@@ -1,0 +1,26 @@
+# 构建产物：内嵌前端资源的二进制（项目根目录）
+/webssh
+# fpk 打包暂存区里放置的二进制
+/fpk/app/bin/
+
+# 前端构建产物 / 依赖
+/frontend/dist/
+/frontend/node_modules/
+
+# 构建期临时目录（//go:embed 的输入，编译后即删）
+/backend/embed/
+
+# 本地 Go 缓存与构建临时目录（Makefile 默认放这里）
+/.gocache/
+/.gopath/
+/.gomodcache/
+/.tmp/
+
+# 运行期数据目录（本地调试用）
+/.data/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+*.log

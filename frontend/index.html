@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- interactive-widget=resizes-content：虚拟键盘弹出时让布局视口随可视视口收缩，
+         使 CSS 高度单位与终端容器在 Chrome/Firefox for Android 上平滑跟随键盘。
+         注意：Safari 至今不支持该指令，iOS 上只有可视视口收缩，因此壳层不能只依赖它：
+         由 src/composables/useViewportHeight.ts 监听 visualViewport 写入 --vvh/--vvt，
+         .app-shell 据此跟随键盘（见 style.css）。 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <title>Web终端</title>
+    <meta name="theme-color" content="#FAFAFA" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

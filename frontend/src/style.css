@@ -1,0 +1,395 @@
+@import 'tailwindcss';
+
+/* 深浅主题：class 模式（html.dark 类切换） */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ===== 设计令牌（tailwind v4 CSS-first 配置），沿用 Terminal 的设计语言 ===== */
+@theme {
+  /* 品牌主色（indigo） */
+  --color-brand: #6366f1;
+  --color-brand-hover: #4f46e5;
+  --color-brand-soft: rgba(99, 102, 241, 0.12);
+
+  /* 语义色 */
+  --color-success: #10b981;
+  --color-warning: #f59e0b;
+  --color-danger: #ef4444;
+
+  /* 中性层：背景 / 表面 / 边框 / 文本（浅色 + 深色） */
+  --color-bg: #fafafa;
+  --color-bg-dark: #0b0b0f;
+  --color-surface: #ffffff;
+  --color-surface-dark: #111115;
+  --color-line: #e8e8ec;
+  --color-line-dark: #2a2a32;
+  --color-ink: #0a0a0a;
+  --color-ink-dark: #ededf0;
+  --color-ink-soft: #6b6b6b;
+  --color-ink-soft-dark: #a6a6ad;
+  --color-ink-faint: #9c9c9c;
+  --color-ink-faint-dark: #8a8a92;
+
+  /* 字体：全部使用系统字体（不从 CDN 拉 webfont）。唯一例外是终端区域：那里的 xterm 用
+   * 内置的 Maple Mono CN（见 src/main.ts 与 TerminalPane 的字体常量），不经过这几个变量。 */
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --font-display: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono',
+    'Liberation Mono', 'Courier New', monospace;
+
+  /* 投影：卡片悬浮 / 主按钮辉光 / 弹层 */
+  --shadow-card: 0 8px 30px rgba(0, 0, 0, 0.08);
+  --shadow-glow: 0 4px 12px rgba(99, 102, 241, 0.35);
+  --shadow-pop: 0 10px 40px rgba(0, 0, 0, 0.12);
+}
+
+/* ===== 基础排版 ===== */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+/* 应用壳 = 可视视口矩形（--vvh/--vvt，见 composables/useViewportHeight.ts）。
+ * 不用 100dvh：键盘弹起时只有 Chrome/Firefox for Android 遵循 interactive-widget=
+ * resizes-content 收缩布局视口；Safari 仍只收缩「可视视口」，dvh 不变 → 键盘盖住底部
+ * 辅助键条、终端区域不收缩。用 fixed + top: --vvt 把壳层钉在可视视口矩形上，不产生
+ * 文档滚动溢出（键盘弹起时 iOS 会移动可视视口，留在文档流里的壳层会被推走）。 */
+.app-shell {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--vvt, 0px);
+  height: 100%;
+}
+
+@supports (height: 100dvh) {
+  .app-shell {
+    height: 100dvh;
+  }
+}
+
+/* 顺序关键：本声明必须在 @supports 之后（@supports 条件里出现 var() 按规范一律判为不支持，
+ * 因此靠「解析期失效」兜底：不认识 var() 的内核整条丢弃，落到上面的 100dvh / 100%）。 */
+.app-shell {
+  height: var(--vvh, 100dvh);
+}
+
+/* 顶栏第一行 48px 是内容高度，刘海安全区额外增加、不包含在固定高度内。 */
+.app-header-row {
+  min-height: calc(3rem + env(safe-area-inset-top, 0px));
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #fafafa;
+  color: #0a0a0a;
+  font-size: 15px;
+  line-height: 1.5;
+
+  /* 除终端区域与文件列表外，全局禁用文本选择：这是一层应用外壳。终端里的复制由 xterm
+   * 自己的选区实现（另有「框选/长按选词自动复制」）。输入框/文本域必须保留可选择性。 */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.term-container {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+input,
+textarea,
+select,
+[contenteditable='true'] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.dark body {
+  background-color: #0b0b0f;
+  color: #ededf0;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.font-mono,
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-mono);
+}
+
+*:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+  border-radius: 6px;
+}
+
+html,
+body {
+  overscroll-behavior-x: none;
+}
+
+/* 隐藏滚动条（标签条横向滚动） */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+/* ===== 终端容器 ===== */
+/* 只负责视觉留白（左侧/底部 10px 边框）与裁剪。
+ * - xterm 不挂在这里：FitAddon 通过父元素高度取可用高度，border-box 下**包含边框**，
+ *   会把行数多算一行、首行被裁；因此挂到内层无边框的 .term-mount。
+ * - overflow: clip 而非 hidden：clip 不产生「可编程滚动」的滚动容器，否则移动端键盘
+ *   弹出时浏览器会把整体推走（区域跳动）。
+ * - touch-action: none：终端里的纵向拖动由 TerminalPane 自研滚动处理（xterm 6.0.0
+ *   stable 没有触摸滚动实现），不声明会被浏览器认领为页面平移（iOS 橡皮筋回弹）。 */
+.term-container {
+  height: 100%;
+  width: 100%;
+  overflow: hidden; /* 兜底：不支持 overflow: clip 的旧内核 */
+  position: relative;
+  touch-action: none;
+}
+
+@supports (overflow: clip) {
+  .term-container {
+    overflow: clip;
+  }
+}
+
+.term-mount {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  overflow: hidden;
+}
+
+@supports (overflow: clip) {
+  .term-mount {
+    overflow: clip;
+  }
+}
+
+.term-mount > .xterm {
+  flex: none;
+}
+
+/* xterm 滚动条（6.0.0 stable：.xterm-scrollable-element > .scrollbar.vertical > .slider）。
+ * 滑块显隐是 Auto 可见性（靠 hover），触屏永远等不到 → 滑块 opacity:0 且 pointer-events:none，
+ * 等于抓不到。这里在 (hover: none) 下让滑块常驻可见并恢复可命中，热区左右各扩 4px。
+ * ⚠️ visibility 只能写 inherit：写 visible 会把「非激活标签的隐藏面板」里的滑块一起复活
+ * （面板是 absolute inset-0，位置完全重合，所有标签的滑块会叠在一起显示）。 */
+.xterm .xterm-scrollable-element > .scrollbar.vertical,
+.xterm .xterm-scrollable-element > .scrollbar.vertical > .slider {
+  touch-action: none;
+}
+
+@media (hover: none) {
+  .xterm .xterm-scrollable-element > .scrollbar.vertical,
+  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider {
+    opacity: 1;
+    visibility: inherit;
+    pointer-events: auto;
+  }
+  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider {
+    background: rgba(128, 128, 128, 0.45);
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    background-clip: padding-box;
+  }
+  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider.active {
+    background: rgba(128, 128, 128, 0.75);
+    background-clip: padding-box;
+  }
+}
+
+/* 终端内部的复制/粘贴反馈气泡（每个 TerminalPane 一个实例） */
+.term-copy-toast {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  z-index: 30;
+  padding: 4px 12px;
+  border-radius: 6px;
+  background: rgba(10, 10, 10, 0.78);
+  color: #ffffff;
+  font-size: 12px;
+  font-family: var(--font-sans);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+  transition: opacity 200ms ease;
+  pointer-events: none;
+}
+
+/* 弹窗定位带 = 「内容区域」本身（各弹窗共用）：
+ *   内容区 = 壳层（高 --vvh、顶偏移 --vvt）− 顶栏（--header-h）
+ *            − 底部辅助键条（--keypad-h，移动端才有）
+ * 面板在带内垂直居中、用 max-h-[90%] 限高；不用 100vh/50vh（iOS 上键盘弹起时 vh 会算错），
+ * 也不用 fixed inset-0 居中（相对布局视口，会被键盘盖住）。
+ * ⚠️ 定位带横跨整宽，必须 pointer-events: none，面板侧 pointer-events: auto。 */
+.region-center {
+  top: calc(var(--vvt, 0px) + var(--header-h, 0px));
+  height: calc(var(--vvh, 100dvh) - var(--header-h, 0px) - var(--keypad-h, 0px));
+  pointer-events: none;
+}
+
+/* ===== 可复用组件类 ===== */
+@layer components {
+  /* 主按钮：indigo 填充白字、6px 圆角、hover 辉光 + 上移 */
+  .g-btn-primary {
+    @apply inline-flex items-center justify-center gap-2 bg-brand hover:bg-brand-hover text-white font-medium rounded-md px-4 h-10 text-sm disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150;
+  }
+  .g-btn-primary:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+  }
+
+  /* 次要按钮：透明 + 1px 边框 */
+  .g-btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 bg-transparent border border-line dark:border-line-dark text-ink dark:text-ink-dark font-medium rounded-md px-4 h-10 text-sm hover:bg-black/5 dark:hover:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150;
+  }
+  .g-btn-secondary:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  /* 幽灵按钮：无边框无底色 */
+  .g-btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 text-ink-soft hover:text-ink hover:bg-black/5 dark:text-ink-soft-dark dark:hover:text-white dark:hover:bg-white/5 font-medium rounded-md px-2.5 h-8 text-sm transition-colors duration-150;
+  }
+
+  /* 危险文字按钮 */
+  .g-btn-danger {
+    @apply inline-flex items-center justify-center gap-2 bg-transparent border border-danger text-danger font-medium rounded-md px-4 h-10 text-sm hover:bg-danger/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150;
+  }
+  .g-btn-danger:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  /* 输入框 / 下拉框 / 文本域 */
+  .g-input {
+    @apply w-full bg-surface dark:bg-surface-dark border border-line dark:border-line-dark rounded-md px-3.5 py-2.5 text-sm text-ink dark:text-ink-dark placeholder:text-ink-faint outline-none transition-all duration-150;
+  }
+  .g-input:focus {
+    border-color: #6366f1;
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+  }
+
+  /* 标签 chip：胶囊形状 */
+  .g-chip {
+    @apply inline-flex items-center gap-1 rounded-full bg-black/5 dark:bg-white/10 text-ink-soft dark:text-ink-soft-dark px-3 py-1 text-xs font-medium whitespace-nowrap;
+  }
+  .g-chip-active {
+    @apply bg-brand text-white;
+  }
+
+  /* 面板 / 卡片：1px 边框平铺 */
+  .g-panel {
+    @apply bg-surface dark:bg-surface-dark border border-line dark:border-line-dark rounded-xl;
+  }
+
+  /* 顶部主标签（首页 / 会话）：圆角胶囊，激活态 indigo 填充白字 */
+  .app-tab {
+    @apply flex shrink-0 items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium cursor-pointer transition-all duration-150 max-w-[13rem];
+  }
+  .app-tab-active {
+    @apply bg-brand text-white;
+  }
+  .app-tab-idle {
+    @apply text-ink-soft dark:text-ink-soft-dark hover:bg-black/5 dark:hover:bg-white/5;
+  }
+
+  /* 会话内的子标签（固定「文件管理」+ 多个终端标签）：
+   * 固定段与滚动段分开渲染，固定段不参与横向滚动（见 SessionView.vue）。 */
+  .subtab {
+    @apply flex shrink-0 items-center gap-1.5 rounded-md px-2.5 h-7 text-xs font-medium cursor-pointer transition-colors duration-150;
+  }
+  .subtab-active {
+    @apply bg-brand text-white;
+  }
+  .subtab-idle {
+    @apply text-ink-soft dark:text-ink-soft-dark hover:bg-black/5 dark:hover:bg-white/5;
+  }
+
+  /* 文件管理器工具栏按钮 */
+  .tree-tool {
+    @apply inline-flex items-center justify-center rounded-md w-8 h-8 text-ink-soft dark:text-ink-soft-dark hover:bg-black/5 dark:hover:bg-white/5 hover:text-ink dark:hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent;
+  }
+}
+
+/* 横向滚动窄滚动条（标签栏 / 文件列表用） */
+@layer utilities {
+  .thin-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(148 163 184 / 0.5) transparent;
+    /* 滚到头就停住：不把滚动链交给外层，也就不会把整页带着弹（移动端尤其明显） */
+    overscroll-behavior: contain;
+  }
+  .thin-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .thin-scroll::-webkit-scrollbar-thumb {
+    background: rgb(148 163 184 / 0.45);
+    border-radius: 4px;
+  }
+  .thin-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .dark .thin-scroll {
+    scrollbar-color: rgb(100 116 139 / 0.6) transparent;
+  }
+  .dark .thin-scroll::-webkit-scrollbar-thumb {
+    background: rgb(100 116 139 / 0.55);
+  }
+
+  /* 「悬停才出现」的关闭按钮（自身挂 .hover-reveal，父元素挂 .group）。
+   * **不要**用 Tailwind 的 opacity-0 group-hover:opacity-100：Tailwind 4 给 hover 变体
+   * 自带 @media (hover: hover)，触屏设备上那条规则永不生效，按钮等于不存在。这里反过来写：
+   * 默认常显，只有真的能悬停的设备才收起来。 */
+  @media (hover: hover) {
+    .hover-reveal {
+      opacity: 0;
+    }
+    .group:hover .hover-reveal,
+    .group:focus-within .hover-reveal {
+      opacity: 1;
+    }
+  }
+}
+
+/* 弹窗遮罩进场动画 */
+.modal-fade-enter-active,
+.modal-fade-leave-active {
+  transition: opacity 200ms ease;
+}
+.modal-fade-enter-from,
+.modal-fade-leave-to {
+  opacity: 0;
+}
