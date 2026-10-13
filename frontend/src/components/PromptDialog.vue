@@ -72,12 +72,20 @@ function onCancel() {
             <h3 class="font-display text-base font-semibold text-ink dark:text-ink-dark">
               {{ title }}
             </h3>
-            <label v-if="label" class="mt-3 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+            <label
+              v-if="label"
+              for="prompt-dialog-input"
+              class="mt-3 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark"
+            >
               {{ label }}
             </label>
+            <!-- id + for 把 label 和输入框真正关联起来：否则输入框没有可访问名（屏幕阅读器
+                 与自动化都只能靠猜），而且点 label 也不会聚焦到输入框。 -->
             <input
+              id="prompt-dialog-input"
               ref="inputEl"
               v-model="value"
+              type="text"
               class="g-input mt-1.5"
               :placeholder="placeholder"
               @keydown.enter.prevent="onConfirm"

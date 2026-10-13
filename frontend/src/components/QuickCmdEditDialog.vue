@@ -73,10 +73,10 @@ function save() {
 
             <div class="mt-4 space-y-3">
               <div>
-                <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                <label for="field-quickcmdeditdialog-1" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                   {{ t('qc_name') }}
                 </label>
-                <input
+                <input id="field-quickcmdeditdialog-1"
                   v-model="name"
                   class="g-input"
                   :placeholder="t('qc_name_placeholder')"
@@ -84,10 +84,10 @@ function save() {
                 />
               </div>
               <div>
-                <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                <label for="field-quickcmdeditdialog-2" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                   {{ t('qc_content') }}
                 </label>
-                <textarea
+                <textarea id="field-quickcmdeditdialog-2"
                   v-model="content"
                   class="g-input resize-y font-mono text-xs"
                   rows="3"

@@ -127,8 +127,11 @@
   `terminals`（终端子标签）、`sftp`（文件浏览）、`sessionUi`（激活子标签/左栏显隐）各管一段；
   `sessionUi.activeSubOf(sid)` 是「当前激活子标签」的**唯一来源**（终端激活写自己的 uid，
   文件管理写 `FILES_TAB`）。
-- 面板一律 `v-show` 挂载（终端靠 `visibility` 隐藏），**不要**用 `v-if`：
-  切标签会销毁 xterm 与 WS，重挂载要重新握手 + 回放历史，用户会看到闪屏与丢失的滚动位置。
+- 面板一律**保持挂载**、`absolute inset-0` 叠放，非激活的加 `.invisible`（`visibility: hidden`）：
+  **不要**用 `v-if`（切标签会销毁 xterm 与 WS，重挂载要重新握手 + 回放历史，用户会看到闪屏与
+  丢失的滚动位置），**也不要**用 `v-show`/`display:none`——`display:none` 下容器尺寸为 0，
+  FitAddon 量不到尺寸、WebGL 渲染器会反复触发 0 尺寸重排。`visibility:hidden` 保留元素尺寸，
+  xterm 完全不知道自己被隐藏，重新可见时不需要重新 fit。
 - 终端面板职责边界：`TerminalPane` 只管自己的 xterm + WS + 命令出口（`paneControls`），
   **不负责**子标签栏与文件管理；子标签栏在 `SessionView`。
 - 历史回放只有一处：后端在挂载时回放，**前端不要再自己拉 `/api/terminals/history` 写一遍**
@@ -144,6 +147,12 @@
   `fixed inset-0` 居中或 `100vh`（iOS 键盘弹起时会算错、被键盘盖住）。
 - 列表类操作（删除、重命名、关闭标签）失败必须给出原因（`describeError(e)` + toast），
   不能「点了没反应」。
+- **点完按钮要把键盘焦点还给终端**：按钮在 Chrome 上点击后会获得焦点，焦点留在按钮上时用户
+  接着敲的空格/回车会去「再按一次按钮」——点一次「+」后按三个空格就多开三个终端（每个都真的
+  拨号建 SSH 会话），点「重连」后打字则完全进不了 shell。规则见 `SessionView.vue` 的
+  `focusTermSoon()` 与 `runAction()`。
+- 弹窗里的 `<label>` 必须用 `id`/`for` 与输入框关联（否则输入框没有可访问名，屏幕阅读器与
+  自动化只能猜 placeholder）。
 - 上传弹窗三种来源（本地文件 / 本地目录 / 飞牛文件）都要有进度与取消；
   飞牛宿主不可用时给明确提示，而不是让用户点了报错。
 - 文案全部走 `t()`；缺 key 时 `t()` 会回退中文再回退 key 本身——**看到 key 就是漏了文案**。
@@ -179,6 +188,11 @@
   命令有回显 → 新建第二个终端标签 → 文件管理浏览/上传/下载/新建/重命名/删除 →
   全局与专属快捷指令 → 关闭会话标签（终端与 SFTP 全断）→ 刷新页面会话仍在并能恢复。
 - 修 bug 时优先补一条能复现该 bug 的测试/说明；没有测试的修复要在提交信息里写清验证方式。
+- `internal/testssh` 用真实 pty（`github.com/creack/pty`，**仅测试依赖**）；生产代码不得 import 它。
+  `make test` 首次跑要能访问模块代理，之后走本地 `.gomodcache/`。
+- 端到端手测：`go run ./internal/testssh/cmd/testsshd -addr 127.0.0.1:2222 -user demo -password demo -root <可写目录>`
+  + `socat TCP-LISTEN:18080,fork UNIX-CONNECT:<WEBSSH_ADMIN_SOCK>`（浏览器访问
+  `http://127.0.0.1:18080<WEBSSH_ADMIN_BASEURL>`）。验证清单见 `docs/CONTRACT.md` 第 10.3 节。
 
 ## 8. 代码风格
 

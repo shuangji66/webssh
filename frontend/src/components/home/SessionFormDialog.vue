@@ -272,18 +272,18 @@ function onDiscardVisible(v: boolean) {
 
             <div class="mt-4 space-y-3">
               <div>
-                <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                <label for="field-sessionformdialog-1" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                   {{ t('form_name') }}
                 </label>
-                <input v-model="name" class="g-input" :placeholder="t('form_name_placeholder')" />
+                <input id="field-sessionformdialog-1" v-model="name" class="g-input" :placeholder="t('form_name_placeholder')" />
               </div>
 
               <div class="flex gap-2">
                 <div class="min-w-0 flex-1">
-                  <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                  <label for="field-sessionformdialog-2" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                     {{ t('form_host') }}
                   </label>
-                  <input
+                  <input id="field-sessionformdialog-2"
                     v-model="host"
                     class="g-input font-mono"
                     :placeholder="t('form_host_placeholder')"
@@ -293,18 +293,18 @@ function onDiscardVisible(v: boolean) {
                   />
                 </div>
                 <div class="w-24 shrink-0">
-                  <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                  <label for="field-sessionformdialog-3" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                     {{ t('form_port') }}
                   </label>
-                  <input v-model="port" class="g-input font-mono" inputmode="numeric" placeholder="22" />
+                  <input id="field-sessionformdialog-3" v-model="port" class="g-input font-mono" inputmode="numeric" placeholder="22" />
                 </div>
               </div>
 
               <div>
-                <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                <label for="field-sessionformdialog-4" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                   {{ t('form_user') }}
                 </label>
-                <input
+                <input id="field-sessionformdialog-4"
                   v-model="user"
                   class="g-input font-mono"
                   :placeholder="t('form_user_placeholder')"
@@ -345,10 +345,10 @@ function onDiscardVisible(v: boolean) {
               </div>
 
               <div v-if="authType === 'password'">
-                <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                <label for="field-sessionformdialog-6" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                   {{ t('form_password') }}
                 </label>
-                <input
+                <input id="field-sessionformdialog-6"
                   v-model="password"
                   class="g-input"
                   type="password"
@@ -362,10 +362,10 @@ function onDiscardVisible(v: boolean) {
 
               <template v-else>
                 <div>
-                  <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                  <label for="field-sessionformdialog-7" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                     {{ t('form_private_key') }}
                   </label>
-                  <textarea
+                  <textarea id="field-sessionformdialog-7"
                     v-model="privateKey"
                     class="g-input resize-y font-mono text-xs"
                     rows="4"
@@ -377,10 +377,10 @@ function onDiscardVisible(v: boolean) {
                   </p>
                 </div>
                 <div>
-                  <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                  <label for="field-sessionformdialog-8" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                     {{ t('form_passphrase') }}
                   </label>
-                  <input
+                  <input id="field-sessionformdialog-8"
                     v-model="passphrase"
                     class="g-input"
                     type="password"
@@ -391,10 +391,10 @@ function onDiscardVisible(v: boolean) {
               </template>
 
               <div>
-                <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                <label for="field-sessionformdialog-9" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
                   {{ t('form_note') }}
                 </label>
-                <input v-model="note" class="g-input" :placeholder="t('form_note_placeholder')" />
+                <input id="field-sessionformdialog-9" v-model="note" class="g-input" :placeholder="t('form_note_placeholder')" />
               </div>
 
               <p v-if="formError" class="break-words text-xs text-danger">{{ formError }}</p>

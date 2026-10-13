@@ -41,6 +41,7 @@ const shellPrompt = "$ "
 
 // TestTerminalCreateEchoAndResize 覆盖新建终端、PTY 收发、resize 与心跳控制帧。
 func TestTerminalCreateEchoAndResize(t *testing.T) {
+	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
 
@@ -127,6 +128,7 @@ func TestTerminalCreateEchoAndResize(t *testing.T) {
 
 // TestTerminalReplayAndDetach 覆盖「浏览器断开只解挂载」+ 重新挂载回放历史 + 单挂载点顶号。
 func TestTerminalReplayAndDetach(t *testing.T) {
+	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
 
@@ -174,6 +176,7 @@ func TestTerminalReplayAndDetach(t *testing.T) {
 
 // TestTerminalGoneFrames 覆盖「终端/会话不存在」必须带 gone 控制帧。
 func TestTerminalGoneFrames(t *testing.T) {
+	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
 
@@ -202,6 +205,7 @@ func TestTerminalGoneFrames(t *testing.T) {
 
 // TestTerminalShellExitAndReap 覆盖 shell 退出 → exit 控制帧 → 宽限期后回收。
 func TestTerminalShellExitAndReap(t *testing.T) {
+	requirePTY(t)
 	// 把宽限期缩到毫秒级（否则要等 10 分钟）。测试串行跑，改完恢复。
 	oldGrace := exitedGrace()
 	setExitedGrace(300 * time.Millisecond)
@@ -253,6 +257,7 @@ func TestTerminalShellExitAndReap(t *testing.T) {
 
 // TestTerminalFrameLimits 覆盖单帧上限与分片累积（不能一条消息打爆进程）。
 func TestTerminalFrameLimits(t *testing.T) {
+	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
 	ws := a.dialWS(t, sid, "")
@@ -293,6 +298,7 @@ func TestTerminalFrameLimits(t *testing.T) {
 
 // TestTerminalHistorySizeCap 校验历史读取上限（避免把无限增长的日志塞进一次响应）。
 func TestTerminalHistorySizeCap(t *testing.T) {
+	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
 	ws := a.dialWS(t, sid, "")
@@ -341,6 +347,7 @@ func TestTerminalAPINotFound(t *testing.T) {
 // WS 层很难稳定复现「被顶掉的连接还有残留帧正在路上」（旧连接已经被关掉了），
 // 所以这一条在 server 层直接验：非操作端的输入必须被丢弃、操作端的照常生效。
 func TestTerminalWriteInputDropsNonOwner(t *testing.T) {
+	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
 	rt, apiErr := a.mux.sessions.runtimeFor(sid)

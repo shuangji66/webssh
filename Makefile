@@ -25,10 +25,13 @@ V         ?= $(version)
 
 GOCACHE   ?= $(ROOT)/.gocache
 GOPATH    ?= $(ROOT)/.gopath
+# 模块缓存也放项目本地：一是与 GOCACHE/GOPATH 同一套约定（环境里已设则沿用），
+# 二是飞牛上默认的 $GOPATH/pkg/mod 可能落在别的卷上、权限/模式位不可靠。
+GOMODCACHE ?= $(ROOT)/.gomodcache
 # go build 的工作目录走 os.TempDir()（$TMPDIR 或 /tmp）。飞牛的存储卷上 /tmp 权限受限时
 # 会报 "open /tmp/go-build.../exe/a.out: permission denied"，指到项目本地即可。
 TMPDIR    ?= $(ROOT)/.tmp
-export GOCACHE GOPATH TMPDIR
+export GOCACHE GOPATH GOMODCACHE TMPDIR
 
 # 纯 Go，不需要 cgo：产物静态链接（真正的单文件交付），且冷编译不再走 runtime/cgo
 # （那一步写的 .o 中间文件在本卷上会被损坏）。环境里已设 CGO_ENABLED 则沿用。
@@ -66,7 +69,7 @@ build:
 	mkdir -p "$(EMBED)"
 	tar -C "$(FRONTEND)/dist" -cf - . | tar -C "$(EMBED)" -xf -
 	@echo "==> Building Go binary..."
-	mkdir -p "$(GOCACHE)" "$(GOPATH)" "$(TMPDIR)"
+	mkdir -p "$(GOCACHE)" "$(GOPATH)" "$(GOMODCACHE)" "$(TMPDIR)"
 	# 清一次编译缓存：保证代码与 embed 资产的变化一定被编进去。
 	go clean -cache
 	cd "$(BACKEND)" && go build -trimpath -ldflags "$(LDFLAGS)" -o "$(OUT)" .

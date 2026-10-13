@@ -66,8 +66,20 @@ const hasTarget = computed(() => !!controlsFor())
 /** 有目标但还没连上：按钮可以点，但要在按钮态上体现出来（灰一点）。 */
 const targetConnected = computed(() => controlsFor()?.connected === true)
 
-function runAction(action: 'search' | 'paste' | 'clear' | 'reconnect') {
-  controlsFor()?.[action]()
+/**
+ * 工具条动作（搜索 / 粘贴 / 清屏 / 重连）作用到当前终端。
+ *
+ * 点完必须把**键盘焦点还给终端**：按钮在 Chrome 上点击后会获得焦点，焦点留在按钮上时
+ * 用户接着敲的空格/回车会去「再按一次按钮」——清屏/重连被重复触发，而普通字符则完全
+ * 进不了 shell（e2e 里就是这样：点完重连后打字毫无反应）。搜索是例外：它要保留焦点在
+ * 自己的输入框里，所以不还。
+ */
+function runAction(action: 'search' | 'paste' | 'clear' | 'reconnect', event?: MouseEvent) {
+  const ctl = controlsFor()
+  ctl?.[action]()
+  if (action === 'search') return
+  ;(event?.currentTarget as HTMLElement | null)?.blur()
+  ctl?.focus()
 }
 
 // ---------- 子标签切换 ----------
@@ -78,11 +90,29 @@ function activateFiles() {
 
 function activateTerm(uid: string) {
   sessionUi.setActiveSub(props.sid, uid)
+  focusTermSoon(uid)
+}
+
+/**
+ * 切到某个终端后把键盘焦点交给它。
+ *
+ * 不做这一步是个真 bug（e2e 抓到的）：点子标签 / 点「+」之后，焦点留在**那个按钮**上，
+ * 用户接着敲命令时按下的空格会去「激活」这个还在焦点里的按钮 —— 点一次「+」之后按三个
+ * 空格，就等于又开了三个终端（每开一个都会真的拨号建一条 SSH 会话，代价很实在）。
+ * 把焦点移进终端面板，既让后续输入直接进 shell，也顺手解掉按钮的「空格/回车即点击」。
+ *
+ * 走 paneControls 的 focus()（契约 6.1 的命令出口）而不是直接摸 DOM：面板还没 open()
+ * 时它会挂起聚焦意图并在 open() 后补发（见 TerminalPane 的 pendingFocus）。
+ */
+function focusTermSoon(uid: string) {
+  void nextTick(() => paneControls.get(props.sid, uid)?.focus())
 }
 
 function addTerminal() {
   // terminals.add 会同时把新标签设为激活项（写入 sessionUi），这里不用再管激活
-  terminals.add(props.sid)
+  const tab = terminals.add(props.sid)
+  // 新面板刚 push 进模板，要等它挂载完（并完成 paneControls 注册）才能聚焦
+  focusTermSoon(tab.uid)
 }
 
 // 切换子标签后把激活项滚进可视区（终端标签多了会滚出屏幕）
@@ -389,7 +419,7 @@ function onRenamed(value: string) {
             :class="targetConnected ? '' : 'opacity-50'"
             :disabled="!hasTarget"
             :title="t('term_act_search')"
-            @click="runAction('search')"
+            @click="runAction('search', $event)"
           >
             <svg
               viewBox="0 0 24 24"
@@ -411,7 +441,7 @@ function onRenamed(value: string) {
             :class="targetConnected ? '' : 'opacity-50'"
             :disabled="!hasTarget"
             :title="t('term_act_paste')"
-            @click="runAction('paste')"
+            @click="runAction('paste', $event)"
           >
             <svg
               viewBox="0 0 24 24"
@@ -433,7 +463,7 @@ function onRenamed(value: string) {
             :class="targetConnected ? '' : 'opacity-50'"
             :disabled="!hasTarget"
             :title="t('term_act_clear')"
-            @click="runAction('clear')"
+            @click="runAction('clear', $event)"
           >
             <svg
               viewBox="0 0 24 24"
@@ -455,7 +485,7 @@ function onRenamed(value: string) {
             :class="targetConnected ? '' : 'opacity-50'"
             :disabled="!hasTarget"
             :title="t('term_act_reconnect')"
-            @click="runAction('reconnect')"
+            @click="runAction('reconnect', $event)"
           >
             <svg
               viewBox="0 0 24 24"
@@ -539,7 +569,7 @@ function onRenamed(value: string) {
             class="g-btn-ghost !h-7 !px-2"
             :disabled="!hasTarget"
             :title="t('term_act_search')"
-            @click="runAction('search')"
+            @click="runAction('search', $event)"
           >
             <svg
               viewBox="0 0 24 24"
@@ -558,7 +588,7 @@ function onRenamed(value: string) {
             class="g-btn-ghost !h-7 !px-2"
             :disabled="!hasTarget"
             :title="t('term_act_paste')"
-            @click="runAction('paste')"
+            @click="runAction('paste', $event)"
           >
             <svg
               viewBox="0 0 24 24"
@@ -577,7 +607,7 @@ function onRenamed(value: string) {
             class="g-btn-ghost !h-7 !px-2"
             :disabled="!hasTarget"
             :title="t('term_act_clear')"
-            @click="runAction('clear')"
+            @click="runAction('clear', $event)"
           >
             <svg
               viewBox="0 0 24 24"
@@ -596,7 +626,7 @@ function onRenamed(value: string) {
             class="g-btn-ghost !h-7 !px-2"
             :disabled="!hasTarget"
             :title="t('term_act_reconnect')"
-            @click="runAction('reconnect')"
+            @click="runAction('reconnect', $event)"
           >
             <svg
               viewBox="0 0 24 24"

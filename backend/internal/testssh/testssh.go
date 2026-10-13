@@ -30,6 +30,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/creack/pty"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -331,3 +332,20 @@ func generateSigner() (ssh.Signer, error) {
 
 // pemEncode 把 ssh.MarshalPrivateKey 的结果编成 PEM 文本。
 func pemEncode(block *pem.Block) []byte { return pem.EncodeToMemory(block) }
+
+// PTYAvailable 报告当前环境能不能分配 PTY（能否打开 /dev/ptmx）。
+//
+// 为什么需要它：在受限的沙箱 / 容器里（/dev 只读、禁止打开设备节点），pty.Start 会以
+// "open /dev/ptmx: permission denied" 失败，于是所有「要起一个真 PTY」的用例会以
+// 「无法启动远程 shell」这种**与真实故障无关**的形态翻红——排查的人会去怀疑 SSH 或
+// SFTP 代码。用例开头调它，环境不支持就 t.Skip 并写明原因：跳过的是「环境能力」，
+// 不是「代码正确性」，本机与 CI 上照常全跑。
+func PTYAvailable() (bool, string) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		return false, "当前环境无法分配 PTY（" + err.Error() + "）：PTY 相关用例已跳过"
+	}
+	_ = master.Close()
+	_ = slave.Close()
+	return true, ""
+}

@@ -265,6 +265,7 @@ func TestSessionInputSemantics(t *testing.T) {
 
 // TestOpenCloseLifecycle 校验打开/关闭的幂等性与语义。
 func TestOpenCloseLifecycle(t *testing.T) {
+	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
 

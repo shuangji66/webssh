@@ -546,3 +546,11 @@ func (w *wsClient) closeCode(timeout time.Duration) uint16 {
 	w.t.Fatalf("等待关闭帧超时")
 	return 0
 }
+
+// requirePTY 让「必须真的分配 PTY」的用例在受限环境里明确跳过（见 testssh.PTYAvailable）。
+func requirePTY(t *testing.T) {
+	t.Helper()
+	if ok, why := testssh.PTYAvailable(); !ok {
+		t.Skip(why)
+	}
+}

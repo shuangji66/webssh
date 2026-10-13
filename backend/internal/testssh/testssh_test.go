@@ -25,6 +25,9 @@ func clientConfig(user string) *ssh.ClientConfig {
 // TestShellPTYAndResize 验证「真 PTY + 交互 shell」这条链路：
 // 提示符、输入回显、命令输出、window-change 生效。
 func TestShellPTYAndResize(t *testing.T) {
+	if ok, why := PTYAvailable(); !ok {
+		t.Skip(why)
+	}
 	srv := StartServer(t, Options{User: "demo", Password: "demo", Root: t.TempDir()})
 	conn, err := ssh.Dial("tcp", srv.Addr(), clientConfig("demo"))
 	if err != nil {

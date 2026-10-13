@@ -502,3 +502,75 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   （首次要信任指纹）→ 打开会话 → 自动出现 1 个终端标签 → 输入命令有回显 → 新建第 2 个终端
   标签 → 文件管理浏览、上传（本地文件/目录）、下载、新建、重命名、删除 → 快捷指令（全局 +
   专属）→ 关闭会话标签（终端与 SFTP 全断）→ 刷新页面会话仍打开并能恢复 → 移动端视口下键条可用。
+
+---
+
+## 10. 实施记录（构建完成后补记的偏差与实测结论）
+
+以下都是实现阶段与端到端验证（`internal/testssh` 起的进程内 SSH/SFTP + 真实浏览器）中确认的
+事实，实现与本文原稿不一致的地方**以这一节为准**。
+
+### 10.1 后端
+
+1. **SFTP 在 `open` 时就建立**（原稿写「懒加载」）：打开会话已经拨了号（为了在「打开」这一步
+   就把 hostkey/auth 错误报出来），再开一条 channel 几乎不花钱；`sftpOpen` 因此一开始就是
+   `true`。建立失败**不阻断 open**（记日志 + `sftpOpen:false`），首次文件操作会重连一次。
+   前端不要把 `sftpOpen` 当「文件管理不可用」的硬门禁。
+2. **错误码补充**：`not_open`（会话未打开）、`session_gone`（会话不存在/已删）、`aborted`
+   （客户端取消）、`duplicate`（身份重复）。i18n 里已有对应 `err_*` 文案。
+   连接类错误的状态码：远端失败 → 502；hostkey 相关 → 409；参数类 → 400。
+3. **`/api/sessions/test` 的失败是 HTTP 200 + `{ok:true, result:{success:false, code,…}}`**；
+   只有参数不合法才 4xx。
+4. **`SessionInput` 的 `name` 空串 = 保留原值**（新建时回退 `user@host`）；其他字段按原稿
+   「空串 = 清除」。
+5. **上传同时接受 `files` 与 `files[]` 两个字段名**（冻结的前端用 `files`）。
+   上传 filename 从 **Content-Disposition 原文**解析——Go 的 `mime/multipart` 会按 RFC 7578
+   主动 `filepath.Base`，用它会把目录上传拍平（已修 + 测试钉住）。
+6. **`fs/read` 上限 4 MiB**（与历史读取一致）；超限只回 `size` + `tooLarge: true`。
+7. **`fs/remove` 的 `dir=true` 是递归删除**（确认文案已写明），拒绝删 `/`；删符号链接只删链接
+   本身（`RemoveAll` 会顺着链接删掉目标整棵树）。
+8. **进程启动时清理上次运行留下的 `history/`**（重启后没有任何挂载者，留着只占盘）。
+9. **终端初始尺寸 80×24**：握手 URL 里没有尺寸，前端拿到 `ready` 后按 xterm 实际尺寸发一次
+   `resize`。重新挂载**已退出**的终端时会补发 `\x1b]exit\x07`（该控制帧不落历史文件）。
+10. **依赖**：新增 `github.com/creack/pty v1.1.24`，**只被 `internal/testssh` 使用**（生产代码
+   不 import）；测试第一次跑需要能访问模块代理，之后走本地 `.gomodcache`。
+11. 一个 x/crypto 的坑：它只往 `sess.Stdout` 写、**不关闭它**，所以用 `io.Pipe` 时 pump 会
+    永久阻塞在 `Read` 上（症状：shell 退出后既没有 `[process exited]` 也没有 `\x1b]exit\x07`，
+    终端永不回收）。现在由 `sess.Wait()` 返回后关写端来驱动。
+
+### 10.2 前端
+
+1. **面板隐藏必须用 `visibility`（`invisible`）而不是 `v-show`/`display:none`**：
+   `display:none` 下容器尺寸为 0，FitAddon 量不到尺寸、WebGL 渲染器会反复触发 0 尺寸重排。
+   所有面板都保持挂载、`absolute inset-0` 叠放。
+2. **点完按钮要把焦点还给终端**（e2e 抓到的真 bug）：点子标签 / 点「+」之后焦点留在按钮上，
+   用户接着敲的空格会去「激活」那个按钮——点一次「+」后按三个空格就多开三个终端；点「重连」
+   后打字则完全进不了 shell。规则：`addTerminal()` 与 `activateTerm()` 之后聚焦对应终端面板；
+   工具条的 `runAction()`（除 `search`）之后 `blur()` 按钮并聚焦终端。
+3. 弹窗里的 `<label>` 必须与输入框用 `id`/`for` 关联（否则输入框没有可访问名，屏幕阅读器与
+   自动化只能靠猜 placeholder）。
+4. `SessionState.terminals[].title` 默认空串，由前端组合「终端 N / 终端 N：标题」。
+5. 快捷指令保存以**后端返回的那一份**为准（后端会补齐 id、去重、trim）。
+
+### 10.3 端到端验证覆盖（已实测通过）
+
+建会话 → 连接测试（首次指纹未信任 → 信任并继续 → 自动重测成功 · 2ms）→ 保存 →
+打开（自动 1 个终端）→ 命令回显与 `stty size`（PTY 尺寸 29×105 正确）→ 新建第二个终端
+（且键入含空格的命令不会再多开标签）→ 文件管理（浏览 / 新建目录 / 上传本地文件 / 相对路径
+目录上传保留层级 / `../` 逃逸被拒 / 同名未覆盖跳过 / 重命名 / 删除 / 单文件下载 / 目录 zip 下载）
+→ 快捷指令（全局 + 专属分别落盘 `global.json` 与 `<sid>.json`；在文件管理页执行会兜底发到
+最后一个终端并回显）→ 刷新页面（会话恢复、终端历史回放完整）→ 第二设备挂载同一终端（本端置
+detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭会话标签（终端与 SFTP 全断、历史目录
+被清、配置保留）→ 后端重启（配置存活、打开态清空、前端提示）。
+
+未在本次验证中覆盖（无对应环境，不是未实现）：移动端键盘/辅助键条（浏览器工具无法模拟窄视口
+与触屏）、模型化输入法（IME）路径、飞牛宿主内的「选飞牛文件」上传（需要飞牛宿主桥）、
+`Shift` 上档锁定等纯前端触屏交互。
+`files_open_terminal_here`（在此目录打开终端）**按可选项未实现**（i18n 文案保留未用）。
+
+### 10.4 已知的小瑕疵（不影响使用）
+
+- 会话表单里的密码框不在 `<form>` 内，Chromium 会打印一条 verbose 级提示
+  （`Password field is not contained in a form`）；这是浏览器给密码管理器的建议，不是错误。
+- `SettingsDialog` / `UploadDialog` 里的若干「label + 按钮组/开关」没有做 `aria-labelledby`
+  关联（第 10.2 节第 3 条只覆盖了真正的输入框）。
