@@ -122,14 +122,21 @@ export interface SessionView {
   lastUsedAt?: string
 }
 
-/** 新增/编辑会话的输入。密码与私钥留空表示「不修改已保存的值」。 */
+/**
+ * 新增/编辑会话的输入。密码与私钥留空（或干脆不发）表示「不修改已保存的值」。
+ *
+ * `host` / `user` / `authType` 在**更新**时也可以省：后端按「部分更新」把缺省字段合并成现有
+ * 配置里的值（见 CONTRACT 4.3 与 backend/sessions.go 的 resolveSessionFields）。那是给
+ * 「只改名字」这类调用方用的（home.renameSession）——回传一份**本地缓存**的旧值等于把别的
+ * 设备刚改过的地址覆盖回去。新增会话时三者必填（否则后端会以 invalid 拒绝）。
+ */
 export interface SessionInput {
   id?: string
   name?: string
-  host: string
+  host?: string
   port?: number
-  user: string
-  authType: AuthType
+  user?: string
+  authType?: AuthType
   password?: string
   privateKey?: string
   passphrase?: string
@@ -189,6 +196,22 @@ export interface FsEntry {
   mtime: string
   symlink?: string
   broken?: boolean
+}
+
+/** 单个路径的信息（「信息」弹窗）：FsEntry 的全部字段 + 属主 + 直接子项的计数。 */
+export interface FsInfo extends FsEntry {
+  /** 属主的数字 uid/gid（SFTP v3 只给数字） */
+  uid: number
+  gid: number
+  /** 在远端查出来的账号名/组名；查不到就没有这两个字段（界面退回显示数字） */
+  owner?: string
+  group?: string
+  /** 直接子项里的目录数（跟随软链接，与列表的目录/文件图标口径一致） */
+  dirCount: number
+  /** 直接子项里的文件数 */
+  fileCount: number
+  /** 非空 = 数子项失败的原因（多半是权限）：界面如实显示，**不是**「空目录」 */
+  countError?: string
 }
 
 /** 批量文件操作（复制/移动/粘贴）的结果。 */
@@ -460,6 +483,16 @@ export const api = {
     request<{ ok: boolean; path: string; home: string; entries: FsEntry[] }>('/api/fs/list', {
       json: { sid, path }
     }),
+
+  /**
+   * 单个路径的信息（「信息」弹窗）：条目自身属性 + 目录**直接子项**的计数。
+   *
+   * 列目录（fsList）拿不到「当前目录自己」的属性（它返回的是目录里的东西），所以这里必须
+   * 单独问一次；`countError` 非空表示数子项失败（多半是权限），界面要如实说原因，
+   * **不能**把 0 当成「空目录」显示。
+   */
+  fsInfo: (sid: string, path: string) =>
+    request<{ ok: boolean; info: FsInfo }>('/api/fs/info', { json: { sid, path } }),
 
   fsMkdir: (sid: string, path: string) =>
     request<{ ok: boolean }>('/api/fs/mkdir', { json: { sid, path } }),

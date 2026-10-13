@@ -298,10 +298,15 @@ func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
 		}
 	}
 
-	// 会话名称：留空回退 `user@host`（前端的 sessionLabel 也是这么兜底的）。
-	if in.Name != nil && strings.TrimSpace(*in.Name) != "" {
+	// 会话名称：**显式发空串 = 清除自定义名**（展示时由 displayName / 前端 sessionLabel
+	// 退回 `user@host`）。字段缺省 = 保持原值。
+	//
+	// 原来那版把「空串」也当成「保持原值」，于是用户把名称清空后保存，界面上还是旧名字
+	// （第六轮用户报的「清空失败」）。凭据与备注早就是「显式空串 = 清除」的语义，名字不该例外。
+	if in.Name != nil {
 		sc.Name = strings.TrimSpace(*in.Name)
-	} else if sc.Name == "" {
+	} else if created {
+		// 新建且没给名字：落盘时就存一份 `user@host`，配置文件自解释
 		sc.Name = defaultSessionName(user, host)
 	}
 	if in.Note != nil {
@@ -314,7 +319,7 @@ func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
 			continue
 		}
 		if other.identity() == sc.identity() {
-			return nil, errDuplicate("已存在相同「地址 + 登录名」的会话「%s」", other.Name)
+			return nil, errDuplicate("已存在相同「地址 + 登录名」的会话「%s」", other.displayName())
 		}
 	}
 
@@ -998,6 +1003,15 @@ func (sc *sessionConfig) view() sessionView {
 		UpdatedAt:       sc.UpdatedAt,
 		LastUsedAt:      sc.LastUsedAt,
 	}
+}
+
+// displayName 是配置对外的**展示名**：没起名字（或已被用户清空）就退回 `user@host`，
+// 与前端 sessionLabel 的口径一致。只用于文案——字段本身允许为空。
+func (c *sessionConfig) displayName() string {
+	if strings.TrimSpace(c.Name) != "" {
+		return c.Name
+	}
+	return defaultSessionName(c.User, c.Host)
 }
 
 func defaultSessionName(user, host string) string {

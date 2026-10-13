@@ -158,6 +158,11 @@
   `@media (hover: hover)`，触屏上永不生效，按钮等于不存在）。
 - 移动端判定用 `useMobileLayout()`（触屏或窄视口），**不要**用 `md:hidden`：iPad 宽度
   ≥768px 会被判成桌面而丢掉底部辅助键条。
+- 但**「屏幕大不大」与「有没有键盘/鼠标」是两条判据**，别混用：
+  - 触屏专属的东西用 `useMobileLayout()`（辅助键条、`.hover-reveal` 常显、16px 输入框）；
+  - **布局宽度**用 `useWideLayout()`（≥md 断点）：会话视图左栏显不显、FileManager 的 `mobile`
+    prop（权限列 / 空白右键菜单）都按它——平板是宽屏，左栏和权限列都放得下（第十轮用户
+    原话「平板不是窄屏，可以按模式显示面包屑的」）。
 - 弹窗定位用 `.region-center` 定位带（`--vvh/--vvt/--header-h/--keypad-h`），不要用
   `fixed inset-0` 居中或 `100vh`（iOS 键盘弹起时会算错、被键盘盖住）。
 - 列表类操作（删除、重命名、关闭标签）失败必须给出原因（`describeError(e)` + toast），
@@ -168,18 +173,85 @@
   `focusTermSoon()` 与 `runAction()`。
 - 弹窗里的 `<label>` 必须用 `id`/`for` 与输入框关联（否则输入框没有可访问名，屏幕阅读器与
   自动化只能猜 placeholder）。
+- 内容可能超过 90% 屏高的弹窗（编辑会话、设置）**必须分层**：面板 `flex flex-col` +
+  头部 `shrink-0 border-b` + 正文 `min-h-0 flex-1 overflow-y-auto`（+ 页脚 `shrink-0 border-t`）。
+  **不要**在面板上直接 `overflow-y-auto`——那样标题与关闭按钮会跟着内容滚出去，用户得先滚回
+  顶部才能关掉弹窗（第七轮修过）。
+- 标签（顶栏应用标签、会话内子标签）的非激活态带**常驻灰底**（`.app-tab-idle` /
+  `.subtab-idle`），关闭按钮**常驻显示**（不要再给它们加 `.hover-reveal`）。`.hover-reveal`
+  只留给文件管理器行内的「···」。
+- 关闭按钮想要「悬停才变红」用 `.close-danger`（顶栏标签、卡片终端行）——它**默认就是红的**
+  （触屏没有 hover），只有 `@media (hover: hover)` 才收成中性色：别写成 `hover:text-danger`，
+  那样触屏上永远不红。
+- 左栏目录树的「展开到登录用户家目录」由 `FileTree.revealHome()` 在两个时机做：新开会话
+  （home 到手）与**重新展开面包屑**（leftHidden true→false）。左栏是 v-show 隐藏的，
+  动手前必须 `await nextTick()`（`display:none` 下 `scrollIntoView` 无效）。
+- **按 sid/uid 分片的 store 里，新建分片要「赋值之后再从 ref 上读一次」**：
+  `if (!states.value[sid]) states.value[sid] = blankState(); return states.value[sid]!`
+  ——`x ?? (x = ...)` 或「先赋给局部变量再 return」都会把**原始对象**交给第一个调用方，
+  那个组件的 `computed`/`watch` 从此收不到任何更新（读得到新值、界面不刷新）。
+  第八轮的「新打开会话不展开到家目录」就是这么来的，见 `docs/CONTRACT.md` 18.4。
+- Toast 浮在**顶栏那一条里**并居中（`top: --vvt` + `height: --header-h`，
+  `pointer-events-none` 保证底下的标签照常可点）。
 - **移动端输入控件字号固定 16px**（`style.css` 的 `@media (max-width: 767px)`）：iOS 在
   `font-size < 16px` 的输入框上聚焦会自动放大整页且不缩回。xterm 自己的
   `.xterm-helper-textarea` 显式排除（它的字号由终端字号决定，内联样式设置）。
+- 首页卡片：**子终端列表是内联在卡片下的**（`SessionTerminalsDialog` 第六轮已删除），
+  点一行是「快捷打开」（切应用标签 + `terminals.setActive` + `panes.get().focus()`），
+  关闭单个终端要先确认（会终止远端 shell）。卡片右上角是三个仅图标按钮，不标注认证方式，
+  也不显示状态灯/时间。终端状态点的配色只有一份：`terminals.termStatusDotClass()`。
+- **清空会话名**：后端 `save` 里「显式空串 = 清除、字段缺省 = 保持原值」（与凭据/备注同一套）；
+  展示名统一走 `sessionConfig.displayName()` / 前端 `sessionLabel()`（空 → `user@host`）。
+  `home.renameSession` **只发 `{id, name}`**，不要把本地缓存的 host/user/authType 回传——
+  那会覆盖别的设备刚做的改动。
+- **压缩包的输出目录在远程主机上**（`/tmp/webssh-archive`，`WEBSSH_ARCHIVE_DIR` 可换）：
+  不可写时 `resolveArchiveDir` 依次退到 `<root>-<登录用户名>`、`$HOME/.webssh-archive`，
+  三档都不行才报 permission。探针**只用 shell 内建**，探不出结论时按配置目录继续
+  （否则「远端没有 tar」会被误报成权限问题）。
+- 文件管理的**多选**是**模式**（`SftpState.multi`）而不是「一次全选」：点工具栏「多选」进入、
+  点行逐个选中，做完复制/剪切/删除/压缩/导出后必须 `sftp.exitMulti(sid)` 收回来（进/出都清空
+  `selected`）。别退回「全选」那种一次性批量选中。
+  多选时：**任何工具栏动作都要先 `leaveMulti()`**（后退/前进/刷新/上一层/新建/上传/换视图），
+  **右键菜单换成批量菜单**（行上与空白处同一份：复制/剪切/删除/导出/下载/两个压缩），
+  「导出至飞牛」同名冲突一次问、整批覆盖。
+- 左栏宽度用**骑在分隔线上的手柄**拖（`SessionView` 里那个 20×32 的按钮，`touch-none`）：
+  不要再把它退回「直接拖一条 1px 的线」——平板（触屏）根本抓不住。
 - 会话视图的**唯一判据**是 `sessionUi.activeSubOf(sid) === FILES_TAB`：桌面端「固定的文件管理
   子标签」与「左栏面包屑/目录树」**二选一**（看终端时显左栏，看文件管理时收左栏），
   移动端就是全区域子页面。**不要再引入第二个「主区域模式」状态**——第二轮那版 `mainMode`
-  与这套判断互相打架，已删除。改之前先看 `docs/CONTRACT.md` 13.1。
+  与这套判断互相打架，已删除。文件管理器工具栏里的「返回终端」**只是这个状态的写入口**，
+  不构成第二套开关（左栏按钮条里那个「切换到文件管理」第八轮已删——`文件管理` 子标签常驻，
+  不需要第二个入口）。
+  第六轮又叠了一个**用户偏好**：左栏可以被手动收起（`sessionUi.leftHiddenOf`），可见性是
+  `wide && !filesActive && !leftHidden` 三者的交集（`wide` = `useWideLayout()`，第十轮起
+  按**视口宽度**而不是触屏判定），收起时子标签栏左侧出现「展开面包屑」。
+  改之前先看 `docs/CONTRACT.md` 13.1、14.3 与 16.1。
 - **快捷指令按钮在会话子标签栏的工具条上**（不在顶栏），它作用于当前激活终端；文件管理子标签在
-  前台时没有激活终端，按钮整体禁用（用户原话：不想出现「点指令不知道发到哪个终端」）。
+  前台时没有激活终端，桌面工具条与移动工具行**整条隐藏**（`v-if="!filesActive"`，第四轮用户要求
+  「文件管理标签显示时这些按钮不该出现」）。这几个按钮没有要保留的 DOM 状态，用 `v-if` 是安全的
+  ——文件头第 3 条禁 `v-if` 只针对面板（xterm / WS / FileManager 必须保持挂载）。
   弹窗页脚会显示目标终端名（`qc_send_to`）。
+  要「切回哪个终端」用 `terminals.lastActiveOf(sid)`（导航目标）；**指令发给谁**只能用
+  `terminals.activeOf(sid)`（文件管理在前台时必须返回 null）。
+- **切终端子标签必须走 `terminals.setActive`**（它同时写 sessionUi），不要在组件里直接
+  `sessionUi.setActiveSub`：那样 `activeUid` 会停在「最后建出来的那个标签」上，
+  「返回终端」就会跳到一个陌生的终端（第五轮修过的真 bug，见 CONTRACT 15.4）。
+- 剪贴板的清空语义**由入口决定**：右键/空白菜单的「粘贴」粘完就清，地址栏下那行常驻剪贴板里的
+  「粘贴到此处」不清（只有「取消」才清）。改 `sftp.paste` 时要保留 `keepClipboard` 这个开关；
+  「常驻 + 剪切」失败/跳过时还要把剪贴板路径映射到新位置，否则下一次粘贴只会报 not_found。
+- 菜单的「点别处关闭」用 **`pointerdown` + 捕获阶段**（`FileManager` 的 `onDocPointerDown`），
+  **不要**退回 `window` 上的 `click`：触屏上 tap 的 click 未必到得了 window（第五轮修的真 bug）。
+  菜单项自己开的弹窗（新建文件/目录、上传）必须**显式** `hideMenu()`——pointerdown 落在菜单里
+  不算「别处」。
+- 「信息」走 `POST /api/fs/info`：只数**直接子项**（不要递归），软链接口径与列表一致（跟随），
+  读不出子项时回 `countError` 让界面说原因，**绝不能**把 0 当成「空目录」；属主是
+  `uid/gid`（SFTP attrs）+ 远端 `id -nu/-ng` 查出来的 `owner/group`（**best-effort**，
+  查不到就留空、界面显示数字，不要编名字；查名字要放在 SFTP 锁外面）。
 - 文件管理的**权限显示模式**通过点列表表头「权限」列切换（没有独立按钮），与表头的三态排序
-  互不干扰；列表空白处右键有独立菜单（粘贴 / 打开终端 / 复制路径）。
+  互不干扰；列表空白处右键有独立菜单（新建文件 / 新建文件夹 / 上传 / 信息 / 打开终端 / 复制路径 / 刷新；
+  「粘贴」只在剪贴板**有本会话内容**时出现——为空不显示、来自别的会话才置灰说明原因）。
+  网格视图容器上的 `content-start` 不能删：网格默认会拉伸自动行，只有一行条目时那一行会被拉成
+  整屏高，悬停高亮就变成贯穿上下的一整列（第四轮修的真 bug，见 `docs/CONTRACT.md` 14.5）。
 - 会话改名必须走 `home.renameSession`（同时更新配置与顶栏标签，双向同步）；
   **不要**只改标签标题——那样配置里的名字与界面会长期不一致。
 - 上传弹窗三种来源（本地文件 / 本地目录 / 飞牛文件）都要有进度与取消；

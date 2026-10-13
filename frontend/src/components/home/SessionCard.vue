@@ -1,21 +1,29 @@
 <script setup lang="ts">
-// SessionCard — 首页的会话卡片（大号卡片，点「打开」即连接）。
+// SessionCard — 首页的会话卡片（点右上角的电源图标即连接）。
 //
 // 只做展示与抛事件：打开/关闭/编辑/删除的完整流程（确认框、toast、终端接线）在 HomeView，
 // 因为那里知道「其他卡片的状态」与「表单弹窗的显隐」，卡片自己不该管这些。
+//
+// 第五轮：卡片上的状态灯、「未打开/已打开」、打开时间、最近使用时间全部去掉——现在唯一的
+// 实时指示是终端列表本身。
+// 第六轮（当前这版）：
+//   - 关闭/编辑/删除移到**右上角**，仅图标、无边框，与会话名同一行且不换行；名字放不下就
+//     横向滚动（`overflow-x-auto whitespace-nowrap`），而不是把按钮挤下去或换行；
+//   - 不再标注认证方式（密码/密钥那两个徽标删掉）；
+//   - 打开的子终端**直接列在卡片下**（不再藏进弹窗），点一行就是「快捷打开」；
+//     每行右侧保留单个关闭按钮（它会终止远端的 shell，所以 HomeView 那边还有一次确认）。
 import { computed } from 'vue'
 import { t } from '@/i18n'
 import type { SessionState, SessionView } from '@/serverapi'
-import { relativeTime, sessionLabel, sessionTarget } from '@/utils/format'
+import { termStatusDotClass, useTerminalsStore, type TermTab } from '@/stores/terminals'
+import { formatTime, sessionLabel, sessionTarget } from '@/utils/format'
 
 const props = defineProps<{
   session: SessionView
   /** 后端实时状态（未打开时为空）。 */
   state?: SessionState
-  /** 该会话下的终端子标签数量。 */
-  terminalCount: number
-  /** 首页共享的「当前时间」，用于让「打开于 / 最近使用」这两个相对时间自己走字。 */
-  now: Date
+  /** 该会话已打开的终端子标签（直接列在卡片下）。 */
+  tabs: TermTab[]
   /** 正在打开/关闭：按钮先禁用，避免连点重复请求。 */
   busy?: boolean
 }>()
@@ -25,136 +33,55 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'edit'): void
   (e: 'remove'): void
-  /** 「N 个终端」按钮：打开终端列表弹窗（改名 / 关闭单个终端 / 新建）。 */
-  (e: 'terminals'): void
+  /** 快捷打开某个子终端：切到该会话并激活那个终端（HomeView 里接线）。 */
+  (e: 'open-terminal', uid: string): void
+  /** 关闭某个子终端（HomeView 会先确认：这会在远端杀掉那个 shell）。 */
+  (e: 'close-terminal', uid: string): void
 }>()
+
+const terminals = useTerminalsStore()
 
 const label = computed(() => sessionLabel(props.session))
 const target = computed(() => `${props.session.user}@${sessionTarget(props.session)}`)
-const openedAt = computed(() => props.state?.openedAt ?? '')
 const isOpen = computed(() => props.state?.open === true)
 </script>
 
 <template>
-  <article class="g-panel group flex flex-col p-5 transition-shadow hover:shadow-card">
-    <div class="flex items-start gap-3">
-      <div class="min-w-0 flex-1">
-        <h3 class="truncate text-lg font-semibold text-ink dark:text-ink-dark" :title="label">
+  <article class="g-panel group flex flex-col p-4 transition-shadow hover:shadow-card">
+    <!-- 第一行：会话名（放不下就横向滚动）+ 右上角三个仅图标按钮。
+         名字外面那层滚动容器必须有 min-w-0，否则 flex 子项不会收缩、滚动条永远不出现。 -->
+    <div class="flex items-center gap-1.5">
+      <div class="thin-scroll min-w-0 flex-1 overflow-x-auto">
+        <h3 class="whitespace-nowrap text-base font-semibold text-ink dark:text-ink-dark" :title="label">
           {{ label }}
         </h3>
-        <p class="mt-1 truncate font-mono text-sm text-ink-soft dark:text-ink-soft-dark" :title="target">
-          {{ target }}
-        </p>
       </div>
-      <!-- 凭据徽标：这张卡片的会话不保存凭据，每次连接都要重新输入（鼠标悬停给完整说明） -->
-      <span v-if="!session.credentialSaved" class="g-chip shrink-0" :title="t('home_cred_unsaved_hint')">
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-3.5 w-3.5 text-warning"
-        >
-          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-          <path d="M12 9v4" />
-          <path d="M12 17h.01" />
-        </svg>
-        {{ t('home_cred_unsaved') }}
-      </span>
-      <!-- 认证方式徽标：密码 / 密钥 -->
-      <span class="g-chip shrink-0">
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-3.5 w-3.5"
-        >
-          <template v-if="session.authType === 'password'">
-            <rect x="3" y="11" width="18" height="10" rx="2" />
-            <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-          </template>
-          <template v-else>
-            <circle cx="7.5" cy="15.5" r="4.5" />
-            <path d="m10.5 12.5 8-8" />
-            <path d="m15 5 3 3" />
-          </template>
-        </svg>
-        {{ session.authType === 'password' ? t('home_auth_password') : t('home_auth_key') }}
-      </span>
-    </div>
 
-    <p v-if="session.note" class="mt-3 line-clamp-2 text-sm text-ink-soft dark:text-ink-soft-dark">
-      {{ session.note }}
-    </p>
-
-    <!-- 打开状态：未打开 / 已打开 + 终端子标签数 + 打开于多久之前 -->
-    <div class="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs">
-      <span class="inline-flex items-center gap-1.5 font-medium text-ink dark:text-ink-dark">
-        <span
-          class="h-2 w-2 shrink-0 rounded-full"
-          :class="isOpen ? 'bg-success' : 'bg-ink-faint dark:bg-ink-faint-dark'"
-        ></span>
-        {{ isOpen ? t('home_opened') : t('home_closed') }}
-      </span>
-      <!-- 终端数量是个按钮：点开弹窗可以看到每个终端并改名/关闭/新建（契约 11.1.4） -->
+      <!-- 关闭用红色（第七轮要求）：它是「中断连接」这类破坏性动作，和「打开」共用一格时
+           靠颜色区分当前是哪一个；删除按钮本来就是红的，两者并排也不冲突。 -->
       <button
-        v-if="isOpen"
-        class="g-chip transition-colors hover:bg-black/10 dark:hover:bg-white/20"
-        :title="t('home_view_terminals')"
-        @click="emit('terminals')"
-      >
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-3.5 w-3.5"
-        >
-          <polyline points="4 17 10 11 4 5" />
-          <line x1="12" y1="19" x2="20" y2="19" />
-        </svg>
-        {{ t('home_terminal_count', { n: terminalCount }) }}
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-3 w-3"
-        >
-          <path d="m9 18 6-6-6-6" />
-        </svg>
-      </button>
-      <span v-if="isOpen && openedAt" class="text-ink-faint dark:text-ink-faint-dark">
-        {{ t('home_opened_at', { time: relativeTime(openedAt, now) }) }}
-      </span>
-    </div>
-
-    <p class="mt-2 text-xs text-ink-faint dark:text-ink-faint-dark">
-      {{
-        session.lastUsedAt
-          ? t('home_last_used', { time: relativeTime(session.lastUsedAt, now) })
-          : t('home_never_used')
-      }}
-    </p>
-
-    <!-- 操作：打开（或关闭，显眼）/ 编辑 / 删除 -->
-    <div class="mt-4 flex items-center gap-2">
-      <button
-        v-if="!isOpen"
-        class="g-btn-primary flex-1"
+        class="g-btn-ghost !h-8 !w-8 shrink-0 !px-0"
+        :class="isOpen ? '!text-danger hover:!bg-danger/10' : ''"
         :disabled="busy"
-        @click="emit('open')"
+        :title="isOpen ? t('home_close') : t('home_open')"
+        :aria-label="isOpen ? t('home_close') : t('home_open')"
+        @click="isOpen ? emit('close') : emit('open')"
       >
         <svg
+          v-if="isOpen"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          class="h-4 w-4"
+        >
+          <path d="M18.36 6.64A9 9 0 1 1 5.64 6.64" />
+          <line x1="12" y1="2" x2="12" y2="12" />
+        </svg>
+        <svg
+          v-else
           viewBox="0 0 24 24"
           fill="none"
           stroke="currentColor"
@@ -167,29 +94,15 @@ const isOpen = computed(() => props.state?.open === true)
           <path d="M10 14 21 3" />
           <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
         </svg>
-        {{ t('home_open') }}
       </button>
+
       <button
-        v-else
-        class="g-btn-danger flex-1"
+        class="g-btn-ghost !h-8 !w-8 shrink-0 !px-0"
         :disabled="busy"
-        @click="emit('close')"
+        :title="t('common_edit')"
+        :aria-label="t('common_edit')"
+        @click="emit('edit')"
       >
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-4 w-4"
-        >
-          <path d="M18.36 6.64A9 9 0 1 1 5.64 6.64" />
-          <line x1="12" y1="2" x2="12" y2="12" />
-        </svg>
-        {{ t('home_close') }}
-      </button>
-      <button class="g-btn-secondary" :disabled="busy" :title="t('common_edit')" @click="emit('edit')">
         <svg
           viewBox="0 0 24 24"
           fill="none"
@@ -202,10 +115,12 @@ const isOpen = computed(() => props.state?.open === true)
           <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
         </svg>
       </button>
+
       <button
-        class="g-btn-ghost !h-10 !px-3 !text-danger hover:!bg-danger/10"
+        class="g-btn-ghost !h-8 !w-8 shrink-0 !px-0 !text-danger hover:!bg-danger/10"
         :disabled="busy"
         :title="t('common_delete')"
+        :aria-label="t('common_delete')"
         @click="emit('remove')"
       >
         <svg
@@ -224,5 +139,78 @@ const isOpen = computed(() => props.state?.open === true)
         </svg>
       </button>
     </div>
+
+    <p class="mt-0.5 truncate font-mono text-xs text-ink-soft dark:text-ink-soft-dark" :title="target">
+      {{ target }}
+    </p>
+
+    <p v-if="session.note" class="mt-2 line-clamp-2 text-sm text-ink-soft dark:text-ink-soft-dark">
+      {{ session.note }}
+    </p>
+
+    <!-- 凭据未保存的提醒（不是敏感信息，是「下次连要重新输入」这个事实） -->
+    <span
+      v-if="!session.credentialSaved"
+      class="g-chip mt-2 self-start"
+      :title="t('home_cred_unsaved_hint')"
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="h-3.5 w-3.5 text-warning"
+      >
+        <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+        <path d="M12 9v4" />
+        <path d="M12 17h.01" />
+      </svg>
+      {{ t('home_cred_unsaved') }}
+    </span>
+
+    <!-- 打开的子终端：直接列在卡片下（第六轮：不再藏进弹窗）。
+         整行是「快捷打开」（切到该会话 + 激活这个终端 + 把焦点交给它），右侧的 × 单独关掉它。 -->
+    <ul v-if="tabs.length" class="mt-3 space-y-1">
+      <li
+        v-for="tab in tabs"
+        :key="tab.uid"
+        class="flex items-center gap-1 rounded-md border border-line/70 px-1.5 py-1 dark:border-line-dark/70"
+      >
+        <button
+          class="flex min-w-0 flex-1 items-center gap-2 rounded px-0.5 py-0.5 text-left hover:bg-black/5 dark:hover:bg-white/5"
+          :title="t('home_term_open')"
+          @click="emit('open-terminal', tab.uid)"
+        >
+          <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="termStatusDotClass(tab)"></span>
+          <span class="min-w-0 flex-1 truncate text-sm text-ink dark:text-ink-dark">
+            {{ terminals.titleOf(session.id, tab) }}
+          </span>
+          <span class="shrink-0 text-[11px] text-ink-faint dark:text-ink-faint-dark">
+            {{ formatTime(tab.createdAt) }}
+          </span>
+        </button>
+        <!-- 关闭这个终端：鼠标悬停才变红，触屏常驻红（.close-danger，见 style.css） -->
+        <button
+          class="close-danger flex h-6 w-6 shrink-0 items-center justify-center"
+          :title="t('home_term_close')"
+          :aria-label="t('home_term_close')"
+          @click.stop="emit('close-terminal', tab.uid)"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            class="h-3.5 w-3.5"
+          >
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </li>
+    </ul>
   </article>
 </template>

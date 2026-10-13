@@ -20,6 +20,7 @@ import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, describeError, type ArchiveFormat } from '@/serverapi'
 import { usePaneControlsStore } from '@/stores/paneControls'
+import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
@@ -33,6 +34,7 @@ const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
 // 本组件**不 emit**：点目录只更新共享的当前目录（sftp store）与展开状态；主区域显示什么由
 // 子标签栏决定（`sessionUi.activeSubOf`），从树里点一下就切走会打断正在终端里干活的人。
 const sftp = useSftpStore()
+const ui = useSessionUiStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 const toastStore = useToastStore()
@@ -96,8 +98,6 @@ async function toggleNode(path: string, event: MouseEvent) {
 // ---- 首次定位 + 高亮滚入视野 ----
 
 const scrollEl = ref<HTMLElement | null>(null)
-/** 已经做过首次定位的会话：home 之后再变（理论上不该）也不把树重新拽回家目录。 */
-const revealed = new Set<string>()
 
 async function scrollTo(path: string) {
   await nextTick()
@@ -111,15 +111,42 @@ async function scrollTo(path: string) {
   row?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
 }
 
+/**
+ * 把树拉回登录用户的家目录：只展开到 home 那一条链路（`expandPath` 会顺手收起链外的节点），
+ * 并把那一行滚进视野。
+ *
+ * 两个时机各做一次（第八轮）——这就是原来那个「家目录」按钮的活，按钮删掉了，行为留着：
+ *  1. **新打开会话**（`home` 第一次到手）：树上要「站在」用户的主场，不用一层层点进去；
+ *  2. **重新展开面包屑**（左栏从收起变回显示）：收起期间用户可能已经在别处逛过，链路也
+ *     被收掉了；重新展开时把视线拉回主场。
+ *
+ * 左栏是 `v-show` 隐藏的：隐藏时 `display:none`，`scrollIntoView` 一点效果都没有，
+ * 所以两个入口都先 `await nextTick()` 等 DOM 真的可见了再滚。
+ */
+async function revealHome() {
+  const home = state.value.home
+  if (!home) return
+  await sftp.expandPath(sid, home)
+  await nextTick()
+  await scrollTo(home)
+}
+
 // 家目录要等 ensure 拿到响应才知道（不同账号可能是 /root、/home/x），所以盯 home 而不是
 // 在 mounted 里直接跑。
 watch(
   () => state.value.home,
   (home) => {
-    if (!home || revealed.has(sid)) return
-    revealed.add(sid)
-    // 从 `/` 一路展开到 home：树上就「站在」用户的主场，不用一层层点进去
-    void sftp.expandPath(sid, home).then(() => void scrollTo(home))
+    if (home) void revealHome()
+  }
+)
+
+// 重新展开面包屑（leftHidden: true → false）时再拉一次家目录。只在「收起 → 显示」那一刻做：
+// hidden 变 true 时左栏正要消失，什么都不用做（此刻滚也滚不动）。
+watch(
+  () => ui.leftHiddenOf(sid),
+  (hidden, wasHidden) => {
+    if (hidden || !wasHidden) return
+    void nextTick().then(() => revealHome())
   }
 )
 

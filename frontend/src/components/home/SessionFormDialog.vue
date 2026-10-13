@@ -92,7 +92,9 @@ function reset() {
   password.value = ''
   privateKey.value = ''
   passphrase.value = ''
-  note.value = ''
+  // 备注必须**回填已有值**：它是整份提交的普通字段（见 buildInput），留空提交等于把配置里的
+  // 备注清掉——用户点开「编辑」只是想改个名字，顺手保存就把备注弄没了（第四轮用户报的）。
+  note.value = s?.note ?? ''
   saveCredential.value = s ? s.credentialSaved : true
   formError.value = ''
   testResult.value = null
@@ -205,7 +207,7 @@ async function runTest() {
   if (!input) return
   testing.value = true
   testResult.value = null
-  testHost.value = input.host
+  testHost.value = input.host ?? host.value
   try {
     testResult.value = await home.test(input)
   } catch (e) {
@@ -290,240 +292,249 @@ function onDiscardVisible(v: boolean) {
         <div class="absolute inset-0 bg-black/50" @click="requestClose"></div>
         <div class="region-center absolute left-0 right-0 flex items-center justify-center px-4">
           <div
-            class="pointer-events-auto relative max-h-[90%] w-full max-w-lg overflow-y-auto rounded-xl border border-line bg-surface p-5 shadow-pop dark:border-line-dark dark:bg-surface-dark"
+            class="pointer-events-auto relative flex max-h-[90%] w-full max-w-lg flex-col rounded-xl border border-line bg-surface shadow-pop dark:border-line-dark dark:bg-surface-dark"
           >
-            <div class="flex items-center justify-between">
+            <!-- 标题与关闭按钮固定在顶部、不参与滚动（第七轮用户要求）：表单很长时中间那段
+                 自己滚，标题和 × 一直在——否则要滚回顶部才能关掉弹窗。页脚同理固定在底部。 -->
+            <div
+              class="flex shrink-0 items-center justify-between border-b border-line px-5 py-3 dark:border-line-dark"
+            >
               <h3 class="font-display text-base font-semibold text-ink dark:text-ink-dark">
                 {{ isEdit ? t('form_edit_title') : t('form_new_title') }}
               </h3>
               <button class="g-btn-ghost !h-8 !px-2 text-lg leading-none" @click="requestClose">×</button>
             </div>
 
-            <div class="mt-4 space-y-3">
-              <div>
-                <label for="field-sessionformdialog-1" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                  {{ t('form_name') }}
-                </label>
-                <input id="field-sessionformdialog-1" v-model="name" class="g-input" :placeholder="t('form_name_placeholder')" />
-              </div>
-
-              <div class="flex gap-2">
-                <div class="min-w-0 flex-1">
-                  <label for="field-sessionformdialog-2" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                    {{ t('form_host') }}
+            <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              <div class="space-y-3">
+                <div>
+                  <label for="field-sessionformdialog-1" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                    {{ t('form_name') }}
                   </label>
-                  <input id="field-sessionformdialog-2"
-                    v-model="host"
+                  <input id="field-sessionformdialog-1" v-model="name" class="g-input" :placeholder="t('form_name_placeholder')" />
+                </div>
+
+                <div class="flex gap-2">
+                  <div class="min-w-0 flex-1">
+                    <label for="field-sessionformdialog-2" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                      {{ t('form_host') }}
+                    </label>
+                    <input id="field-sessionformdialog-2"
+                      v-model="host"
+                      class="g-input font-mono"
+                      :placeholder="t('form_host_placeholder')"
+                      autocapitalize="off"
+                      autocorrect="off"
+                      spellcheck="false"
+                    />
+                  </div>
+                  <div class="w-24 shrink-0">
+                    <label for="field-sessionformdialog-3" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                      {{ t('form_port') }}
+                    </label>
+                    <input id="field-sessionformdialog-3" v-model="port" class="g-input font-mono" inputmode="numeric" placeholder="22" />
+                  </div>
+                </div>
+
+                <div>
+                  <label for="field-sessionformdialog-4" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                    {{ t('form_user') }}
+                  </label>
+                  <input id="field-sessionformdialog-4"
+                    v-model="user"
                     class="g-input font-mono"
-                    :placeholder="t('form_host_placeholder')"
+                    :placeholder="t('form_user_placeholder')"
                     autocapitalize="off"
                     autocorrect="off"
                     spellcheck="false"
                   />
-                </div>
-                <div class="w-24 shrink-0">
-                  <label for="field-sessionformdialog-3" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                    {{ t('form_port') }}
-                  </label>
-                  <input id="field-sessionformdialog-3" v-model="port" class="g-input font-mono" inputmode="numeric" placeholder="22" />
-                </div>
-              </div>
-
-              <div>
-                <label for="field-sessionformdialog-4" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                  {{ t('form_user') }}
-                </label>
-                <input id="field-sessionformdialog-4"
-                  v-model="user"
-                  class="g-input font-mono"
-                  :placeholder="t('form_user_placeholder')"
-                  autocapitalize="off"
-                  autocorrect="off"
-                  spellcheck="false"
-                />
-                <p class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
-                  {{ t('form_identity_hint') }}
-                </p>
-              </div>
-
-              <div>
-                <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                  {{ t('form_auth_type') }}
-                </label>
-                <div class="grid grid-cols-2 gap-2">
-                  <button
-                    v-for="opt in authOptions"
-                    :key="opt"
-                    class="rounded-md border px-3 py-2 text-sm font-medium transition-colors"
-                    :class="
-                      authType === opt
-                        ? 'border-brand bg-brand/10 text-brand'
-                        : 'border-line text-ink hover:border-brand dark:border-line-dark dark:text-ink-dark'
-                    "
-                    @click="authType = opt"
-                  >
-                    {{ opt === 'password' ? t('form_auth_password') : t('form_auth_key') }}
-                  </button>
-                </div>
-                <p
-                  v-if="authChangedHint"
-                  class="mt-1 text-xs text-warning"
-                >
-                  {{ t('form_auth_changed_hint') }}
-                </p>
-              </div>
-
-              <div v-if="authType === 'password'">
-                <label for="field-sessionformdialog-6" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                  {{ t('form_password') }}
-                </label>
-                <input id="field-sessionformdialog-6"
-                  v-model="password"
-                  class="g-input"
-                  type="password"
-                  autocomplete="new-password"
-                  :placeholder="t('form_password_placeholder')"
-                />
-                <p v-if="keepHint" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
-                  {{ t('form_password_keep') }}
-                </p>
-              </div>
-
-              <template v-else>
-                <div>
-                  <label for="field-sessionformdialog-7" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                    {{ t('form_private_key') }}
-                  </label>
-                  <textarea id="field-sessionformdialog-7"
-                    v-model="privateKey"
-                    class="g-input resize-y font-mono text-xs"
-                    rows="4"
-                    spellcheck="false"
-                    :placeholder="t('form_private_key_placeholder')"
-                  ></textarea>
-                  <p v-if="keepHint" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
-                    {{ t('form_private_key_keep') }}
+                  <p class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
+                    {{ t('form_identity_hint') }}
                   </p>
                 </div>
+
                 <div>
-                  <label for="field-sessionformdialog-8" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                    {{ t('form_passphrase') }}
+                  <label class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                    {{ t('form_auth_type') }}
                   </label>
-                  <input id="field-sessionformdialog-8"
-                    v-model="passphrase"
+                  <div class="grid grid-cols-2 gap-2">
+                    <button
+                      v-for="opt in authOptions"
+                      :key="opt"
+                      class="rounded-md border px-3 py-2 text-sm font-medium transition-colors"
+                      :class="
+                        authType === opt
+                          ? 'border-brand bg-brand/10 text-brand'
+                          : 'border-line text-ink hover:border-brand dark:border-line-dark dark:text-ink-dark'
+                      "
+                      @click="authType = opt"
+                    >
+                      {{ opt === 'password' ? t('form_auth_password') : t('form_auth_key') }}
+                    </button>
+                  </div>
+                  <p
+                    v-if="authChangedHint"
+                    class="mt-1 text-xs text-warning"
+                  >
+                    {{ t('form_auth_changed_hint') }}
+                  </p>
+                </div>
+
+                <div v-if="authType === 'password'">
+                  <label for="field-sessionformdialog-6" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                    {{ t('form_password') }}
+                  </label>
+                  <input id="field-sessionformdialog-6"
+                    v-model="password"
                     class="g-input"
                     type="password"
                     autocomplete="new-password"
-                    :placeholder="t('form_passphrase_placeholder')"
+                    :placeholder="t('form_password_placeholder')"
                   />
+                  <p v-if="keepHint" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
+                    {{ t('form_password_keep') }}
+                  </p>
                 </div>
-              </template>
 
-              <!-- 凭据保存开关（契约 11.1.3）：关掉 = 不写入数据目录，凭据只活在后端内存里，
-                   该会话关闭或后端重启后要重新输入。文案按认证方式分（保存密码 / 保存私钥）。 -->
-              <div class="rounded-md border border-line px-3 py-2.5 dark:border-line-dark">
-                <label class="flex cursor-pointer items-start gap-2.5" :title="t('form_save_credential')">
-                  <input v-model="saveCredential" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-brand" />
-                  <span class="min-w-0">
-                    <span class="block text-sm font-medium text-ink dark:text-ink-dark">
+                <template v-else>
+                  <div>
+                    <label for="field-sessionformdialog-7" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                      {{ t('form_private_key') }}
+                    </label>
+                    <textarea id="field-sessionformdialog-7"
+                      v-model="privateKey"
+                      class="g-input resize-y font-mono text-xs"
+                      rows="4"
+                      spellcheck="false"
+                      :placeholder="t('form_private_key_placeholder')"
+                    ></textarea>
+                    <p v-if="keepHint" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
+                      {{ t('form_private_key_keep') }}
+                    </p>
+                  </div>
+                  <div>
+                    <label for="field-sessionformdialog-8" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                      {{ t('form_passphrase') }}
+                    </label>
+                    <input id="field-sessionformdialog-8"
+                      v-model="passphrase"
+                      class="g-input"
+                      type="password"
+                      autocomplete="new-password"
+                      :placeholder="t('form_passphrase_placeholder')"
+                    />
+                  </div>
+                </template>
+
+                <!-- 凭据保存开关（契约 11.1.3）：关掉 = 不写入数据目录，凭据只活在后端内存里，
+                     该会话关闭或后端重启后要重新输入。文案按认证方式分（保存密码 / 保存私钥）。 -->
+                <div class="rounded-md border border-line px-3 py-2.5 dark:border-line-dark">
+                  <label class="flex cursor-pointer items-start gap-2.5" :title="t('form_save_credential')">
+                    <input v-model="saveCredential" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-brand" />
+                    <span class="min-w-0">
+                      <span class="block text-sm font-medium text-ink dark:text-ink-dark">
+                        {{
+                          authType === 'password'
+                            ? t('form_save_credential_password')
+                            : t('form_save_credential_key')
+                        }}
+                      </span>
+                      <span class="mt-0.5 block text-xs text-ink-faint dark:text-ink-faint-dark">
+                        {{ t('form_save_credential_hint') }}
+                      </span>
+                    </span>
+                  </label>
+                </div>
+
+                <div>
+                  <label for="field-sessionformdialog-9" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                    {{ t('form_note') }}
+                  </label>
+                  <input id="field-sessionformdialog-9" v-model="note" class="g-input" :placeholder="t('form_note_placeholder')" />
+                </div>
+
+                <p v-if="formError" class="break-words text-xs text-danger">{{ formError }}</p>
+
+                <!-- 测试连接结果 -->
+                <div
+                  v-if="testing"
+                  class="rounded-md border border-line px-3 py-2 text-xs text-ink-soft dark:border-line-dark dark:text-ink-soft-dark"
+                >
+                  {{ t('test_pending', { host: testHost }) }}
+                </div>
+                <div
+                  v-else-if="testResult"
+                  class="space-y-1.5 rounded-md border border-line px-3 py-2 text-xs dark:border-line-dark"
+                >
+                  <div class="flex items-center gap-2">
+                    <span
+                      class="h-2 w-2 shrink-0 rounded-full"
+                      :class="testResult.success ? 'bg-success' : 'bg-danger'"
+                    ></span>
+                    <span
+                      class="font-medium"
+                      :class="testResult.success ? 'text-success' : 'text-danger'"
+                    >
                       {{
-                        authType === 'password'
-                          ? t('form_save_credential_password')
-                          : t('form_save_credential_key')
+                        testResult.success
+                          ? t('test_ok', { ms: testResult.latencyMs ?? 0 })
+                          : t('test_failed')
                       }}
                     </span>
-                    <span class="mt-0.5 block text-xs text-ink-faint dark:text-ink-faint-dark">
-                      {{ t('form_save_credential_hint') }}
-                    </span>
-                  </span>
-                </label>
-              </div>
+                  </div>
+                  <p v-if="testResult.success" class="text-ink-soft dark:text-ink-soft-dark">
+                    {{ t('test_ok_detail') }}
+                  </p>
+                  <p v-else class="break-words text-danger">{{ outcomeText(testResult) }}</p>
 
-              <div>
-                <label for="field-sessionformdialog-9" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                  {{ t('form_note') }}
-                </label>
-                <input id="field-sessionformdialog-9" v-model="note" class="g-input" :placeholder="t('form_note_placeholder')" />
-              </div>
-
-              <p v-if="formError" class="break-words text-xs text-danger">{{ formError }}</p>
-
-              <!-- 测试连接结果 -->
-              <div
-                v-if="testing"
-                class="rounded-md border border-line px-3 py-2 text-xs text-ink-soft dark:border-line-dark dark:text-ink-soft-dark"
-              >
-                {{ t('test_pending', { host: testHost }) }}
-              </div>
-              <div
-                v-else-if="testResult"
-                class="space-y-1.5 rounded-md border border-line px-3 py-2 text-xs dark:border-line-dark"
-              >
-                <div class="flex items-center gap-2">
-                  <span
-                    class="h-2 w-2 shrink-0 rounded-full"
-                    :class="testResult.success ? 'bg-success' : 'bg-danger'"
-                  ></span>
-                  <span
-                    class="font-medium"
-                    :class="testResult.success ? 'text-success' : 'text-danger'"
+                  <dl
+                    v-if="testResult.fingerprint || testResult.keyType || testResult.banner"
+                    class="grid grid-cols-[5.5rem_1fr] gap-x-2 gap-y-1"
                   >
-                    {{
-                      testResult.success
-                        ? t('test_ok', { ms: testResult.latencyMs ?? 0 })
-                        : t('test_failed')
-                    }}
-                  </span>
-                </div>
-                <p v-if="testResult.success" class="text-ink-soft dark:text-ink-soft-dark">
-                  {{ t('test_ok_detail') }}
-                </p>
-                <p v-else class="break-words text-danger">{{ outcomeText(testResult) }}</p>
+                    <template v-if="testResult.fingerprint">
+                      <dt class="text-ink-faint dark:text-ink-faint-dark">{{ t('test_fingerprint') }}</dt>
+                      <dd class="break-all font-mono">{{ testResult.fingerprint }}</dd>
+                    </template>
+                    <template v-if="testResult.keyType">
+                      <dt class="text-ink-faint dark:text-ink-faint-dark">{{ t('test_key_type') }}</dt>
+                      <dd class="font-mono">{{ testResult.keyType }}</dd>
+                    </template>
+                    <template v-if="testResult.banner">
+                      <dt class="text-ink-faint dark:text-ink-faint-dark">{{ t('test_banner') }}</dt>
+                      <dd class="break-all font-mono">{{ testResult.banner }}</dd>
+                    </template>
+                  </dl>
 
-                <dl
-                  v-if="testResult.fingerprint || testResult.keyType || testResult.banner"
-                  class="grid grid-cols-[5.5rem_1fr] gap-x-2 gap-y-1"
-                >
-                  <template v-if="testResult.fingerprint">
-                    <dt class="text-ink-faint dark:text-ink-faint-dark">{{ t('test_fingerprint') }}</dt>
-                    <dd class="break-all font-mono">{{ testResult.fingerprint }}</dd>
-                  </template>
-                  <template v-if="testResult.keyType">
-                    <dt class="text-ink-faint dark:text-ink-faint-dark">{{ t('test_key_type') }}</dt>
-                    <dd class="font-mono">{{ testResult.keyType }}</dd>
-                  </template>
-                  <template v-if="testResult.banner">
-                    <dt class="text-ink-faint dark:text-ink-faint-dark">{{ t('test_banner') }}</dt>
-                    <dd class="break-all font-mono">{{ testResult.banner }}</dd>
-                  </template>
-                </dl>
-
-                <p
-                  v-if="testResult.fingerprint && !testResult.mismatch"
-                  class="text-ink-soft dark:text-ink-soft-dark"
-                >
-                  {{ testResult.trusted ? t('test_trusted') : t('test_untrusted') }}
-                </p>
-
-                <div v-if="needTrust" class="space-y-1.5 pt-1">
-                  <p class="text-warning">{{ t('test_need_trust_first') }}</p>
-                  <button
-                    class="g-btn-secondary !h-8 !px-3 text-xs"
-                    :disabled="trusting"
-                    @click="trustAndRetest"
+                  <p
+                    v-if="testResult.fingerprint && !testResult.mismatch"
+                    class="text-ink-soft dark:text-ink-soft-dark"
                   >
-                    {{ t('test_trust') }}
-                  </button>
-                </div>
+                    {{ testResult.trusted ? t('test_trusted') : t('test_untrusted') }}
+                  </p>
 
-                <p v-if="testResult.mismatch" class="text-danger">
-                  {{ t('test_mismatch_hint') }}
-                </p>
+                  <div v-if="needTrust" class="space-y-1.5 pt-1">
+                    <p class="text-warning">{{ t('test_need_trust_first') }}</p>
+                    <button
+                      class="g-btn-secondary !h-8 !px-3 text-xs"
+                      :disabled="trusting"
+                      @click="trustAndRetest"
+                    >
+                      {{ t('test_trust') }}
+                    </button>
+                  </div>
+
+                  <p v-if="testResult.mismatch" class="text-danger">
+                    {{ t('test_mismatch_hint') }}
+                  </p>
+                </div>
               </div>
             </div>
 
-            <div class="mt-5 flex justify-end gap-2">
-              <button class="g-btn-ghost !h-9 !px-4 text-sm" @click="requestClose">
+            <!-- 页脚：三个按钮都「有边框、不填色」（第七轮用户要求），靠文字区分主次 -->
+            <div
+              class="flex shrink-0 justify-end gap-2 border-t border-line px-5 py-3 dark:border-line-dark"
+            >
+              <button class="g-btn-secondary !h-9 !px-4 text-sm" @click="requestClose">
                 {{ t('common_cancel') }}
               </button>
               <button
@@ -534,7 +545,7 @@ function onDiscardVisible(v: boolean) {
                 {{ testing ? t('form_testing') : t('form_test') }}
               </button>
               <button
-                class="g-btn-primary !h-9 !px-5 text-sm"
+                class="g-btn-secondary !h-9 !px-5 text-sm"
                 :disabled="saving || testing"
                 @click="submit"
               >

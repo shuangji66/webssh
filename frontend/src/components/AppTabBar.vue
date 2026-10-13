@@ -263,14 +263,11 @@ onBeforeUnmount(() => {
           {{ terminals.countOf(tab.id) }}
         </span>
 
+        <!-- 关闭按钮：鼠标悬停才变红，触屏常驻红（.close-danger，见 style.css） -->
         <button
           v-if="tab.closable"
-          class="hover-reveal flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors"
-          :class="
-            tab.id === tabs.activeId
-              ? 'text-white/80 hover:bg-white/20'
-              : 'text-ink-faint hover:bg-black/10 dark:hover:bg-white/10'
-          "
+          class="close-danger flex h-4 w-4 shrink-0 items-center justify-center"
+          :class="tab.id === tabs.activeId ? 'on-brand' : ''"
           :title="t('common_close')"
           @click.stop="requestClose(tab.id)"
         >

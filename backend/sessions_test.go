@@ -246,6 +246,17 @@ func TestSessionInputSemantics(t *testing.T) {
 	if strOf(upd["session"], "note") != "" {
 		t.Fatalf("note 传空串应清空：%v", upd["session"])
 	}
+	// name 给了空字符串 → 清除自定义名（前端会退回 user@host 展示）。
+	// 第六轮修：原来那版把空串当成「保持原值」，用户清空名称保存后界面上还是旧名字。
+	upd = a.ok(t, "/api/sessions/save", map[string]any{"id": sid, "name": ""})
+	if strOf(upd["session"], "name") != "" {
+		t.Fatalf("name 传空串应清空：%v", upd["session"])
+	}
+	// 字段缺省（压根不发 name）→ 保持原值（上面刚清空，这里不该被塞回默认名）
+	upd = a.ok(t, "/api/sessions/save", map[string]any{"id": sid, "note": "n2"})
+	if strOf(upd["session"], "name") != "" {
+		t.Fatalf("缺省 name 不该改名字：%v", upd["session"])
+	}
 	// password 给了空字符串 → 清除（契约第 4.3 节：空串 = 清除该字段）
 	upd = a.ok(t, "/api/sessions/save", map[string]any{
 		"id": sid, "host": "h", "user": "u", "authType": "password", "password": "",

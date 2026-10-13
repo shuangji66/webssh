@@ -2,31 +2,34 @@
 // HomeView — 首页：会话卡片网格（只平铺，不做列表/表格视图）。
 //
 // 打开会话的完整接线（契约 6.3）都在这里：home.openSession → appTabs.openSession →
-// terminals.ensure → 桌面端没有终端标签就自动建一个。顺序不能乱：标签要先建好，
-// SessionView 才会挂载，终端面板才有地方登记 paneControls。
+// terminals.ensure → 一个终端都没有就自动建一个（桌面与窄屏一样，第五轮统一）。
+// 顺序不能乱：标签要先建好，SessionView 才会挂载，终端面板才有地方登记 paneControls。
+//
+// 第六轮：卡片上的**子终端列表**由这里接线——「快捷打开」= 切应用标签 + 激活那个子终端 +
+// 把键盘焦点交给它（panes.get 在 SessionView 挂载的那一帧就已注册，见 TerminalPane 的 setup）；
+// 单个终端的关闭同样从这里走确认框（它会终止远端的 shell）。原来的终端列表弹窗已删除。
 //
 // 「不保存凭据」的会话会在这里收到 `credential_required`（契约 11.1.3）：那不是失败，
 // 而是「请先输入凭据」，所以转成 CredentialPromptDialog，填完带凭据重试一次。
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, describeError, type SessionView } from '@/serverapi'
-import { useMobileLayout } from '@/composables/useMobileLayout'
 import { useAppTabsStore } from '@/stores/appTabs'
 import { useHomeStore, type SessionCredential } from '@/stores/home'
+import { usePaneControlsStore } from '@/stores/paneControls'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
 import { sessionLabel } from '@/utils/format'
 import SessionCard from '@/components/home/SessionCard.vue'
 import SessionFormDialog from '@/components/home/SessionFormDialog.vue'
-import SessionTerminalsDialog from '@/components/home/SessionTerminalsDialog.vue'
 import CredentialPromptDialog from '@/components/CredentialPromptDialog.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 
 const home = useHomeStore()
 const tabs = useAppTabsStore()
 const terminals = useTerminalsStore()
+const panes = usePaneControlsStore()
 const toast = useToastStore()
-const isMobile = useMobileLayout()
 
 /** 设置弹窗挂在壳层（App.vue），这里只抛事件——它是应用级设置（主题/语言/字体），不是首页的。 */
 const emit = defineEmits<{
@@ -37,10 +40,6 @@ const formVisible = ref(false)
 const editing = ref<SessionView | null>(null)
 /** 正在打开/关闭的会话 id（按钮禁用，防连点）。 */
 const busyId = ref('')
-
-/** 终端列表弹窗（点卡片上的「N 个终端」）。空串 = 没打开。 */
-const terminalsSid = ref('')
-const terminalsVisible = ref(false)
 
 // ---------- 卡片列表 ----------
 
@@ -55,20 +54,8 @@ const list = computed(() => {
   return items
 })
 
-// 相对时间（「打开于 X 分钟前」）要自己走字：没有定时器的话，只有别的状态变化才会重算，
-// 放在那儿的会话会一直显示「刚刚」。30s 粒度足够（最小单位是分钟）。
-const now = ref(new Date())
-let tick = 0
-
 onMounted(() => {
   if (!home.loaded) void home.load()
-  tick = window.setInterval(() => {
-    now.value = new Date()
-  }, 30_000)
-})
-
-onBeforeUnmount(() => {
-  if (tick) window.clearInterval(tick)
 })
 
 // ---------- 打开 / 关闭 ----------
@@ -96,7 +83,9 @@ async function openWith(session: SessionView, credential?: SessionCredential) {
   // ensure 恢复后端已有的终端（并把激活项落到第一个），add 新建即激活 —— 两者都会写
   // sessionUi，这里不需要（也不应该）再去改激活项，否则会和 store 的选择打架。
   terminals.ensure(session.id, state)
-  if (!isMobile.value && terminals.countOf(session.id) === 0) terminals.add(session.id)
+  // 桌面与窄屏都要自动建一个终端（契约 11.7 / 第五轮用户要求：手机上新开会话也直接落在
+  // 「终端 1」，而不是丢进文件管理子标签——新会话的第一件事就是敲命令）
+  if (terminals.countOf(session.id) === 0) terminals.add(session.id)
   toast.show(t('home_open_success', { name: sessionLabel(session) }), 'success')
 }
 
@@ -146,25 +135,29 @@ async function onClose(session: SessionView) {
     return
   }
   home.forgetSession(session.id)
-  closeTerminalsDialog(session.id)
   toast.show(t('home_close_success', { name: sessionLabel(session) }), 'success')
   busyId.value = ''
 }
 
-// ---------- 终端列表弹窗 ----------
-
-function onViewTerminals(session: SessionView) {
-  terminalsSid.value = session.id
-  terminalsVisible.value = true
-}
+// ---------- 卡片上的子终端（第六轮：内联列表 + 快捷打开） ----------
 
 /**
- * 会话被关掉 / 删掉时收起它的终端清单弹窗。
- * 不收的话弹窗会留在屏幕上显示一个空列表（终端标签已经跟着 forget 清掉了），
- * 用户只能自己点 ×——而那一刻他会以为「终端都消失了」。
+ * 快捷打开某个子终端：切到该会话的应用标签 → 激活那个终端子标签 → 把键盘焦点交给它。
+ *
+ * 焦点为什么放在 nextTick 里：`openSession` 只是建标签/改激活项，SessionView（以及它里面的
+ * TerminalPane）要到下一帧才被创建；而 paneControls 的注册发生在 TerminalPane 的 setup 里，
+ * 所以 nextTick 之后 `get()` 一定拿得到。拿不到也不报错——终端本身已经切过去了，
+ * 用户点一下就能打字，这里只是顺手把焦点送进去。
  */
-function closeTerminalsDialog(sid: string) {
-  if (terminalsSid.value === sid) terminalsVisible.value = false
+function onOpenTerminal(session: SessionView, uid: string) {
+  tabs.openSession(session.id, sessionLabel(session))
+  terminals.setActive(session.id, uid)
+  void nextTick(() => panes.get(session.id, uid)?.focus())
+}
+
+/** 关闭某个子终端：先确认（会终止远端的 shell），见 pending 的 kind: 'term'。 */
+function onCloseTerminal(session: SessionView, uid: string) {
+  pending.value = { kind: 'term', session, uid }
 }
 
 // ---------- 编辑 / 删除 ----------
@@ -185,18 +178,29 @@ function onSaved(session: SessionView) {
   tabs.syncTitle(session.id, sessionLabel(session))
 }
 
-const pending = ref<{ kind: 'close' | 'delete'; session: SessionView } | null>(null)
-
-const confirmTitle = computed(() =>
-  pending.value?.kind === 'delete' ? t('home_delete_confirm_title') : t('home_close_confirm_title')
+const pending = ref<{ kind: 'close' | 'delete' | 'term'; session: SessionView; uid?: string } | null>(
+  null
 )
+
+const confirmTitle = computed(() => {
+  const kind = pending.value?.kind
+  if (kind === 'delete') return t('home_delete_confirm_title')
+  if (kind === 'term') return t('termlist_close_confirm_title')
+  return t('home_close_confirm_title')
+})
+
 const confirmMessage = computed(() => {
   const p = pending.value
   if (!p) return ''
   const name = sessionLabel(p.session)
-  return p.kind === 'delete'
-    ? t('home_delete_confirm_msg', { name })
-    : t('home_close_confirm_msg', { name })
+  if (p.kind === 'delete') return t('home_delete_confirm_msg', { name })
+  if (p.kind === 'term') {
+    const tab = terminals.tabsOf(p.session.id).find((item) => item.uid === p.uid)
+    return t('termlist_close_confirm_msg', {
+      title: tab ? terminals.titleOf(p.session.id, tab) : ''
+    })
+  }
+  return t('home_close_confirm_msg', { name })
 })
 
 function onConfirmPending() {
@@ -204,7 +208,10 @@ function onConfirmPending() {
   pending.value = null
   if (!p) return
   if (p.kind === 'close') void onClose(p.session)
-  else void onDelete(p.session)
+  else if (p.kind === 'term') {
+    // closeTab 内部会发 /api/terminals/close：远程那个 shell 就此终止（所以上面先确认）
+    if (p.uid) terminals.closeTab(p.session.id, p.uid)
+  } else void onDelete(p.session)
 }
 
 async function onDelete(session: SessionView) {
@@ -222,7 +229,6 @@ async function onDelete(session: SessionView) {
       home.forgetSession(session.id)
     }
     await home.remove(session.id)
-    closeTerminalsDialog(session.id)
     toast.show(t('home_delete_success', { name }), 'success')
   } catch (e) {
     toast.show(t('home_delete_failed', { error: describeError(e) }), 'error')
@@ -235,10 +241,12 @@ async function onDelete(session: SessionView) {
 <template>
   <div class="flex h-full min-h-0 flex-col bg-bg dark:bg-bg-dark">
     <!-- 工具条固定在顶部：会话多的时候它跟着滚出去就没法用了。
-         一行两段（契约 13.2）：左 = 新建 + 刷新，右 = 设置（从顶栏移下来）。 -->
-    <div class="shrink-0 border-b border-line px-3 py-3 dark:border-line-dark sm:px-4">
+         第六轮（用户要求）：删掉「刷新」（会话列表本来每次进首页都会重读，留一个按钮只是噪音）、
+         「添加会话」不填充颜色但补上描边（品牌色的图标+文字）、「设置」也是描边、字号统一 14px，
+         整栏高度跟着降下来（py-2 + 按钮 h-9）。 -->
+    <div class="shrink-0 border-b border-line px-3 py-2 dark:border-line-dark sm:px-4">
       <div class="flex items-center gap-2 sm:gap-3">
-        <button class="g-btn-primary" @click="onAdd">
+        <button class="g-btn-secondary !h-9 !px-3 text-sm !text-brand" @click="onAdd">
           <svg
             viewBox="0 0 24 24"
             fill="none"
@@ -253,32 +261,13 @@ async function onDelete(session: SessionView) {
           {{ t('home_new') }}
         </button>
 
-        <button
-          class="g-btn-secondary"
-          :disabled="home.loading"
-          :title="t('home_refresh')"
-          @click="home.load(true)"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="h-4 w-4"
-          >
-            <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
-            <path d="M21 3v5h-5" />
-            <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
-            <path d="M3 21v-5h5" />
-          </svg>
-          <span class="hidden sm:inline">{{ t('common_refresh') }}</span>
-        </button>
-
         <span class="flex-1"></span>
 
-        <button class="g-btn-ghost !h-10 !px-3" :title="t('settings_title')" @click="emit('settings')">
+        <button
+          class="g-btn-secondary !h-9 !px-3 text-sm"
+          :title="t('settings_title')"
+          @click="emit('settings')"
+        >
           <svg
             viewBox="0 0 24 24"
             fill="none"
@@ -330,21 +319,19 @@ async function onDelete(session: SessionView) {
           :key="session.id"
           :session="session"
           :state="home.stateOf(session.id)"
-          :terminal-count="terminals.countOf(session.id)"
-          :now="now"
+          :tabs="terminals.tabsOf(session.id)"
           :busy="busyId === session.id"
           @open="onOpen(session)"
           @close="pending = { kind: 'close', session }"
           @edit="onEdit(session)"
           @remove="pending = { kind: 'delete', session }"
-          @terminals="onViewTerminals(session)"
+          @open-terminal="(uid) => onOpenTerminal(session, uid)"
+          @close-terminal="(uid) => onCloseTerminal(session, uid)"
         />
       </div>
     </div>
 
     <SessionFormDialog v-model:visible="formVisible" :session="editing" @saved="onSaved" />
-
-    <SessionTerminalsDialog v-model:visible="terminalsVisible" :sid="terminalsSid" />
 
     <!-- 凭据输入：只在「不保存凭据」的会话上出现（第一次 open 回了 credential_required） -->
     <CredentialPromptDialog

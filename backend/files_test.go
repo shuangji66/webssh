@@ -6,7 +6,9 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -116,6 +118,140 @@ func TestFsList(t *testing.T) {
 	a.fail(t, "/api/fs/list", map[string]any{"sid": strOf(notOpen["session"], "id"), "path": ""}, "not_open", http.StatusConflict)
 	// 缺 sid
 	a.fail(t, "/api/fs/list", map[string]any{"path": ""}, "session_gone", 0)
+}
+
+// TestFsInfo 覆盖「信息」接口（/api/fs/info，契约 15.5）：条目自身属性 + 目录直接子项计数。
+//
+// 三条口径都钉住：
+//   - 计数只数**一层**（不是递归）；
+//   - 软链接**跟随**（指向目录的算目录、失效的算文件），与列表里的目录/文件图标一致；
+//   - 拿不到属性（不存在 / 越权路径 / 会话没了）就按既有的错误码回，不返回半份数据。
+func TestFsInfo(t *testing.T) {
+	a, sid := fsTestApp(t)
+
+	// 普通文件：属性齐全，没有子项计数
+	out := a.ok(t, "/api/fs/info", map[string]any{"sid": sid, "path": filepath.Join(a.sshRoot, "hello.txt")})
+	info := out["info"]
+	if info == nil {
+		t.Fatalf("响应里没有 info：%v", out)
+	}
+	if strOf(info, "name") != "hello.txt" || info.(map[string]any)["dir"] != false {
+		t.Fatalf("hello.txt 的信息不对：%v", info)
+	}
+	if numOf(info, "size") != 12 {
+		t.Errorf("size = %v，期望 12", numOf(info, "size"))
+	}
+	if mode := strOf(info, "mode"); !strings.HasPrefix(mode, "-") {
+		t.Errorf("mode = %q，期望以 - 开头", mode)
+	}
+	if mt := strOf(info, "mtime"); !strings.HasSuffix(mt, "Z") && !strings.Contains(mt, "+") {
+		t.Errorf("mtime 不是 RFC3339：%q", mt)
+	}
+	if strOf(info, "countError") != "" {
+		t.Errorf("文件不该有统计错误：%v", info)
+	}
+	if numOf(info, "dirCount") != 0 || numOf(info, "fileCount") != 0 {
+		t.Errorf("文件不该有子项计数：%v", info)
+	}
+
+	// 属主：uid/gid 来自 SFTP attrs，必须与本地 stat 一致；名字是远端 `id` 查出来的
+	local, err := os.Stat(filepath.Join(a.sshRoot, "hello.txt"))
+	if err != nil {
+		t.Fatalf("本地 stat 失败：%v", err)
+	}
+	if st, ok := local.Sys().(*syscall.Stat_t); ok {
+		if int(numOf(info, "uid")) != int(st.Uid) || int(numOf(info, "gid")) != int(st.Gid) {
+			t.Errorf("uid/gid 不对：%v，期望 %d:%d", info, st.Uid, st.Gid)
+		}
+		// 名字能不能查到取决于本机有没有 `id`（测试服务器就跑在本机）：先自己问一遍再断言，
+		// 免得在精简环境里把一个「环境不支持」当成产品 bug。
+		if out, err := exec.Command("id", "-nu", strconv.Itoa(int(st.Uid))).Output(); err == nil {
+			want := strings.TrimSpace(string(out))
+			if strOf(info, "owner") != want {
+				t.Errorf("owner = %q，期望 %q（info=%v）", strOf(info, "owner"), want, info)
+			}
+			if strOf(info, "group") == "" {
+				t.Errorf("group 不该为空：%v", info)
+			}
+		} else {
+			t.Log("本机没有可用的 id 命令：跳过属主名字断言")
+		}
+	}
+
+	// 目录：数一层。docs 里只有 readme.md
+	out = a.ok(t, "/api/fs/info", map[string]any{"sid": sid, "path": filepath.Join(a.sshRoot, "docs")})
+	info = out["info"]
+	if info.(map[string]any)["dir"] != true {
+		t.Fatalf("docs 应当是目录：%v", info)
+	}
+	if numOf(info, "dirCount") != 0 || numOf(info, "fileCount") != 1 {
+		t.Errorf("docs 内含计数不对（期望 0 目录 / 1 文件）：%v", info)
+	}
+
+	// 家目录：docs（目录）+ hello.txt / binary.bin / link.txt / dangling.txt
+	// 软链接跟随：link.txt 指向文件 → 文件；dangling.txt 失效 → 也按文件算（与列表一致）
+	out = a.ok(t, "/api/fs/info", map[string]any{"sid": sid, "path": ""})
+	info = out["info"]
+	if strOf(info, "path") != a.sshRoot {
+		t.Errorf("空 path 应当指向家目录：%v", info)
+	}
+	if numOf(info, "dirCount") != 1 || numOf(info, "fileCount") != 4 {
+		t.Errorf("家目录内含计数不对（期望 1 目录 / 4 文件）：%v", info)
+	}
+
+	// 指向目录的软链接算目录（口径与列表的 dir 一致）
+	if err := os.Symlink("docs", filepath.Join(a.sshRoot, "docs-link")); err != nil {
+		t.Fatalf("建软链接失败：%v", err)
+	}
+	out = a.ok(t, "/api/fs/info", map[string]any{"sid": sid, "path": ""})
+	if n := numOf(out["info"], "dirCount"); n != 2 {
+		t.Errorf("指向目录的软链接应当算目录（期望 dirCount=2）：%v", n)
+	}
+	if strOf(out["info"], "countError") != "" {
+		t.Errorf("统计失败不该静默：%v", out["info"])
+	}
+
+	// 错误路径：.. 逃逸、不存在、非法会话，都和 /api/fs/list 一个口径
+	a.fail(t, "/api/fs/info", map[string]any{"sid": sid, "path": a.sshRoot + "/../.."}, "invalid", http.StatusBadRequest)
+	a.fail(t, "/api/fs/info", map[string]any{"sid": sid, "path": filepath.Join(a.sshRoot, "nope")}, "not_found", http.StatusNotFound)
+	a.fail(t, "/api/fs/info", map[string]any{"sid": "ffffffffffffffffffffffffffffffff", "path": ""}, "session_gone", http.StatusNotFound)
+}
+
+// TestFsInfoCountError 校验「数不出子项」时如实带原因回来，而不是把 0 当空目录。
+//
+// 用 0000 权限的目录模拟：SFTP 的 ReadDir 会失败。两种环境里这招不灵，直接 skip 并写明原因
+// （**不要**假装通过）：
+//   - 以 root 跑测试：root 不受权限位约束；
+//   - 文件系统不认权限位（飞牛这类卷会按自己的 ACL 重写 mode——实测量到的是 0705，
+//     AGENTS 第 2 节也记了「新文件的模式位不可靠」）。
+func TestFsInfoCountError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("以 root 运行：权限位挡不住 ReadDir，跳过")
+	}
+	a, sid := fsTestApp(t)
+	locked := filepath.Join(a.sshRoot, "locked")
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatalf("建目录失败：%v", err)
+	}
+	defer os.Chmod(locked, 0o755)
+	// 直接问「ReadDir 到底会不会失败」——这才是一条权限断言真正需要的前提，
+	// 比检查 mode 的数字可靠（文件系统可能改写 mode，却仍然拦得住读取）
+	if _, err := os.ReadDir(locked); err == nil {
+		fi, _ := os.Stat(locked)
+		t.Skipf("这个文件系统拦不住 0000 目录的读取（mode=%v）：无法模拟「读不出子项」，跳过", fi.Mode())
+	}
+
+	out := a.ok(t, "/api/fs/info", map[string]any{"sid": sid, "path": locked})
+	info := out["info"]
+	if info.(map[string]any)["dir"] != true {
+		t.Fatalf("locked 应当是目录：%v", info)
+	}
+	if strOf(info, "countError") == "" {
+		t.Errorf("读不出子项时应当带回原因（不能显示成空目录）：%v", info)
+	}
+	if n := numOf(info, "dirCount") + numOf(info, "fileCount"); n != 0 {
+		t.Errorf("统计失败时不该给出计数（会被读成空目录）：%v", info)
+	}
 }
 
 func listEntryIsDir(t *testing.T, v any) bool {

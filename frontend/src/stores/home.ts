@@ -161,19 +161,13 @@ export const useHomeStore = defineStore('home', () => {
    * 名字为空串时后端保留原名（契约 11.1.4），所以这里回填的是后端返回的 session 而不是入参。
    */
   async function renameSession(id: string, name: string): Promise<SessionView> {
-    const current = sessions.value.find((item) => item.id === id)
-    if (!current) {
-      // 本地没有这份配置就没法补齐 host/user/port/authType。抛给调用方 toast，不做静默失败。
+    if (!sessions.value.some((item) => item.id === id)) {
+      // 本地没有这份配置（配置被删/被别处刷新掉了）：抛给调用方 toast，不做静默失败。
       throw new Error(t('err_not_found'))
     }
-    const saved = await save({
-      id,
-      name,
-      host: current.host,
-      port: current.port,
-      user: current.user,
-      authType: current.authType
-    })
+    // **只发名字**：后端按部分更新合并其余字段。回传本地缓存的 host/user/authType 在
+    // 「另一台设备刚改过地址」时会把它覆盖掉（第六轮用户报的「把缓存写回」就是这类问题）。
+    const saved = await save({ id, name })
     // 标签标题跟着配置走（openSession 之外的入口不能把用户拽到那个会话上）。
     // syncTitle 不覆盖用户手动起过的名字，这里也不需要改激活项。
     useAppTabsStore().syncTitle(id, sessionLabel(saved))

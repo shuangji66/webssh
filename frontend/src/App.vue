@@ -7,8 +7,8 @@
 //   2. home.loadInfo()：拿后端进程实例 bootId（判定「后端重启过」的基准）；
 //   3. home.load()：会话配置 + 已打开会话的实时状态；
 //   4. home.restore()：把后端仍在运行的会话恢复成应用标签（返回 sid 列表）；
-//   5. 逐个会话接线终端标签：terminals.ensure(state) 恢复已有的终端，桌面端一个都没有时
-//      自动建一个——「打开了会话就能直接打字」。
+//   5. 逐个会话接线终端标签：terminals.ensure(state) 恢复已有的终端，一个都没有时自动建
+//      一个（桌面与窄屏一致）——「打开了会话就能直接打字」。
 // 恢复数量 > 0 时给一条 toast：用户刷新后需要知道「刚才那些会话回来了」。
 //
 // 弹窗归属（契约 13.1/13.2）：顶栏不再有快捷指令与设置入口——快捷指令按钮进会话工具条
@@ -17,7 +17,6 @@
 // 上下文，没必要在每个会话视图里各挂一份。
 import { onMounted, ref } from 'vue'
 import { t } from '@/i18n'
-import { useMobileLayout } from '@/composables/useMobileLayout'
 import { useTheme } from '@/composables/useTheme'
 import { useViewportHeight } from '@/composables/useViewportHeight'
 import { HOME_TAB_ID, useAppTabsStore } from '@/stores/appTabs'
@@ -38,7 +37,6 @@ const tabs = useAppTabsStore()
 const home = useHomeStore()
 const terminals = useTerminalsStore()
 const toast = useToastStore()
-const isMobile = useMobileLayout()
 
 const settingsVisible = ref(false)
 const quickCmdsVisible = ref(false)
@@ -70,8 +68,9 @@ onMounted(async () => {
     const state = home.stateOf(sid)
     if (!state) continue
     terminals.ensure(sid, state)
-    // 桌面端没有终端标签就自动建一个（移动端由用户点 + 新建，避免一进会话就占满屏幕）
-    if (!isMobile.value && terminals.countOf(sid) === 0) terminals.add(sid)
+    // 没有终端标签就自动建一个：恢复回来的会话必须能直接打字（第五轮起窄屏也一样——
+    // 用户原话：移动页面新打开/恢复的会话也要自动进入「终端 1」，不是文件管理子标签）
+    if (terminals.countOf(sid) === 0) terminals.add(sid)
   }
   restoring.value = false
   if (sids.length) toast.show(t('app_restore_done', { n: sids.length }), 'success')

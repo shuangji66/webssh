@@ -321,8 +321,10 @@ body {
   .app-tab-active {
     @apply bg-brand text-white;
   }
+  /* 非激活的标签也带一层**常驻**的灰底（第七轮用户要求）：标签栏里一眼能看出有几个标签、
+   * 边界在哪；悬停时再深一档，点中的是品牌色。 */
   .app-tab-idle {
-    @apply text-ink-soft dark:text-ink-soft-dark hover:bg-black/5 dark:hover:bg-white/5;
+    @apply bg-black/5 text-ink-soft hover:bg-black/10 dark:bg-white/5 dark:text-ink-soft-dark dark:hover:bg-white/10;
   }
 
   /* 会话内的子标签（固定「文件管理」+ 多个终端标签）：
@@ -334,7 +336,7 @@ body {
     @apply bg-brand text-white;
   }
   .subtab-idle {
-    @apply text-ink-soft dark:text-ink-soft-dark hover:bg-black/5 dark:hover:bg-white/5;
+    @apply bg-black/5 text-ink-soft hover:bg-black/10 dark:bg-white/5 dark:text-ink-soft-dark dark:hover:bg-white/10;
   }
 
   /* 文件管理器工具栏按钮 */
@@ -380,6 +382,31 @@ body {
     .group:hover .hover-reveal,
     .group:focus-within .hover-reveal {
       opacity: 1;
+    }
+  }
+
+  /* 「鼠标悬停时才变红」的关闭按钮（顶栏应用标签、卡片里的终端行）。
+   *
+   * 为什么反过来写：触屏没有 hover，而 Tailwind 的 `hover:` 变体自带 @media (hover: hover)，
+   * 于是「平时中性、悬停变红」在触屏上等于**永远不红**。这里默认就是红的（触屏常驻红），
+   * 只有真的能悬停的设备才把它收成中性色、悬停时再变红——与 .hover-reveal 同一套思路。
+   *
+   * `.on-brand` 是品牌色底上那一档（激活的顶栏标签）：平时白色调，悬停同样变红。 */
+  .close-danger {
+    @apply rounded-full text-danger transition-colors;
+  }
+  @media (hover: hover) {
+    .close-danger {
+      @apply text-ink-faint dark:text-ink-faint-dark;
+    }
+    .close-danger:hover {
+      @apply bg-danger/10 text-danger dark:text-danger;
+    }
+    .close-danger.on-brand {
+      @apply text-white/80;
+    }
+    .close-danger.on-brand:hover {
+      @apply bg-white/20 text-danger;
     }
   }
 }

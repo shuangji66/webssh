@@ -15,8 +15,11 @@
 // 第二轮新增的公开成员（左栏 FileTree 与 FileManager 共用，两个组件都从这里取）：
 //   state.mode / toggleMode                权限列显示形态（符号 / 八进制，持久化）
 //   state.sort / cycleSort / sorted        列表排序（三态循环，持久化；sorted 返回排好的副本）
-//   clipboard / copyToClipboard / cutToClipboard / paste / clipboardFor / clipboardIsForeign
-//                                          剪贴板（全局一份、不跨会话；粘贴成功后清空）
+//   clipboard / copyToClipboard / cutToClipboard / paste / clipboardFor / clipboardIsForeign /
+//   clearClipboard
+//                                          剪贴板（全局一份、不跨会话；清不清由入口决定：
+//                                          右键菜单的粘贴粘完就清，常驻剪贴板栏的
+//                                          「粘贴到此处」不清，点「取消」才清）
 //   paste / compress / extract / exportToNas
 //                                          批量/远程操作（compress 支持 tar.gz 与 zip 两种格式）
 //   expandPath / refreshTree               树：展开到某条链路（家目录）、刷新某个节点
@@ -88,6 +91,15 @@ export interface SftpState {
   expanded: string[]
   treeLoading: Record<string, boolean>
   selected: string[]
+  /**
+   * 是否处于**多选模式**（第九轮）。
+   *
+   * 与 `selected` 分开：`selected` 是「选了哪些」，这个是「现在是点选模式的吗」——用户先点
+   * 「多选」进入模式（此时一个都没选），再逐个点选；执行复制/剪切/删除/压缩/导出之后退出模式
+   * （见 FileManager 的 exitMulti 调用点）。之前那个「全选」按钮是一次性把当前目录全选上，
+   * 用户想选三个文件还得先全选再逐个取消。
+   */
+  multi: boolean
 }
 
 /** 视图偏好（列表 / 网格）的持久化键。纯界面偏好：跟随浏览器，不落后端、不随会话走。 */
@@ -157,7 +169,8 @@ function blankState(): SftpState {
     treeChildren: {},
     expanded: [],
     treeLoading: {},
-    selected: []
+    selected: [],
+    multi: false
   }
 }
 
@@ -187,13 +200,19 @@ export const useSftpStore = defineStore('sftp', () => {
 
   const dirKey = (sid: string, path: string) => `${sid}\u0000${path}`
 
+  /**
+   * 取某个会话的展示状态（没有就建一个）。
+   *
+   * ⚠️ 新键必须**从 ref 上再读一次**再返回：`blankState()` 造出来的是**原始对象**，直接把它
+   * 返回给「第一个调用方」，那个组件拿到的就是一层没有响应式的壳——它自己的模板与 watch 全都
+   * 收不到后续改动（读到的值是对的，界面永远不刷新）。这正是第八轮用户报的
+   * 「新打开会话时面包屑没有展开至家目录」的根因：左栏里的 BreadcrumbBar 不再读 `state.home`
+   * 之后，FileTree 成了第一个调用方，于是它的 `watch(() => state.home)` 从注册那天起就没触发过。
+   * （谁先调用是会随模板改动变化的，所以这里不能靠「反正有别的组件先建」来兜。）
+   */
   function stateOf(sid: string): SftpState {
-    let st = states.value[sid]
-    if (!st) {
-      st = blankState()
-      states.value[sid] = st
-    }
-    return st
+    if (!states.value[sid]) states.value[sid] = blankState()
+    return states.value[sid]!
   }
 
   /** 把某个已加载过的路径从账本里清掉（删除 / 重命名之后调用）。 */
@@ -564,18 +583,35 @@ export const useSftpStore = defineStore('sftp', () => {
   }
 
   /**
+   * 清空剪贴板（文件管理里那行「剪贴板」的「取消」按钮）。
+   *
+   * 不走 sid：剪贴板全局只有一份，而「取消」的语义就是「把手上这份东西放下」，
+   * 来自别的会话的那份也一并丢掉——否则它会在那个会话里一直挂着、点不掉。
+   */
+  function clearClipboard() {
+    clipboard.value = null
+  }
+
+  /**
    * 粘贴到目标目录。
    *
-   * 取「**成功后清空、失败保留**」（契约 11.4 把这两种取舍都写了出来，这里选后一种）：
-   * - 成功后再粘一次，多半是误操作（真粘第二份会真的多出一份文件，同名跳过挡不住改名这类场景），
-   *   所以清空；
-   * - 失败时保留剪贴板，用户可以直接重试或换个目录粘——失败后还要重新去复制一遍是很烦的；
-   * - 「一项都没贴上」（全被同名挡下）等于是没发生任何事，也保留。
+   * 剪贴板什么时候清空，由**入口**决定（`keepClipboard`）——第五轮用户明确要求两种入口语义不同：
+   * - 右键/空白菜单里的「粘贴」（缺省）：**成功后清空**（现状不变）。这些是一次性动作。
+   * - 文件管理里那行常驻「剪贴板」的「粘贴到此处」（keepClipboard=true）：**不清空**，只有点
+   *   「取消」才清。那一行的意义就是「同一批东西想粘到好几个目录去」，粘一次就清掉等于把它
+   *   的用处抹掉一半。
+   *
+   * 失败、以及「一项都没贴上」（全被同名挡下）时一律**保留**剪贴板：那两种情况下什么都没发生，
+   * 用户可以直接重试或换个目录粘——失败后还要重新去复制一遍是很烦的。
+   *
+   * 「常驻 + 剪切」要多做一步：剪切粘贴是「搬走」，粘完之后剪贴板里的路径已经**不存在**了，
+   * 下一次粘贴只会报 not_found。所以把剪贴板里的路径跟着映射到新位置（被同名跳过的那些没搬，
+   * 保持原样）——这样再粘一次就是「把这东西再搬过去」，语义仍然自洽。
    *
    * 不跨会话在这里是**硬约束**：剪贴板里的路径属于另一个主机的文件系统，拿过来粘贴轻则
    * 「文件不存在」，重则删/改错了同名文件，必须由调用方先拦住（这里再兜一次底）。
    */
-  async function paste(sid: string, toDir: string): Promise<PasteOutcome> {
+  async function paste(sid: string, toDir: string, keepClipboard = false): Promise<PasteOutcome> {
     const clip = clipboardFor(sid)
     if (!clip) {
       // 调用方按「同一会话才显示粘贴项」过滤过，走到这里说明状态被别处改了。明确抛错而不是
@@ -596,7 +632,17 @@ export const useSftpStore = defineStore('sftp', () => {
       outcome.conflicts = paths.map((path) => baseName(path)).filter((n) => !pastedNames.has(n))
       if (!outcome.conflicts.length) outcome.conflicts = paths.map((path) => baseName(path))
     }
-    if (outcome.count > 0) clipboard.value = null
+    if (outcome.count > 0) {
+      if (!keepClipboard) {
+        // 一次性入口（右键/空白菜单）：粘完就清（现状不变）
+        clipboard.value = null
+      } else if (op === 'cut') {
+        // 常驻 + 剪切：把这批路径跟着搬到新位置（被同名跳过的那几项没搬，保持原路径），
+        // 否则剪贴板指着一批已经不存在的东西，下一次粘贴只会报 not_found。
+        const moved = new Map(res.files.map((file) => [baseName(file.path), file.path]))
+        clipboard.value = { sid, op: 'cut', paths: paths.map((p) => moved.get(baseName(p)) ?? p) }
+      }
+    }
     await refreshDir(sid, toDir)
     if (op === 'cut') {
       // 剪切是「搬走」：源目录里那一项已经没了，不刷新的话用户切回去还能看到它
@@ -716,6 +762,22 @@ export const useSftpStore = defineStore('sftp', () => {
     stateOf(sid).selected = []
   }
 
+  /**
+   * 进/出多选模式。两个方向都**清空已选**：
+   *  - 进入时本来就没选（干净起点）；
+   *  - 退出时清掉高亮，否则「退出了但东西还亮着」会让人以为选择还在（下次进模式又冒出来）。
+   */
+  function setMulti(sid: string, on: boolean) {
+    const st = stateOf(sid)
+    st.multi = on
+    st.selected = []
+  }
+
+  /** 结束多选：做完一个批量操作（复制/剪切/删除/压缩/导出）之后收敛回普通浏览状态。 */
+  function exitMulti(sid: string) {
+    setMulti(sid, false)
+  }
+
   /** 会话关闭时丢掉它的全部浏览状态（否则记录只增不减）。 */
   function forget(sid: string) {
     delete states.value[sid]
@@ -758,12 +820,15 @@ export const useSftpStore = defineStore('sftp', () => {
     cutToClipboard,
     clipboardFor,
     clipboardIsForeign,
+    clearClipboard,
     paste,
     compress,
     extract,
     exportToNas,
     select,
     clearSelection,
+    setMulti,
+    exitMulti,
     forget
   }
 })

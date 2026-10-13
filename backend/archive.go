@@ -89,6 +89,105 @@ func archiveKindOf(name string) string {
 	return ""
 }
 
+// archiveProbeUnwritable 是探针脚本里「两个目录都不可写」的专用退出码。
+// 用 73 而不是 1：要能把它和「脚本本身没跑起来」（127 等）区分开，见 resolveArchiveDir。
+const archiveProbeUnwritable = 73
+
+// resolveArchiveDir 决定这次压缩把产物写到哪里，顺带处理「配置的目录不可写」。
+//
+// 为什么不能直接 `mkdir -p <root>` 就开打（第六轮用户报的「压缩提示权限不足」）：
+// archiveDir 默认是**远端主机**的 /tmp/webssh-archive。远端 /tmp 一般世界可写，但这个目录
+// 本身可能是别的账号（典型是历史上以 root 跑过一次）建的：当前登录用户既写不进去、也删不掉，
+// 于是用户只看到一句「权限不足」——既不知道说的是远端的哪个目录，也不知道能怎么办。
+//
+// 规则（第九轮起是三档）：
+//  1. 配置的目录可写 → 用它（现有行为完全不变）；
+//  2. 不可写 → 退到同级的 `<root>-<登录用户名>`：这个目录是自己建的，不会与别的账号撞车，
+//     也不会去动别人已有的东西；
+//  3. 还不可写 → 再退到**登录用户家目录**下的 `$HOME/.webssh-archive`（用户要求：/tmp 整个
+//     不可写的机器也得能压缩；家目录是登录用户唯一保证能写的地方）；
+//  4. 三档都不可写 → 明确报错：把三个候选目录、原始输出、以及 WEBSSH_ARCHIVE_DIR 都写出来。
+//
+// 探测放在远端 shell 里做（一次命令搞定，不用发两次）：
+// `-d` 与 `-w` 都要查：`-w` 判的是当前登录用户的实际权限（比在服务端猜 uid/权限位可靠），
+// `-d` 则保证配置成一个**文件**时也走回退分支，不会把文件当目录去打包。
+func (r *sessionRuntime) resolveArchiveDir(ctx context.Context, root string) (string, *apiError) {
+	user := ""
+	if cfg, ok := r.config(); ok {
+		user = cfg.User
+	}
+	fallback := root + "-" + dirNameSafe(user)
+	// 第三档：家目录下的隐藏目录。用 `$HOME` 而不是 `~`：`~` 只在交互式 shell 里展开，
+	// `sh -c` 里不一定（POSIX 只要求 `$HOME`）。`$HOME` 为空时跳过这一档。
+	homeDir := "$HOME/.webssh-archive"
+	// 只用 shell 内建 + `command -v` 判断 mkdir 在不在：远端 PATH 坏掉时（比如那台主机
+	// 上什么都没有）**不能**在这里就报「目录不可写」——真正的原因（缺 tar）要让后面的
+	// 打包命令去说，否则会把一个 no_archive_tool 误报成权限问题。这种情况下原样返回
+	// 配置的目录，交给后面那条命令去失败并报告。
+	// `try` 判的是「建得出来 + 真的是目录 + 当前登录用户可写」；三档按顺序试，都不行就以
+	// 73 退出——让 Go 那边给出说得清的报错，而不是一句裸的 mkdir 失败。
+	probe := "d=" + shellQuote(root) + "; " +
+		"if command -v mkdir >/dev/null 2>&1; then " +
+		"try() { mkdir -p \"$1\" 2>/dev/null || true; [ -d \"$1\" ] && [ -w \"$1\" ]; }; " +
+		"if try \"$d\"; then :; " +
+		"elif try " + shellQuote(fallback) + "; then d=" + shellQuote(fallback) + "; " +
+		"elif [ -n \"$HOME\" ] && try \"$HOME/.webssh-archive\"; then d=\"$HOME/.webssh-archive\"; " +
+		"else printf 'NOTWRITABLE %s\\n' \"$d\"; exit 73; fi; " +
+		"fi; " +
+		"printf '%s\\n' \"$d\""
+	res, err := r.runRemote(ctx, probe)
+	if err != nil {
+		return "", err
+	}
+	// 只有探针**明确说**「两个目录都不可写」（它自己 exit 73）时才把它当成权限问题：
+	// 探针本身跑不起来（远端 PATH 坏掉、连 sh 都没有）不是「目录不可写」，那种情况
+	// 要原样返回配置目录，让后面的打包命令去失败 —— 否则一个 no_archive_tool 会被误报成权限问题。
+	if res.Code != archiveProbeUnwritable {
+		if dir := firstLine(res.Stdout); res.ok() && dir != "" {
+			return strings.TrimSpace(dir), nil
+		}
+		warnf("会话 %s 的归档目录探针没有结论（退出码 %d：%s），按配置目录继续", r.id, res.Code, res.diagnostic())
+		return root, nil
+	}
+	{
+		return "", errPermission(
+			"远端压缩包输出目录不可写：%s、%s、%s 都试过了（第三档是登录用户家目录下的隐藏目录）。"+
+				"压缩包是在**远程主机**上生成的，和运行本应用的机器无关；"+
+				"请给远端登录用户写权限，或用环境变量 WEBSSH_ARCHIVE_DIR 换一个可写目录。原始输出：%s",
+			root, fallback, homeDir, res.diagnostic())
+	}
+}
+
+// dirNameSafe 把登录名收拾成能安全拼进目录名的一小串字符。
+//
+// 远端登录名可能带 @、空格、Unicode：拼进路径要避免分隔符/空白，也别因为名字特别长撑爆路径。
+// 允许的字符之外一律换成 `_`；全被换掉时退回 "user"。
+func dirNameSafe(name string) string {
+	var sb strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune('_')
+		}
+	}
+	out := strings.Trim(sb.String(), "._-")
+	if out == "" {
+		return "user"
+	}
+	if len(out) > 32 {
+		out = out[:32]
+	}
+	return out
+}
+
+// firstLine 取输出的第一行（远端探目录时用来读回它选的那个目录）。
+func firstLine(out string) string {
+	line, _, _ := strings.Cut(out, "\n")
+	return strings.TrimSpace(strings.TrimRight(line, "\r"))
+}
+
 // handleFsCompress 把远程的若干条目打成 <archiveDir>/<name>.<ext>（契约 11.5 / 13.5）。
 //
 // format 决定用哪个工具与后缀：tar.gz（缺省，`tar -czf`）或 zip（`zip -qry`）。
@@ -126,7 +225,13 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	if apiErr != nil {
 		return apiErr
 	}
-	out := path.Join(root, name)
+	// 真正的输出目录由远端探一遍再定：配置的目录不可写时退到同级的 <root>-<登录用户>
+	// （见 resolveArchiveDir 的说明——用户报的「压缩提示权限不足」就出在这里）。
+	archiveDir, apiErr := rt.resolveArchiveDir(r.Context(), root)
+	if apiErr != nil {
+		return apiErr
+	}
+	out := path.Join(archiveDir, name)
 
 	// 1) 解析路径（相对路径相对家目录）+ 校验存在 + 去重，并先把同名产物挪开。
 	//    这一步用 SFTP 做：路径语义（家目录、相对路径）与其它文件接口保持一致，
@@ -151,7 +256,7 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	if format == archiveFormatZip {
 		archiveCmd = zipCommand(out, items)
 	}
-	command := "mkdir -p " + shellQuote(root) + " && " + archiveCmd
+	command := "mkdir -p " + shellQuote(archiveDir) + " && " + archiveCmd
 	res, runErr := rt.runRemote(r.Context(), command)
 	if runErr != nil {
 		return runErr
@@ -185,7 +290,7 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	}
 	return respond(w, map[string]any{
 		"ok":      true,
-		"archive": map[string]any{"path": out, "size": size, "dir": root},
+		"archive": map[string]any{"path": out, "size": size, "dir": archiveDir},
 	})
 }
 

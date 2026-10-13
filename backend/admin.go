@@ -557,6 +557,8 @@ func (m *AdminMux) buildHandler() http.Handler {
 			m.route(m.handleTerminalRename)(w, r)
 		case p == "/api/fs/list":
 			m.route(m.handleFsList)(w, r)
+		case p == "/api/fs/info":
+			m.route(m.handleFsInfo)(w, r)
 		case p == "/api/fs/mkdir":
 			m.route(m.handleFsMkdir)(w, r)
 		case p == "/api/fs/create":

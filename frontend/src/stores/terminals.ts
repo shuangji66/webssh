@@ -47,6 +47,21 @@ function newUid(): string {
   return `term-${Date.now().toString(36)}-${uidSeq}`
 }
 
+/**
+ * 终端状态点的配色（子标签栏与首页卡片共用一份）。
+ *
+ * 放在 store 文件里而不是组件里：它描述的是**终端状态**（open / connecting / exited / error /
+ * detached），两个界面（会话子标签栏、首页的终端列表）必须给出同一套颜色，否则同一个终端在
+ * 两处显示成不同状态，用户会以为其中一处坏了。参数写成结构化类型，避免和 store 的
+ * TermTab 形成循环依赖。
+ */
+export function termStatusDotClass(tab: { status: TermStatus; restoring: boolean }): string {
+  if (tab.status === 'open' && !tab.restoring) return 'bg-success'
+  if (tab.status === 'connecting' || tab.restoring || tab.status === 'detached') return 'bg-warning'
+  if (tab.status === 'exited') return 'bg-ink-faint dark:bg-ink-faint-dark'
+  return 'bg-danger'
+}
+
 export const useTerminalsStore = defineStore('terminals', () => {
   const ui = useSessionUiStore()
   const toast = useToastStore()
@@ -88,7 +103,30 @@ export const useTerminalsStore = defineStore('terminals', () => {
     return fallback ? find(sid, fallback) ?? null : null
   }
 
-  /** 改激活项：本 store 与 sessionUi 一起写，保证两边不会各说各话。 */
+  /**
+   * 本会话**上一次激活**的终端（不关心此刻激活的是不是文件管理子标签），没有就返回 null。
+   *
+   * 「此刻激活的是终端就直接用它」这一条是关键：切子标签只写 sessionUi（唯一真相在那边），
+   * 所以 `activeUid` 只在 add / ensure / 关标签时被写过，光靠它会把「返回终端」固定指到
+   * **最后建出来的那个标签**上（第五轮用户报的 bug：从终端 2 切到文件管理，点返回却跳回终端 3）。
+   * 现在两头一起保证：切终端标签走 setActive（两个 store 一起写，见上），这里再以 sessionUi 为准。
+   *
+   * 用途仅限「切回哪个终端」这类**导航**；`activeOf` 仍然是「指令发给谁」的唯一判据
+   * （文件管理在前台时必须返回 null，见文件头）。
+   */
+  function lastActiveOf(sid: string): TermTab | null {
+    const cur = activeOf(sid)
+    if (cur) return cur
+    const uid = activeUid.value[sid]
+    return uid ? find(sid, uid) ?? null : null
+  }
+
+  /**
+   * 改激活项：本 store 与 sessionUi 一起写，保证两边不会各说各话。
+   *
+   * 切终端子标签**必须**走这里（而不是直接 `sessionUi.setActiveSub`）：否则 `activeUid` 会停在
+   * 「最后新建的那个标签」上，`lastActiveOf` 这种「你刚才在哪个终端」的判断就全错了。
+   */
   function setActive(sid: string, uid: string) {
     activeUid.value[sid] = uid
     ui.setActiveSub(sid, uid)
@@ -99,7 +137,11 @@ export const useTerminalsStore = defineStore('terminals', () => {
    * 也不再改动已有标签的状态（否则一次刷新就把用户本地状态覆盖掉了）。
    */
   function ensure(sid: string, state: SessionState): void {
-    const list = tabs.value[sid] ?? (tabs.value[sid] = [])
+    // ⚠️ 新键要赋值**再读一次**：`tabs.value[sid] ?? (tabs.value[sid] = [])` 这种写法在键不存在时
+    // 求值成的是**原始数组**（赋值表达式的值 = 右值），拿它 push 不会触发响应式——和
+    // sftp.stateOf 踩的是同一个坑（见那里的说明）。
+    if (!tabs.value[sid]) tabs.value[sid] = []
+    const list = tabs.value[sid]!
     for (const info of state.terminals ?? []) {
       if (list.some((tab) => tab.tid === info.id)) continue
       list.push({
@@ -148,7 +190,8 @@ export const useTerminalsStore = defineStore('terminals', () => {
     }
     // 只在真的有命令时挂字段：留一个空串会让「非空才发」的判断多一层无意义的分支
     if (opts?.initialCommand) tab.initialCommand = opts.initialCommand
-    const list = tabs.value[sid] ?? (tabs.value[sid] = [])
+    if (!tabs.value[sid]) tabs.value[sid] = []
+    const list = tabs.value[sid]!
     list.push(tab)
     setActive(sid, tab.uid)
     return tab
@@ -271,6 +314,8 @@ export const useTerminalsStore = defineStore('terminals', () => {
   return {
     tabsOf,
     activeOf,
+    lastActiveOf,
+    setActive,
     countOf,
     ensure,
     add,

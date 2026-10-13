@@ -10,6 +10,11 @@
 //     左栏收起（文件管理器自带面包屑），切回终端标签时左栏展开。规则写在 SessionView 里，
 //     这里只提供状态（早先那版把「主区域模式」也放进来，结果两套开关会互相打架，已删掉）。
 //   - 移动端：没有左栏，`FILES_TAB` 就是一个占据全区域的子页面。
+//
+// 第六轮新增 `leftHidden`：用户可以把左栏（面包屑 + 目录树）**手动收起**，收起后子标签栏
+// 左侧会出现一个「展开面包屑」按钮。它不是第二个「主区域模式」——主区域显示什么仍然只由
+// `activeSubOf` 决定；左栏的可见性是**推导**出来的三合一：
+// `!isMobile && !filesActive && !leftHiddenOf(sid)`（规则写在 SessionView）。
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
@@ -19,6 +24,8 @@ export const FILES_TAB = 'files'
 export const useSessionUiStore = defineStore('sessionUi', () => {
   // sid → 激活的子标签 id（'files' 或某个终端标签的 uid）
   const activeSub = ref<Record<string, string>>({})
+  // sid → 用户是否手动收起了左栏（面包屑 + 目录树）。缺省 false = 显示。
+  const leftHidden = ref<Record<string, boolean>>({})
 
   function setActiveSub(sid: string, id: string) {
     activeSub.value[sid] = id
@@ -33,9 +40,19 @@ export const useSessionUiStore = defineStore('sessionUi', () => {
     return activeSubOf(sid) === FILES_TAB
   }
 
+  /** 左栏是不是被用户手动收起了（桌面端才有意义；移动端根本没有左栏）。 */
+  function leftHiddenOf(sid: string): boolean {
+    return leftHidden.value[sid] === true
+  }
+
+  function setLeftHidden(sid: string, hidden: boolean) {
+    leftHidden.value[sid] = hidden
+  }
+
   /** 会话被关闭时丢掉它的界面状态（否则记录只增不减）。 */
   function forget(sid: string) {
     delete activeSub.value[sid]
+    delete leftHidden.value[sid]
   }
 
   return {
@@ -43,6 +60,8 @@ export const useSessionUiStore = defineStore('sessionUi', () => {
     setActiveSub,
     activeSubOf,
     isFilesActive,
+    leftHiddenOf,
+    setLeftHidden,
     forget
   }
 })

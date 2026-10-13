@@ -3,9 +3,13 @@
 //
 // 四条不能改的规则：
 //  1. **激活子标签只有 sessionUi 一个来源**（契约 6.1）：终端标签激活写自己的 uid，文件管理
-//     标签写 FILES_TAB。终端 store 的 ensure/add/closeTab 也会同步它，这里不再自己改。
+//     标签写 FILES_TAB。写入口都经过 store：终端标签走 `terminals.setActive`（它同时更新
+//     「用户刚才在哪个终端」，文件管理里的「返回终端」靠它），ensure/add/closeTab 也同步它；
+//     本组件不直接改 sessionUi 里的终端 uid。
 //  2. **「文件管理」子标签与左栏是二选一**（契约 13.1）：激活文件管理 → 左栏收起（文件管理器
 //     自带面包屑）、主区域是文件管理；激活某个终端标签 → 左栏展开、主区域是那个终端。
+//     第六轮又叠了一个**用户偏好**：左栏可以被手动收起（sessionUi.leftHiddenOf），收起时子
+//     标签栏左侧出现「展开面包屑」。三者是交集关系，主区域仍然只看 activeSub（见 showLeft）。
 //     判据只有 `activeSubOf(sid) === FILES_TAB` 一处，**不要**再引入第二个「主区域模式」状态
 //     （第二轮那套 `sessionUi.mainMode` 就是因此删掉的：两个开关会互相打架）。
 //  3. 面板**全部保持挂载**，只切显隐，而且必须用 `visibility: hidden`（Tailwind 的
@@ -21,10 +25,10 @@
 //     存在的终端 uid 时退到本会话最后激活的终端。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { t } from '@/i18n'
-import { useMobileLayout } from '@/composables/useMobileLayout'
+import { useWideLayout } from '@/composables/useMobileLayout'
 import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
 import { usePaneControlsStore } from '@/stores/paneControls'
-import { useTerminalsStore, type TermTab } from '@/stores/terminals'
+import { termStatusDotClass, useTerminalsStore, type TermTab } from '@/stores/terminals'
 import { revealActive, wheelToHorizontal } from '@/utils/scroll'
 import BreadcrumbBar from '@/components/files/BreadcrumbBar.vue'
 import FileManager from '@/components/files/FileManager.vue'
@@ -43,7 +47,15 @@ const emit = defineEmits<{
 const sessionUi = useSessionUiStore()
 const terminals = useTerminalsStore()
 const paneControls = usePaneControlsStore()
-const isMobile = useMobileLayout()
+/**
+ * 左栏要不要占位，看的是**视口宽不宽**（≥ Tailwind 的 md 断点），而不是「是不是触屏」。
+ *
+ * 第十轮用户的原话：「平板不是窄屏，可以按模式显示面包屑的」。iPad 的 CSS 宽度是 768/834/1024，
+ * 用触屏判定会把它的左栏整个吃掉；而左栏在平板上完全放得下（宽度还能用手柄拖，见 19.1）。
+ * 触屏专属的东西（底部辅助键条、`.hover-reveal`、16px 输入框）仍然用 `useMobileLayout()`——
+ * 「屏幕大不大」和「有没有键盘/鼠标」是两件事，别混成一条判据。
+ */
+const wide = useWideLayout()
 
 const termTabs = computed(() => terminals.tabsOf(props.sid))
 const activeSub = computed(() => sessionUi.activeSubOf(props.sid))
@@ -106,7 +118,10 @@ function activateFiles() {
 }
 
 function activateTerm(uid: string) {
-  sessionUi.setActiveSub(props.sid, uid)
+  // 走 terminals.setActive：它同时写 sessionUi（唯一真相还是那边），并让 terminals 知道
+  // 「用户刚才在哪个终端」——文件管理子标签里的「返回终端」才不会回到一个陌生的标签上
+  // （第五轮用户报的 bug：只写 sessionUi 时 activeUid 停在最后新建的标签上）。
+  terminals.setActive(props.sid, uid)
   focusTermSoon(uid)
 }
 
@@ -200,18 +215,41 @@ function leftMax() {
 const leftWidth = ref(Math.min(Number(localStorage.getItem(LEFT_WIDTH_KEY)) || 300, leftMax()))
 
 /**
- * 左栏只在「激活的是某个终端」时显示（契约 13.1）：切到文件管理子标签就收起，因为文件管理器
- * 自带面包屑，再挂一条目录树是重复的。移动端没有左栏的位置（文件管理是整页的子标签）。
+ * 左栏（面包屑按钮条 + 目录树）的可见性 = 三个条件的**交集**（第六轮起）：
+ *   1. **宽视口**（窄屏没有左栏的位置，文件管理是整页的子标签；平板 ≥768px 算宽，见 wide）；
+ *   2. 激活的是某个终端（切到文件管理子标签就收起——文件管理器自带面包屑，再挂一条目录树是
+ *      重复的）。判据用 filesActive 而不是直接写 activeSubOf !== FILES_TAB，是为了与主区域
+ *      **严格互斥**：「一个终端都没有 + sessionUi 指着幽灵 uid」这种退化状态下主区域会兜底
+ *      显示文件管理器，此时左栏也必须收起，否则会出现「左栏 + 文件管理」同时在场；
+ *   3. 用户没有手动收起它（`sessionUi.leftHiddenOf`，第六轮新增的按钮）。
  *
- * 判据用 filesActive（而不是直接写 activeSubOf !== FILES_TAB）是为了与主区域**严格互斥**：
- * 「一个终端都没有 + sessionUi 指着幽灵 uid」这种退化状态下主区域会兜底显示文件管理器，
- * 此时左栏也必须一起收起，否则会出现「左栏 + 文件管理」同时在场。
+ * 这**不是**第二个「主区域模式」：主区域显示什么仍然只由 activeSub 决定，这里只是把左栏的
+ * 一个「用户偏好」叠加上去（第二轮那版 mainMode 之所以被删，是因为它自己也能决定主区域）。
  */
-const showLeft = computed(() => !isMobile.value && !filesActive.value)
+const showLeft = computed(
+  () => wide.value && !filesActive.value && !sessionUi.leftHiddenOf(props.sid)
+)
+
+/**
+ * 左栏被用户手动收起（且此刻本该显示）——子标签栏最左侧就出现「展开面包屑」按钮。
+ *
+ * 为什么带上 `!filesActive`：在文件管理子标签里，左栏本来就不该显示（规则 2），这时给一个
+ * 「展开面包屑」按钮是骗人的——点了也不会出现。用户在那个状态想找左栏，就点终端子标签
+ * （左栏会回来，除非确实被手动收起过）。
+ */
+const leftCollapsed = computed(
+  () => wide.value && !filesActive.value && sessionUi.leftHiddenOf(props.sid)
+)
+
+function showLeftAgain() {
+  sessionUi.setLeftHidden(props.sid, false)
+}
 
 function startResize(event: PointerEvent) {
-  // 手柄按下会顺手选中文本 / 触发一次点击，先挡掉
+  // 手柄按下会顺手选中文本 / 触发一次点击，先挡掉；顺便把焦点从手柄上摘掉（
+  // 手柄在 Chrome 上会获得焦点，用户接着按空格/回车会「再按一次」它）
   event.preventDefault()
+  ;(event.currentTarget as HTMLElement | null)?.blur()
   const startX = event.clientX
   const startWidth = leftWidth.value
   const move = (e: PointerEvent) => {
@@ -236,13 +274,6 @@ onBeforeUnmount(() => {
 })
 
 // ---------- 终端标签：状态点 / 关闭 / 重命名 ----------
-
-function dotClass(tab: TermTab): string {
-  if (tab.status === 'open' && !tab.restoring) return 'bg-success'
-  if (tab.status === 'connecting' || tab.restoring || tab.status === 'detached') return 'bg-warning'
-  if (tab.status === 'exited') return 'bg-ink-faint dark:bg-ink-faint-dark'
-  return 'bg-danger'
-}
 
 const closeVisible = ref(false)
 const closeUid = ref<string | null>(null)
@@ -292,24 +323,68 @@ function onRenamed(value: string) {
          BreadcrumbBar / FileTree 都不向外抛事件（切主区域就是切子标签，契约 13.1）。 -->
     <aside
       v-show="showLeft"
-      class="flex shrink-0 flex-col border-r border-line dark:border-line-dark"
+      class="relative flex shrink-0 flex-col border-r border-line dark:border-line-dark"
       :style="{ width: `${leftWidth}px` }"
       :title="t('session_left_title')"
     >
       <BreadcrumbBar :sid="sid" />
       <FileTree :sid="sid" class="min-h-0 flex-1" />
+
+      <!-- 拖动手柄（第九轮）：吸附在分隔线上、居于面包屑按钮条右侧，**代替**直接拖那条 1px 的分隔线。
+           为什么需要它：平板是触屏、没有鼠标，1px 的线根本抓不住（手指的落点精度差一个数量级）。
+           手柄 `-translate-x-1/2` 骑在边框上（一半在左栏、一半在主区域），触屏上是一个 20×32 的
+           实体目标；`touch-none` 保证拖动时不会顺手滚动画布。桌面端也留着——它同时是个可见的
+           「这里可以拖」提示。 -->
+      <button
+        v-if="showLeft"
+        type="button"
+        class="tree-tool absolute top-1.5 right-0 z-10 !h-8 !w-5 -translate-x-1/2 touch-none !cursor-col-resize border border-line bg-surface shadow-sm dark:border-line-dark dark:bg-surface-dark"
+        :title="t('session_left_resize')"
+        :aria-label="t('session_left_resize')"
+        @pointerdown="startResize"
+      >
+        <svg
+          class="h-3.5 w-3.5"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+        >
+          <path d="M9 6v12M15 6v12" />
+        </svg>
+      </button>
     </aside>
-    <div
-      v-show="showLeft"
-      class="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-brand/40"
-      @pointerdown="startResize"
-    ></div>
 
     <section class="flex min-w-0 flex-1 flex-col">
       <!-- 子标签栏：固定段 = 「文件管理」（不参与横向滚动，否则终端一多就被挤出屏幕、再也点不回来）
            + 滚动段 = 终端标签 + 新建。激活它 = 主区域切到文件管理、左栏收起（契约 13.1）。 -->
       <div class="flex shrink-0 items-center gap-1 border-b border-line px-2 py-1 dark:border-line-dark">
         <div class="flex shrink-0 items-center gap-1">
+          <!-- 展开面包屑（第六轮）：只在左栏被手动收起时出现，点一下左栏回来、它自己消失。
+               放在「文件管理」子标签左侧（用户原话），与左栏里那个「隐藏面包屑」互为一对。 -->
+          <button
+            v-if="leftCollapsed"
+            class="tree-tool"
+            :title="t('session_show_left')"
+            :aria-label="t('session_show_left')"
+            @click="showLeftAgain"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="h-4 w-4"
+            >
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <path d="M9 4v16" />
+              <path d="m14 9 2 3-2 3" />
+            </svg>
+          </button>
+
           <button
             class="subtab"
             :class="filesTabActive ? 'subtab-active' : 'subtab-idle'"
@@ -347,15 +422,12 @@ function onRenamed(value: string) {
             @click="activateTerm(tab.uid)"
             @dblclick="startRenameTerm(tab)"
           >
-            <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="dotClass(tab)"></span>
+            <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="termStatusDotClass(tab)"></span>
             <span class="truncate">{{ terminals.titleOf(sid, tab) }}</span>
+            <!-- 关闭按钮：鼠标悬停才变红，触屏常驻红（.close-danger，见 style.css） -->
             <button
-              class="hover-reveal flex h-4 w-4 shrink-0 items-center justify-center rounded-full"
-              :class="
-                activeSub === tab.uid
-                  ? 'text-white/80 hover:bg-white/20'
-                  : 'text-ink-faint hover:bg-black/10 dark:hover:bg-white/10'
-              "
+              class="close-danger flex h-4 w-4 shrink-0 items-center justify-center"
+              :class="activeSub === tab.uid ? 'on-brand' : ''"
               :title="t('session_close_terminal')"
               @click.stop="requestCloseTerm(tab.uid)"
             >
@@ -388,8 +460,12 @@ function onRenamed(value: string) {
           </button>
         </div>
 
-        <!-- 桌面工具条（子标签栏右侧）：作用于当前激活终端 -->
-        <div class="hidden shrink-0 items-center gap-0.5 md:flex">
+        <!-- 桌面工具条（子标签栏右侧）：作用于当前激活终端。
+             文件管理子标签在前台时**整条隐藏**（`hasTarget` 为假，五个按钮加折叠/展开都没有作用
+             对象）：用户的原话是「文件管理标签显示时这些按钮不该出现」，而留一排灰按钮只是噪音
+             ——切回终端时它们本来就回来了（不涉及任何状态，v-if 是安全的：这些按钮没有需要保留
+             的 DOM 状态，与规则 3 禁 v-if 的「面板」不是一回事）。 -->
+        <div v-if="!filesActive" class="hidden shrink-0 items-center gap-0.5 md:flex">
           <button
             class="g-btn-ghost !h-8 !px-1.5"
             :title="labelsOn ? t('term_labels_collapse') : t('term_labels_expand')"
@@ -539,8 +615,11 @@ function onRenamed(value: string) {
       </div>
 
       <!-- 移动端工具行：图标常显（触屏没有 hover，也没有「功能名」这个概念）。
-           内容与桌面行一致（搜索/粘贴/清屏/重连/快捷指令）；设置只在首页工具条上。 -->
+           内容与桌面行一致（搜索/粘贴/清屏/重连/快捷指令）；设置只在首页工具条上。
+           与桌面一样：文件管理子标签在前台时整行隐藏（这一行里只有那几个按钮，
+           藏着它们等于整行没有内容，留着一条空行只会白占屏高）。 -->
       <div
+        v-if="!filesActive"
         class="flex min-h-10 shrink-0 items-center justify-end gap-0.5 border-b border-line/70 bg-black/[0.03] px-2 py-1.5 md:hidden dark:border-line-dark/70 dark:bg-white/[0.04]"
       >
         <div class="flex items-center gap-0.5">
@@ -648,7 +727,9 @@ function onRenamed(value: string) {
            hidden 的元素不接收指针事件，所以叠着的隐藏面板不会挡住当前面板的操作。 -->
       <div class="relative min-h-0 flex-1">
         <div class="absolute inset-0" :class="filesActive ? '' : 'invisible'">
-          <FileManager :sid="sid" :mobile="isMobile" />
+          <!-- `mobile` 判的也是「窄不窄」而不是「是不是触屏」：平板放得下权限列，
+               空白处右键（含多选时的批量菜单）也该照常弹（第十轮）。 -->
+          <FileManager :sid="sid" :mobile="!wide" />
         </div>
         <TerminalPane
           v-for="tab in termTabs"

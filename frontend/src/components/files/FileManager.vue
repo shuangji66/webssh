@@ -9,11 +9,21 @@
 //   2) 表头的「权限」列可点，在符号（-rw-r--r--）与八进制（0644）之间切换显示形态
 //      （八进制由 modeToOctal 换算）。它**故意**与排序共用表头但互不干扰：排序是三列的三态
 //      循环，权限列只切换显示形态，不参与排序——两件事混在一起后用户点一下会同时改变两处；
-//   3) 行内「更多」菜单 + **空白处右键菜单**（桌面）：粘贴 / 打开终端 / 复制路径；
+//   3) 行内「更多」菜单 + **空白处右键菜单**（桌面）：新建文件 / 新建文件夹 / 上传 / 粘贴 /
+//      打开终端 / 复制路径；
 //   4) 复制 / 剪切 / 粘贴 / 压缩为 tar.gz / 压缩为 zip / 解压 / 导出至飞牛 / 在此目录新建终端。
 //
-// 切回终端不再由这个面板负责（第三轮去掉了「返回终端」按钮）：子标签栏里那个固定「文件管理」
-// 子标签与终端标签是二选一，切回去点终端标签即可——面板里再放一个开关就是两套开关打架。
+// 第五轮新增两件事：
+//   1) 「信息」（行菜单/空白处菜单都有）：弹窗显示条目或当前目录的属性，数据走 /api/fs/info
+//      （契约 15.5）——列目录拿不到「当前目录自己」的属性，而目录的「内含多少目录和文件」
+//      也只有服务端顺手数一遍最省（只数一层，见 InfoDialog）；
+//   2) 地址栏下面那行**常驻剪贴板**（复制/剪切之后一直在，直到点「取消」）：它里面的
+//      「粘贴到此处」**不清空**剪贴板（可以连着粘到好几个目录），而右键菜单里的「粘贴」
+//      保持原有语义（粘完就清）——两种入口的区别在 sftp.paste 的 keepClipboard 参数上。
+//
+// 切回终端由工具栏最左侧的「返回终端」按钮负责（第四轮新增）：它只把 sessionUi 的激活子标签
+// 改回**上一次激活的终端**，左栏（面包屑 + 目录树）随之回来——与左栏那条按钮条里的「切换到
+// 文件管理」互为一对，两处共用同一个状态（契约 13.1 的「二选一」判据没变，也没有第二套开关）。
 //
 // 弹窗（重命名 / 新建 用 PromptDialog，删除与覆盖确认用 ConfirmDialog）由 shell 模块提供，见契约 6.2。
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
@@ -27,6 +37,7 @@ import {
   type UploadResult
 } from '@/serverapi'
 import { usePaneControlsStore } from '@/stores/paneControls'
+import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
@@ -43,6 +54,7 @@ import {
 import { revealActive, wheelToHorizontal } from '@/utils/scroll'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import PromptDialog from '@/components/PromptDialog.vue'
+import InfoDialog from './InfoDialog.vue'
 import PreviewDialog from './PreviewDialog.vue'
 import UploadDialog from './UploadDialog.vue'
 
@@ -52,6 +64,7 @@ const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
 const sftp = useSftpStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
+const sessionUi = useSessionUiStore()
 const toastStore = useToastStore()
 
 /** 统一的提示出口：文案一律走 i18n，失败必须说清原因（不能「点了没反应」）。 */
@@ -64,6 +77,8 @@ const state = computed(() => sftp.stateOf(sid))
 const entries = computed(() => sftp.sorted(sid))
 const selected = computed(() => state.value.selected)
 const selecting = computed(() => selected.value.length > 0)
+/** 多选模式（第九轮）：进入后点行是「选中/取消选中」，不再是打开。 */
+const multi = computed(() => state.value.multi)
 
 // ---- 生命周期：进面板就定位家目录 ----
 
@@ -102,30 +117,42 @@ watch(
 )
 
 function go(path: string) {
+  leaveMulti()
   void sftp.navigate(sid, path)
 }
 
 // ---- 工具栏动作 ----
 
+/**
+ * 点了工具栏上任何一个「改状态」的按钮（前进/后退/刷新/上一层/新建/上传/换视图/面包屑导航），
+ * 都**退出多选**（第十轮用户要求）。
+ *
+ * 理由：多选是一个短暂的工作流（选一批 → 做一个动作），用户接着去点视图或新建，语义上已经
+ * 离开那次选择了；留着高亮只会让下一次点行「莫名其妙多选了一项」。关掉它同时也清掉 `selected`。
+ */
+function leaveMulti() {
+  if (multi.value) sftp.exitMulti(sid)
+}
+
 function goUp() {
+  leaveMulti()
   if (state.value.dir === '/' || !state.value.dir) return
   void sftp.navigate(sid, parentPath(state.value.dir))
 }
 
 function retry() {
+  leaveMulti()
   // 家目录还没定位到（ensure 失败）时重试 ensure；否则重拉当前目录
   void (state.value.dir ? sftp.refresh(sid) : sftp.ensure(sid))
 }
 
 function toggleView() {
+  leaveMulti()
   sftp.setView(sid, state.value.view === 'list' ? 'grid' : 'list')
 }
 
-function selectAll() {
-  sftp.select(
-    sid,
-    entries.value.map((entry) => entry.path)
-  )
+function toggleMulti() {
+  sftp.setMulti(sid, !multi.value)
 }
 
 /** 聚焦当前激活的终端；activeOf 为 null（激活项在文件管理上）时退回第一个终端。 */
@@ -134,6 +161,23 @@ function focusTerminal() {
     const uid = terminals.activeOf(sid)?.uid ?? terminals.tabsOf(sid)[0]?.uid
     if (uid) panes.get(sid, uid)?.focus()
   })
+}
+
+/**
+ * 「返回终端」：切回**上一次激活**的终端（与子标签栏里点那个终端标签是同一个动作），
+ * 桌面端左栏（面包屑 + 目录树）随之回来。
+ *
+ * 为什么用 lastActiveOf 而不是 activeOf：后者在文件管理子标签在前台时按设计返回 null
+ * （它是「命令发进哪个终端」的判据，见 terminals store 文件头），这里要的是导航目标。
+ * 没有终端时按钮是禁用的（主区域此时只能交给文件管理，见 SessionView 规则 4），
+ * 兜底再取第一个标签只是为了防御「activeUid 与标签列表暂时不同步」。
+ */
+function backToTerminal() {
+  const tab = terminals.lastActiveOf(sid) ?? terminals.tabsOf(sid)[0]
+  if (!tab) return
+  // 只写 sessionUi 一处状态：主区域与左栏都由 activeSub 推导（契约 13.1 / 14.3）
+  sessionUi.setActiveSub(sid, tab.uid)
+  focusTerminal()
 }
 
 /** 在当前（或菜单指向的）目录里新开一个终端。 */
@@ -217,7 +261,7 @@ function openMenu(entry: FsEntry, event: MouseEvent) {
   void sftp.ensureRuntime()
   // 先按指针位置摆好，渲染出来量到真实尺寸后再夹回窗口内（同一帧内完成，看不出来）
   void nextTick(clampMenu)
-  window.setTimeout(() => window.addEventListener('click', hideMenu, { once: true }), 0)
+  armDismiss()
 }
 
 /**
@@ -250,7 +294,7 @@ function openBlankMenu(event: MouseEvent) {
   menu.blank = true
   void sftp.ensureRuntime()
   void nextTick(clampMenu)
-  window.setTimeout(() => window.addEventListener('click', hideMenu, { once: true }), 0)
+  armDismiss()
 }
 
 function clampMenu() {
@@ -261,8 +305,70 @@ function clampMenu() {
   menu.y = Math.max(MENU_MARGIN, Math.min(menu.y, window.innerHeight - height - MENU_MARGIN))
 }
 
+/**
+ * window 上的「点别处就关」。
+ *
+ * 用 **pointerdown + 捕获阶段**，不用 click：
+ *  1. 触屏上 tap 出来的 click 未必会到达 window（滚动判定的手指微动、别处的处理器
+ *     stopPropagation 都会吃掉它）——用户在手机上「点别处菜单不消失」就是这么来的
+ *     （第五轮报的 bug）；
+ *  2. 捕获阶段先于任何冒泡处理器执行，语义稳定：点在菜单外 → 立刻关；
+ *  3. 鼠标与触摸同一套逻辑，不必分叉。
+ *
+ * 落在菜单自己身上的 pointerdown 不算「别处」：那一击要留给菜单项自己处理
+ * （每项的动作里会 hideMenu）。
+ */
+function onDocPointerDown(event: PointerEvent) {
+  const el = menuEl.value
+  if (el && event.target instanceof Node && el.contains(event.target)) return
+  hideMenu()
+}
+
+/**
+ * 武装「点别处关闭」。
+ *
+ * setTimeout 0 是为了**放过打开菜单的那一击**（本次 pointerdown / click 已经发生过）；
+ * 挂之前先摘一次：不摘的话每次打开都往里塞一个，菜单关掉后 window 上会留一串监听器。
+ */
+function armDismiss() {
+  window.setTimeout(() => {
+    window.removeEventListener('pointerdown', onDocPointerDown, true)
+    window.addEventListener('pointerdown', onDocPointerDown, true)
+  }, 0)
+}
+
+/** 关掉菜单；顺手摘掉 window 上的监听（点别处 / 动作做完 / 组件卸载都走它）。 */
 function hideMenu() {
   menu.show = false
+  window.removeEventListener('pointerdown', onDocPointerDown, true)
+}
+
+// ---- 信息弹窗 ----
+
+const infoVisible = ref(false)
+const infoPath = ref('')
+
+/**
+ * 打开「信息」。行菜单传条目的路径，空白处菜单传**当前目录**（14.x 起的约定：空白处右键
+ * 是对「这个目录」做事）。先收菜单，否则弹窗后面会挂着一个点不掉的菜单。
+ */
+function openInfo(path: string) {
+  hideMenu()
+  if (!path) return
+  infoPath.value = path
+  infoVisible.value = true
+}
+
+// ---- 剪贴板栏 ----
+
+/** 本会话剪贴板里的内容（空 = 不显示那一行）；来自别的会话的不算，不能跨会话粘贴。 */
+const clip = computed(() => sftp.clipboardFor(sid))
+
+/** 剪贴板栏的「粘贴到此处」：粘进当前目录，且**不清空**剪贴板（见 sftp.paste 的说明）。 */
+function pasteHere() {
+  const dir = state.value.dir
+  if (!dir) return
+  void pasteInto(dir, true)
 }
 
 // ---- 打开 / 下载 / 复制路径 ----
@@ -271,7 +377,8 @@ const previewVisible = ref(false)
 const previewPath = ref('')
 
 function onEntryClick(entry: FsEntry) {
-  if (selecting.value) {
+  // 多选模式下点行 = 选中/取消选中（不打开：用户点第二下显然不是想打开两个文件）
+  if (multi.value) {
     toggleSelected(entry)
     return
   }
@@ -333,6 +440,70 @@ async function copyPath(path: string) {
   } catch (e) {
     toast(t('files_op_failed', { error: describeError(e) }))
   }
+}
+
+/**
+ * 批量下载：逐个走既有的单文件下载（浏览器会连着接 N 个下载）。
+ *
+ * 下载没有「一个请求多个文件」的形式（后端 `/api/fs/download` 一次一个路径），所以这里就是串行
+ * 调 N 次；成功不说 N 句（一声「开始下载 N 项」就够），失败**必须**报出来并带上失败数。
+ */
+async function downloadPaths(paths: string[]) {
+  hideMenu()
+  let failed = 0
+  let lastError = ''
+  for (const path of paths) {
+    try {
+      await sftp.download(sid, path)
+    } catch (e) {
+      failed++
+      lastError = describeError(e)
+    }
+  }
+  if (failed) toast(t('files_download_failed_n', { n: failed, error: lastError }))
+  if (paths.length > failed) toast(t('files_download_started_n', { n: paths.length - failed }), 'success')
+  sftp.exitMulti(sid)
+}
+
+/**
+ * 批量导出至飞牛。
+ *
+ * 同名冲突**一次问、整批覆盖**：逐个弹窗问会把用户烦死，而这一批是同一个选择、同一个意图。
+ * 其余失败逐个报（带文件名，方便定位是哪一个）。
+ */
+async function exportPaths(paths: string[], overwrite: boolean) {
+  hideMenu()
+  const skipped: string[] = []
+  let done = 0
+  for (const path of paths) {
+    try {
+      await sftp.exportToNas(sid, path, overwrite)
+      done++
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'duplicate' && !overwrite) {
+        skipped.push(path)
+        continue
+      }
+      toast(t('files_op_failed', { error: describeError(e) }))
+    }
+  }
+  if (done) toast(t('files_export_nas_done_n', { n: done }), 'success')
+  if (skipped.length) {
+    askConfirm(t('files_export_overwrite'), t('files_export_overwrite_n', { n: skipped.length }), () =>
+      void exportPaths(skipped, true)
+    )
+    return // 确认框留着，别把多选态也收掉（用户还没做完这件事）
+  }
+  sftp.exitMulti(sid)
+}
+
+/** 按路径批量删除（多选菜单用；单个删除仍走 askDelete(entry)）。 */
+function askDeletePaths(paths: string[]) {
+  hideMenu()
+  if (!paths.length) return
+  askConfirm(t('common_tip'), t('files_delete_selected_confirm', { n: paths.length }), () =>
+    void removePaths(paths)
+  )
 }
 
 // ---- 新建 / 重命名 / 删除（PromptDialog / ConfirmDialog） ----
@@ -398,6 +569,10 @@ function badName(name: string): 'empty' | 'invalid' | '' {
 }
 
 function newEntry(dir: boolean) {
+  // 先把菜单收掉：菜单项的 pointerdown 落在菜单自己身上（见 onDocPointerDown），不会被「点别处」
+  // 那条规则关掉，所以要在这里显式关——否则弹窗后面会一直挂着一个菜单。
+  hideMenu()
+  leaveMulti()
   askName({
     title: dir ? t('files_new_dir_title') : t('files_new_file_title'),
     label: t('files_new_name_prompt'),
@@ -503,14 +678,15 @@ async function removePaths(paths: string[]) {
       toast(t('files_op_failed', { error: describeError(e) }))
     }
   }
-  sftp.clearSelection(sid)
+  // 批量删除同理：不管成没成，都从多选态收回来（失败的那几项已经在 toast 里说清了）
+  sftp.exitMulti(sid)
   if (single && !failed) toast(t('files_deleted', { name: single.name }), 'success')
 }
 
 function askDeleteSelected() {
   const paths = selected.value.filter((path) => state.value.entries.some((e) => e.path === path))
   if (!paths.length) {
-    sftp.clearSelection(sid)
+    // 一个都没选：按钮在界面上是禁用的，这里再兜一次（防连点/快捷键）
     return
   }
   askConfirm(t('common_tip'), t('files_delete_selected_confirm', { n: paths.length }), () =>
@@ -524,12 +700,15 @@ function copyEntries(paths: string[]) {
   hideMenu()
   sftp.copyToClipboard(sid, paths)
   toast(t('files_copied_items', { n: paths.length }), 'success')
+  // 批量动作做完就退出多选（用户要求：选好之后做完操作不该还停在选择态）
+  sftp.exitMulti(sid)
 }
 
 function cutEntries(paths: string[]) {
   hideMenu()
   sftp.cutToClipboard(sid, paths)
   toast(t('files_cut_items', { n: paths.length }), 'success')
+  sftp.exitMulti(sid)
 }
 
 /**
@@ -538,14 +717,14 @@ function cutEntries(paths: string[]) {
  * 失败**不清空**剪贴板（由 store 保证），用户可以重试或换个目录粘；成功后清空，避免
  * 「同一批再粘一遍」这种误操作真的多出一份文件。失败原因原样报出来（同名 / 权限 / 目标没了）。
  */
-async function pasteInto(toDir: string) {
+async function pasteInto(toDir: string, keepClipboard = false) {
   hideMenu()
   if (!toDir) return
   // 剪贴板里第一项的名字：后端把「同名」报成 duplicate 错误码时（11.5 的表格两种都提了，
   // 实现按 skipped 回，这里把两种都兜住）用它说明是哪一个撞了名字。
   const first = sftp.clipboardFor(sid)?.paths[0]
   try {
-    const res = await sftp.paste(sid, toDir)
+    const res = await sftp.paste(sid, toDir, keepClipboard)
     if (res.count) toast(t('files_paste_done', { n: res.count }), 'success')
     // 后端只回「跳过了几项」，名字是 store 按「源里的名字没出现在结果里」对出来的
     const conflict = res.conflicts[0]
@@ -589,6 +768,7 @@ async function compressEntries(paths: string[], format: ArchiveFormat) {
   try {
     const archive = await sftp.compress(sid, paths, format)
     toast(t('files_compress_done', { path: archive.path }), 'success')
+    sftp.exitMulti(sid)
   } catch (e) {
     toast(t('files_op_failed', { error: describeError(e) }))
   }
@@ -615,6 +795,7 @@ async function exportEntry(entry: FsEntry, overwrite: boolean) {
   try {
     const out = await sftp.exportToNas(sid, entry.path, overwrite)
     toast(t('files_export_nas_done', { path: out.path }), 'success')
+    sftp.exitMulti(sid)
   } catch (e) {
     if (e instanceof ApiError && e.code === 'duplicate') {
       // 拿被导出的那个路径当确认信息：用户要能看出「覆盖的是哪一个」
@@ -628,6 +809,13 @@ async function exportEntry(entry: FsEntry, overwrite: boolean) {
 // ---- 上传：弹窗（三来源） + 拖拽（带进度与取消） ----
 
 const uploadVisible = ref(false)
+
+/** 空白处右键菜单里的「上传」：与工具栏那个按钮同一个弹窗，目标目录就是当前目录。 */
+function uploadHere() {
+  hideMenu()
+  leaveMulti()
+  uploadVisible.value = true
+}
 
 /** 拖拽上传的进度：工具栏「上传」走 UploadDialog 自带的进度与取消，这里管的是拖进来的那批。 */
 const dropUploading = ref(false)
@@ -716,21 +904,19 @@ function pasteBlockedReason(): string | null {
 }
 
 /**
- * 粘贴项。
+ * 粘贴项（两种菜单共用一份判据）。
  *
- * `always = false`（行菜单）：没有剪贴板就整项不出现（11.4）。
- * `always = true`（空白处菜单）：总是出现，粘不了时置灰并在点击时说明原因（13.4）。
+ * **剪贴板没有内容 → 整项不出现**（第九轮用户要求；13.4 那版是「空白处总是显示、置灰+说明」，
+ * 现在统一成不显示：一个永远灰着的菜单项只是噪音）。当前目录/条目能不能粘，看 `pasteBlockedReason`：
+ *  - 剪贴板是空的 → 不显示；
+ *  - 剪贴板来自**别的会话** → 显示但置灰，点一下说明原因——用户需要知道「东西还在，只是不能在这儿粘」。
  */
-function pasteItem(toDir: string, always: boolean): MenuItem | null {
+function pasteItem(toDir: string): MenuItem | null {
   const blocked = pasteBlockedReason()
   if (!blocked) return { label: t('files_paste'), run: () => void pasteInto(toDir) }
-  if (!always) {
-    // 行菜单里「别的会话复制的东西」还是要露出来：用户需要知道「为什么这里没有粘贴」
-    return sftp.clipboardIsForeign(sid)
-      ? { label: t('files_paste'), dim: true, run: () => toast(blocked, 'info') }
-      : null
-  }
-  return { label: t('files_paste'), dim: true, run: () => toast(blocked, 'info') }
+  return sftp.clipboardIsForeign(sid)
+    ? { label: t('files_paste'), dim: true, run: () => toast(blocked, 'info') }
+    : null
 }
 
 /** 导出项：exportRoot 为空 = 服务端没配共享目录，禁用并说明。 */
@@ -745,18 +931,65 @@ function exportItem(entry: FsEntry): MenuItem {
   return { label: t('files_export_nas'), run: () => void exportEntry(entry, false) }
 }
 
-/** 空白处菜单（13.4）：粘贴到当前目录 / 在当前目录开终端 / 复制当前目录路径。 */
+/**
+ * 多选模式下的**批量菜单**（第十轮）：右键的时候，不管点在行上还是空白处，都给这七项，
+ * 而且都作用于**整个选择**——用户此刻的上下文就是那批选中的东西。
+ *
+ * 顺序按用户给的原话：复制 / 剪切 / 删除 / 导出 / 下载 / 两个压缩。**一个都没选时不弹**
+ * （没有作用对象；调用方见 `menuItems`）。
+ */
+function multiMenuItems(): MenuItem[] {
+  const paths = selected.value.filter((path) => state.value.entries.some((e) => e.path === path))
+  if (!paths.length) return []
+  const items: MenuItem[] = []
+  items.push({ label: t('files_copy'), run: () => copyEntries(paths) })
+  items.push({ label: t('files_cut'), run: () => cutEntries(paths) })
+  items.push({ label: t('common_delete'), danger: true, run: () => askDeletePaths(paths) })
+  items.push(
+    sftp.exportRoot()
+      ? { label: t('files_export_nas'), run: () => void exportPaths(paths, false) }
+      : {
+          label: t('files_export_nas'),
+          dim: true,
+          run: () => toast(t('files_export_nas_unavailable'), 'info')
+        }
+  )
+  items.push({ label: t('files_download'), run: () => void downloadPaths(paths) })
+  items.push({
+    label: t('files_compress_selected', { n: paths.length }),
+    run: () => void compressEntries(paths, 'tar.gz')
+  })
+  items.push({ label: t('files_compress_zip'), run: () => void compressEntries(paths, 'zip') })
+  return items
+}
+
+/**
+ * 空白处菜单（13.4 + 第四轮 + 第六轮）：新建文件 / 新建文件夹 / 上传 / 粘贴到当前目录 /
+ * 信息 / 在当前目录开终端 / 复制当前目录路径 / 刷新。
+ *
+ * 为什么把「新建 / 上传」也放这里：空白处右键是「对**这个目录**做事」最自然的入口，
+ * 而这三件事（尤其是上传）在工具栏上都要先回到工具栏去点。粘贴仍然放在中间靠前的位置
+ * （它是使用频率最高的一项），粘不了时置灰并说明原因（13.4）。
+ */
 function blankMenuItems(): MenuItem[] {
   const dir = state.value.dir
   const items: MenuItem[] = []
-  const paste = pasteItem(dir, true)
+  items.push({ label: t('files_new_file'), run: () => newEntry(false) })
+  items.push({ label: t('files_new_dir'), run: () => newEntry(true) })
+  items.push({ label: t('files_upload'), run: uploadHere })
+  const paste = pasteItem(dir)
   if (paste) items.push(paste)
+  items.push({ label: t('files_info'), run: () => openInfo(dir) })
   items.push({ label: t('files_open_terminal'), run: () => openTerminalHere(dir) })
   items.push({ label: t('files_copy_path'), run: () => void copyPath(dir) })
+  // 刷新（第七轮）：空白处右键是「对这个目录做事」的入口，刷新放这里最顺手
+  items.push({ label: t('files_refresh'), run: () => retry() })
   return items
 }
 
 const menuItems = computed<MenuItem[]>(() => {
+  // 多选模式：不管右键落在行上还是空白处，菜单都是那一批（第十轮）
+  if (multi.value && selected.value.length) return multiMenuItems()
   if (menu.blank) return blankMenuItems()
   const entry = entries.value.find((item) => item.path === menu.path)
   if (!entry) return []
@@ -765,7 +998,7 @@ const menuItems = computed<MenuItem[]>(() => {
   // 顺序按契约 11.4（13.4 加了「压缩为 zip」紧跟 tar.gz）：粘贴（有剪贴板时）/ 重命名 /
   // 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 / 压缩为 tar.gz / 压缩为 zip / 解压 /
   // 复制完整路径 / 在此目录新建终端
-  const paste = pasteItem(entry.dir ? entry.path : state.value.dir, false)
+  const paste = pasteItem(entry.dir ? entry.path : state.value.dir)
   if (paste) items.push(paste)
   items.push({ label: t('files_rename'), run: renameEntry })
   items.push({ label: t('files_copy'), run: () => copyEntries(targets) })
@@ -787,6 +1020,7 @@ const menuItems = computed<MenuItem[]>(() => {
   if (!entry.dir && isArchive(entry.name)) {
     items.push({ label: t('files_extract'), run: () => void extractEntry(entry) })
   }
+  items.push({ label: t('files_info'), run: () => openInfo(entry.path) })
   items.push({ label: t('files_copy_path'), run: () => void copyPath(entry.path) })
   items.push({
     label: t('files_open_terminal_here'),
@@ -804,6 +1038,36 @@ onBeforeUnmount(hideMenu)
     <div
       class="flex shrink-0 flex-wrap items-center gap-0 border-b border-line px-1 py-1 dark:border-line-dark"
     >
+      <!-- 返回终端（第四轮新增）：主区域交回上一次激活的终端、左栏（面包屑 + 目录树）回来。
+           放在最左是因为它是「离开这个页面」的动作，与左栏那条按钮条里的「切换到文件管理」
+           互为一对（同一个双向箭头图标）。一个终端都没有时禁用：此时文件管理是唯一能显示的
+           主区域（SessionView 规则 4），没有可返回的目标。 -->
+      <button
+        type="button"
+        class="tree-tool"
+        :disabled="!terminals.countOf(sid)"
+        :title="t('files_switch_to_terminal')"
+        :aria-label="t('files_switch_to_terminal')"
+        @click="backToTerminal"
+      >
+        <svg
+          class="h-4 w-4"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M8 3 4 7l4 4" />
+          <path d="M4 7h16" />
+          <path d="m16 21 4-4-4-4" />
+          <path d="M20 17H4" />
+        </svg>
+      </button>
+
+      <span class="mx-1 h-4 w-px shrink-0 bg-line dark:bg-line-dark" />
+
       <button
         type="button"
         class="tree-tool"
@@ -952,12 +1216,16 @@ onBeforeUnmount(hideMenu)
           <path d="M4 20h16" />
         </svg>
       </button>
+      <!-- 多选（第九轮）：点一下**进入多选模式**（不预选任何东西），之后点行就是逐个点选；
+           做完复制/剪切/删除/压缩/导出会自动退出（见 toggleMulti 与那些 exitMulti 调用点）。
+           原来那个「全选」是一次性把当前目录全选上，想选三个文件还得先全选再逐个取消。 -->
       <button
         type="button"
         class="tree-tool"
-        :title="t('files_select_all')"
-        :aria-label="t('files_select_all')"
-        @click="selectAll"
+        :class="multi ? '!bg-brand/10 !text-brand' : ''"
+        :title="multi ? t('files_multi_exit') : t('files_multi_select')"
+        :aria-label="multi ? t('files_multi_exit') : t('files_multi_select')"
+        @click="toggleMulti"
       >
         <svg
           class="h-4 w-4"
@@ -1011,18 +1279,24 @@ onBeforeUnmount(hideMenu)
            工具栏只留「做什么」的动作按钮。 -->
     </div>
 
-    <!-- 有选中项时面包屑让位给「已选 / 删除所选」；否则是路径分段（点哪段去哪层） -->
+    <!-- 多选模式时面包屑让位给这条「选择条」；其余时候是路径分段（点哪段去哪层）。
+         一个都没选时给一句提示（告诉用户「点行就是选」），而不是「已选 0 项」这种废话。 -->
     <div
-      v-if="selecting"
-      class="flex shrink-0 items-center gap-2 border-b border-line px-2 py-1 dark:border-line-dark"
+      v-if="multi"
+      class="flex shrink-0 items-center gap-2 border-b border-line bg-brand-soft px-2 py-1 dark:border-line-dark"
     >
       <span class="min-w-0 flex-1 truncate text-xs text-ink-soft dark:text-ink-soft-dark">
-        {{ t('files_selected', { n: selected.length }) }}
+        {{ selecting ? t('files_selected', { n: selected.length }) : t('files_multi_hint') }}
       </span>
-      <button type="button" class="g-btn-ghost h-7" @click="sftp.clearSelection(sid)">
-        {{ t('files_clear_selection') }}
+      <button type="button" class="g-btn-ghost h-7" @click="toggleMulti">
+        {{ t('files_multi_exit') }}
       </button>
-      <button type="button" class="g-btn-ghost h-7 text-danger" @click="askDeleteSelected">
+      <button
+        type="button"
+        class="g-btn-ghost h-7 text-danger"
+        :disabled="!selecting"
+        @click="askDeleteSelected"
+      >
         {{ t('files_delete_selected', { n: selected.length }) }}
       </button>
     </div>
@@ -1048,6 +1322,60 @@ onBeforeUnmount(hideMenu)
           {{ seg.label }}
         </button>
       </template>
+    </div>
+
+    <!-- 常驻剪贴板栏（第五轮）：复制/剪切之后一直在，直到点「取消」。
+         放在地址栏下面：先回答「我在哪」（面包屑），再回答「手上拿着什么」（这一行）。
+         「粘贴到此处」**不清空**剪贴板（可以连着粘到好几个目录），这与右键菜单里的「粘贴」
+         刻意不同——那个是一次性动作，粘完就清（用户明确要求两个入口各自保持现状）。
+         来自别的会话的剪贴板这里**不显示**：跨会话粘贴是硬约束（见 sftp store），
+         显示一行只能置灰的按钮不如不显示，菜单里那句「不能跨会话粘贴」已经把话说清了。 -->
+    <div
+      v-if="clip"
+      class="flex shrink-0 items-center gap-2 border-b border-line bg-brand-soft px-2 py-1 text-xs dark:border-line-dark"
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="h-3.5 w-3.5 shrink-0 text-brand"
+      >
+        <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+        <rect x="8" y="2" width="8" height="4" rx="1" />
+      </svg>
+      <span class="shrink-0 text-ink dark:text-ink-dark">
+        {{
+          clip.op === 'cut'
+            ? t('files_cut_items', { n: clip.paths.length })
+            : t('files_copied_items', { n: clip.paths.length })
+        }}
+      </span>
+      <span
+        class="min-w-0 flex-1 truncate font-mono text-ink-faint dark:text-ink-faint-dark"
+        :title="clip.paths.join('\n')"
+      >
+        {{ clip.paths.map((p) => baseName(p)).join('、') }}
+      </span>
+      <button
+        type="button"
+        class="g-btn-ghost h-7 shrink-0 !px-2 !text-brand"
+        :disabled="!state.dir"
+        :title="t('files_paste_here')"
+        @click="pasteHere"
+      >
+        {{ t('files_paste_here') }}
+      </button>
+      <button
+        type="button"
+        class="g-btn-ghost h-7 shrink-0 !px-2"
+        :title="t('files_clipboard_cancel')"
+        @click="sftp.clearClipboard()"
+      >
+        {{ t('files_clipboard_cancel') }}
+      </button>
     </div>
 
     <!-- 站在压缩包输出目录时说明一句：用户是被「压缩完成后跳转」带过来的 -->
@@ -1240,9 +1568,13 @@ onBeforeUnmount(hideMenu)
       <!-- 网格：列宽按容器自适应，用 inline style 而不是 Tailwind 任意值——后者要写一长串
            带括号与逗号的类名，扫不到就静默退化成单列 -->
       <!-- 网格：格子之间的空白同样是「空白处」，由外层容器的右键处理器兜住 -->
+      <!-- content-start 是**修 bug 的关键**，别删：容器有 min-h-full（占满滚动区），而网格默认
+           align-content 会拉伸自动行去填满容器——目录里只有一行时，那一行被拉到整屏高，鼠标停在
+           任意一个格子上，高亮（hover:bg-black/5 + 边框）就变成贯穿上下的整列（用户报的现象）。
+           content-start（align-content: flex-start）让行只占内容高度，多余空间留在容器底部。 -->
       <div
         v-else
-        class="grid min-h-full gap-1 p-2"
+        class="grid min-h-full content-start gap-1 p-2"
         style="grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr))"
       >
         <div
@@ -1343,6 +1675,12 @@ onBeforeUnmount(hideMenu)
       :sid="sid"
       :path="previewPath"
       @update:visible="previewVisible = $event"
+    />
+    <InfoDialog
+      :visible="infoVisible"
+      :sid="sid"
+      :path="infoPath"
+      @update:visible="infoVisible = $event"
     />
     <PromptDialog
       :visible="prompt.show"

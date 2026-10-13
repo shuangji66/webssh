@@ -488,13 +488,14 @@ func TestFsCompressZipMissingTool(t *testing.T) {
 	a.fail(t, "/api/fs/compress", map[string]any{"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "docs")}}, "no_archive_tool", 0)
 }
 
-// TestFsCompressPermissionDenied 校验「归档目录不可写」稳定映射到 permission（403），
-// 而不是 internal——前端要把这句话直接 toast 出来。
+// TestFsCompressArchiveDirFallback 校验「配置的归档目录不可写」时自动退到同级的
+// <root>-<登录用户>（第六轮用户报的「压缩提示权限不足」就是这一条）。
 //
-// 权限位对 root 无效（root 无视目录的写权限），所以换个用户跑时才验得了。
-func TestFsCompressPermissionDenied(t *testing.T) {
+// 权限位对 root 无效，且有些文件系统不认 0000/0555（飞牛卷会把 mode 改写），所以先验前提：
+// 前提不成立就 skip 并写明原因，不假装通过。
+func TestFsCompressArchiveDirFallback(t *testing.T) {
 	if os.Geteuid() == 0 {
-		t.Skip("当前是 root：目录权限位对 root 无效，测不出 permission")
+		t.Skip("当前是 root：目录权限位对 root 无效，测不出回退")
 	}
 	a, sid, _ := fsOpApp(t, appOptions{})
 	if err := os.MkdirAll(a.renv.ArchiveDir, 0o755); err != nil {
@@ -504,13 +505,81 @@ func TestFsCompressPermissionDenied(t *testing.T) {
 		t.Fatalf("改权限失败：%v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(a.renv.ArchiveDir, 0o755) })
+	if _, err := os.CreateTemp(a.renv.ArchiveDir, "probe-"); err == nil {
+		t.Skip("这个文件系统拦不住 0555 目录的写入：无法模拟「不可写」，跳过")
+	}
 
-	for _, format := range []string{"tar.gz", "zip"} {
-		out := a.fail(t, "/api/fs/compress", map[string]any{
-			"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "docs")}, "format": format,
-		}, "permission", http.StatusForbidden)
-		if msg := strOf(out, "error"); !strings.Contains(strings.ToLower(msg), "permission") {
-			t.Errorf("%s：错误文案应当带上命令的输出关键行：%v", format, msg)
+	out := a.ok(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "hello.txt")},
+	})
+	arch, _ := out["archive"].(map[string]any)
+	wantDir := a.renv.ArchiveDir + "-" + "demo"
+	if strOf(arch, "dir") != wantDir {
+		t.Fatalf("应当回退到 %s，实际 %v", wantDir, arch["dir"])
+	}
+	if fi, err := os.Stat(strOf(arch, "path")); err != nil || fi.Size() == 0 {
+		t.Errorf("回退目录里的压缩包不对：%v %v", fi, err)
+	}
+	// 回退目录里不该去动原目录：原目录仍然不可写、也没有多出东西
+	entries, err := os.ReadDir(a.renv.ArchiveDir)
+	if err != nil {
+		t.Fatalf("读原归档目录失败：%v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("不可写的原目录不该被写入：%v", entries)
+	}
+}
+
+// TestFsCompressArchiveDirHomeFallback 校验第二档也不行时退到**登录用户家目录**下的隐藏目录
+// （第九轮用户要求：远端 /tmp 整个不可写也得能压缩）。
+//
+// 构造：把归档目录放在一个普通文件下面（`<file>/arch`），配置目录与它的同级回退目录都建不出来。
+// 远端 shell 的 HOME 由内嵌测试服务器设成 SFTP 根（见 testssh/session.go），所以期望的落点是
+// `<根>/.webssh-archive`。
+func TestFsCompressArchiveDirHomeFallback(t *testing.T) {
+	a, sid, _ := fsOpApp(t, appOptions{})
+	probe := filepath.Join(a.sshRoot, ".webssh-archive")
+	t.Cleanup(func() { _ = os.RemoveAll(probe) })
+	blocker := filepath.Join(a.sshRoot, "blocker.txt")
+	writeLocal(t, blocker, "x")
+	a.renv.ArchiveDir = filepath.Join(blocker, "arch")
+
+	out := a.ok(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "hello.txt")},
+	})
+	arch, _ := out["archive"].(map[string]any)
+	if strOf(arch, "dir") != probe {
+		t.Fatalf("应当回退到 %s，实际 %v", probe, arch["dir"])
+	}
+	if fi, err := os.Stat(strOf(arch, "path")); err != nil || fi.Size() == 0 {
+		t.Errorf("回退目录里的压缩包不对：%v %v", fi, err)
+	}
+}
+
+// TestFsCompressPermissionDenied 校验「三个归档目录都用不了」稳定映射到 permission（403），
+// 且错误文案要点出远端、两个目录与 WEBSSH_ARCHIVE_DIR 这个开关——前端把这句话直接 toast 出来。
+//
+// 用「归档目录落在一个普通文件下面」来构造：mkdir 会以 ENOTDIR 失败，配置目录与它的同级回退
+// 目录都建不出来。这样不依赖权限位（root 跑、或文件系统不认 mode 时都照样成立）。
+func TestFsCompressPermissionDenied(t *testing.T) {
+	// 远端 HOME 指到一个不可能写的地方，让第三档（家目录）也失败，才能走到报错
+	a, sid, _ := fsOpApp(t, appOptions{sshOptions: &testssh.Options{
+		User: "demo", Password: "demo",
+		Env: []string{"HOME=/proc/webssh-nowhere"},
+	}})
+	blocker := filepath.Join(a.sshRoot, "not-a-dir.txt")
+	writeLocal(t, blocker, "x")
+	a.renv.ArchiveDir = filepath.Join(blocker, "archive")
+
+	out := a.fail(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "hello.txt")},
+	}, "permission", http.StatusForbidden)
+	msg := strOf(out, "error")
+	for _, want := range []string{
+		a.renv.ArchiveDir, a.renv.ArchiveDir + "-demo", "$HOME/.webssh-archive", "WEBSSH_ARCHIVE_DIR", "远程主机",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误文案应当包含 %q：%v", want, msg)
 		}
 	}
 }
