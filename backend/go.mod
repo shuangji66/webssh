@@ -3,6 +3,7 @@ module webssh/backend
 go 1.27
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/pkg/sftp v1.13.11
 	golang.org/x/crypto v0.58.0
 )
