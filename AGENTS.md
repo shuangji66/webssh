@@ -222,7 +222,8 @@
 - `internal/testssh` 用真实 pty（`github.com/creack/pty`，**仅测试依赖**）；生产代码不得 import 它。
   `make test` 首次跑要能访问模块代理，之后走本地 `.gomodcache/`。
 - 端到端校验脚本（第二轮的功能都在里面，含病态路径名与「命令注入未执行」的断言）：
-  `.tmp/e2e2/verify.py`（`python3 verify.py <base_url> <sftp_root> <share_root>`，52 项断言）；
+  `.tmp/e2e2/verify.py`（`python3 verify.py <base_url> <sftp_root> <share_root>`，**58 项断言**，
+  含 tar.gz 与 zip 压缩、多父目录追加、非法 format、病态路径名与「命令注入未执行」）；
   它需要 `TRIM_DATA_SHARE_PATHS` 指向一个可写目录（否则导出一条会按预期报 `no_share_path`）。
 - 端到端手测：`go run ./internal/testssh/cmd/testsshd -addr 127.0.0.1:2222 -user demo -password demo -root <可写目录>`
   + `socat TCP-LISTEN:18080,fork UNIX-CONNECT:<WEBSSH_ADMIN_SOCK>`（浏览器访问
