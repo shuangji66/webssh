@@ -1,19 +1,21 @@
 <script setup lang="ts">
-// SettingsDialog — 设置：主题 / 语言 / 终端字体与字号 / 已信任主机 / 飞牛状态 / 关于。
+// SettingsDialog — 设置：主题 / 语言 / 终端字体与字号 / 飞牛状态 / 关于。
 //
 // 主题与语言是**全局立刻生效**的（写 <html> 的 class 与 i18n 的 locale），所以不设「保存」按钮：
 // 这里的每一项点下去就是结果。字体字号同理（TerminalPane 监听 settings store 即时重排）。
 //
 // 第四轮：删掉「数据目录」一栏（连 `settings_data_dir` 文案一起删）——它是服务端的本地路径，
 // 用户既改不了也看不懂，占着弹窗一栏没有价值。
+//
+// 第十一轮：删掉「已信任的主机密钥」一栏（连 6 条 `settings_known_hosts*` 文案一起删）。那份
+// 全局列表里的 `10.0.0.1:22` 对不上用户哪张卡片，已挪进会话弹窗（SessionFormDialog），
+// 删除会话时记录也会一起清掉。见 CONTRACT 21.5。
 import { ref, watch } from 'vue'
 import { t, useI18n } from '@/i18n'
-import { api, describeError, type HostKeyRecord, type TrimStatus } from '@/serverapi'
+import { api, describeError, type TrimStatus } from '@/serverapi'
 import { useTheme, type ThemeMode } from '@/composables/useTheme'
 import { useHomeStore } from '@/stores/home'
 import { FONT_SIZE_MAX, FONT_SIZE_MIN, useSettingsStore, type TerminalFont } from '@/stores/settings'
-import { useToastStore } from '@/stores/toast'
-import ConfirmDialog from './ConfirmDialog.vue'
 
 const props = defineProps<{ visible: boolean }>()
 
@@ -23,7 +25,6 @@ const emit = defineEmits<{
 
 const settings = useSettingsStore()
 const home = useHomeStore()
-const toast = useToastStore()
 const { themeMode, setTheme } = useTheme()
 const { locale, setLocale } = useI18n()
 
@@ -39,44 +40,6 @@ const fontOptions: { value: TerminalFont; key: string }[] = [
   { value: 'maple', key: 'settings_font_maple' },
   { value: 'system', key: 'settings_font_system' }
 ]
-
-// ---------- 已信任主机 ----------
-
-const hosts = ref<HostKeyRecord[]>([])
-const hostsLoading = ref(false)
-const hostsError = ref('')
-const pendingForget = ref<HostKeyRecord | null>(null)
-
-async function loadHosts() {
-  hostsLoading.value = true
-  hostsError.value = ''
-  try {
-    const res = await api.hostKeys()
-    hosts.value = res.hosts ?? []
-  } catch (e) {
-    // 读不到要说出来：显示成「还没有信任任何主机」会让用户以为记录被清了
-    hostsError.value = describeError(e)
-  } finally {
-    hostsLoading.value = false
-  }
-}
-
-function hostLabel(record: HostKeyRecord): string {
-  return record.port && record.port !== 22 ? `${record.host}:${record.port}` : record.host
-}
-
-async function confirmForget() {
-  const record = pendingForget.value
-  pendingForget.value = null
-  if (!record) return
-  try {
-    await api.forgetHostKey(record.host, record.port)
-    toast.show(t('settings_known_hosts_removed'), 'success')
-    await loadHosts()
-  } catch (e) {
-    toast.show(t('settings_known_hosts_remove_failed', { error: describeError(e) }), 'error')
-  }
-}
 
 // ---------- 飞牛状态 ----------
 
@@ -100,8 +63,7 @@ watch(
   (v) => {
     open.value = v
     if (!v) return
-    // 每次打开都重新读一遍：主机密钥可能在别的页面/设备上刚被信任过，飞牛状态也会变
-    void loadHosts()
+    // 每次打开都重新读一遍飞牛状态（它可能刚从不可用变成可用，反之亦然）
     void loadTrim()
     if (!home.runtime) void home.loadInfo().catch(() => undefined)
   },
@@ -244,61 +206,10 @@ function close() {
                   </div>
                 </div>
 
-                <!-- 已信任的主机密钥 -->
-                <div class="border-t border-line pt-4 dark:border-line-dark">
-                  <label class="mb-1.5 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
-                    {{ t('settings_known_hosts') }}
-                  </label>
-                  <p v-if="hostsLoading" class="text-xs text-ink-soft dark:text-ink-soft-dark">
-                    {{ t('common_loading') }}
-                  </p>
-                  <p v-else-if="hostsError" class="break-all text-xs text-danger">
-                    {{ t('err_unknown', { error: hostsError }) }}
-                  </p>
-                  <p
-                    v-else-if="!hosts.length"
-                    class="text-xs text-ink-soft dark:text-ink-soft-dark"
-                  >
-                    {{ t('settings_known_hosts_empty') }}
-                  </p>
-                  <ul v-else class="divide-y divide-line dark:divide-line-dark">
-                    <li
-                      v-for="record in hosts"
-                      :key="`${record.host}:${record.port}`"
-                      class="flex items-center gap-3 py-2"
-                    >
-                      <div class="min-w-0 flex-1">
-                        <p class="truncate font-mono text-xs text-ink dark:text-ink-dark">
-                          {{ hostLabel(record) }}
-                          <span class="text-ink-faint dark:text-ink-faint-dark">{{ record.keyType }}</span>
-                        </p>
-                        <p class="truncate font-mono text-[11px] text-ink-faint dark:text-ink-faint-dark">
-                          {{ record.fingerprint }}
-                        </p>
-                      </div>
-                      <button
-                        class="g-btn-ghost !h-8 !px-2 shrink-0 !text-danger hover:!bg-danger/10"
-                        :title="t('settings_known_hosts_remove')"
-                        @click="pendingForget = record"
-                      >
-                        <svg
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="1.5"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          class="h-4 w-4"
-                        >
-                          <path d="M3 6h18" />
-                          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                          <path d="M10 11v6M14 11v6" />
-                          <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-                        </svg>
-                      </button>
-                    </li>
-                  </ul>
-                </div>
+                <!-- 已信任的主机密钥：**第十一轮挪到了会话弹窗里**（每个会话一份，见
+                     SessionFormDialog 与 CONTRACT 21.5）。留在这里的坏处是它一份全局列表，
+                     `10.0.0.1:22` 这种字符串对不上用户哪张卡片，也就不知道该不该删；
+                     挪到会话弹窗后标题旁边就是 host/port 字段，删除会话时还会一起清掉。 -->
 
                 <!-- 飞牛宿主状态：**只在有问题时**才出现（第五轮用户要求：可用就不必说）。
                      它是「飞牛文件」上传与「导出至飞牛」是否可用的唯一自查处，所以不可用/查不到时
@@ -356,16 +267,4 @@ function close() {
       </div>
     </Transition>
   </Teleport>
-
-  <ConfirmDialog
-    :visible="pendingForget !== null"
-    :title="t('settings_known_hosts_remove')"
-    :message="t('settings_known_hosts_confirm', { host: pendingForget ? hostLabel(pendingForget) : '' })"
-    :danger="true"
-    :confirm-text="t('settings_known_hosts_remove')"
-    :cancel-text="t('common_cancel')"
-    @confirm="confirmForget"
-    @cancel="pendingForget = null"
-    @update:visible="(v) => { if (!v) pendingForget = null }"
-  />
 </template>

@@ -111,10 +111,33 @@ export const useHomeStore = defineStore('home', () => {
     return saved
   }
 
+  /**
+   * 删除会话配置，并**一并清掉这台主机的信任记录**（第十一轮用户要求）。
+   *
+   * 为什么在这里做：known_hosts 按 `host:port` 存，会话配置是它唯一的「引用者」——会话没了
+   * 还留着记录，下次新建一个同主机同端口的会话会「一上来就是已信任」，用户看不到自己是什么
+   * 时候信过它（安全相关的状态不该这么无声无息）。
+   *
+   * 代价说清楚：**同一台主机同一端口上如果还有别的会话**（会话身份是 user@host:port，所以这
+   * 只发生在换了用户名的场景），它们的信任也会一起没了——下次连接要重新确认指纹。这是用户
+   * 明确要的行为；若要改成「删掉最后一个用它的会话时才删」，判据就加在这里。
+   *
+   * 顺序是先删会话、再删信任：反过来一旦删会话失败，会留下一台「没有会话但已被信任」的主机；
+   * 这个顺序最坏也只是留一条没人引用的记录（下面会如实报出来）。
+   */
   async function remove(id: string): Promise<void> {
+    // host/port 必须从删除前的快照里取：配置删掉之后就查不到了
+    const target = sessions.value.find((item) => item.id === id)
     await api.deleteSession(id)
     sessions.value = sessions.value.filter((item) => item.id !== id)
     delete openStates.value[id]
+    if (!target) return
+    try {
+      await api.forgetHostKey(target.host, target.port)
+    } catch (e) {
+      // 会话**已经删掉了**，这里失败不能反过来报「删除失败」——如实说清是哪一步没做完
+      useToastStore().show(t('home_delete_trust_failed', { error: describeError(e) }), 'error')
+    }
   }
 
   /** 连接测试（不建立持久会话）。返回 TestOutcome；参数不合法等会抛 ApiError。 */

@@ -100,10 +100,26 @@ async function onOpen(session: SessionView) {
       credPrompt.value = { session, loading: false, error: '' }
       return
     }
-    toast.show(t('home_open_failed', { error: describeError(e) }), 'error')
+    toast.show(t('home_open_failed', { error: openFailedText(e) }), 'error')
   } finally {
     busyId.value = ''
   }
+}
+
+/**
+ * 打开失败的报错文案：**只有「主机密钥未信任」**这一种失败在后面追加
+ * 「测试连接并信任密钥指纹后再试」（第十一轮用户要求）。
+ *
+ * 为什么不无脑追加：拨号不通、认证失败这些原因跟信任无关——「目标拒绝连接」后面让人去确认
+ * 指纹是误导（先得连上才有指纹可确认）。`hostkey_unknown` 是唯一「就是因为没信任才失败」的
+ * 错误码，指引只属于它；`hostkey_mismatch` 也不加——那种情况该走会话弹窗里的「移除信任」，
+ * 文案 `test_mismatch_hint` 已经把话说了。
+ */
+function openFailedText(e: unknown): string {
+  const text = describeError(e)
+  return e instanceof ApiError && e.code === 'hostkey_unknown'
+    ? text + t('home_open_hostkey_hint')
+    : text
 }
 
 async function onCredentialSubmit(credential: SessionCredential) {

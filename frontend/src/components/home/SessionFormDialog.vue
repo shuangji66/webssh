@@ -7,11 +7,24 @@
 //   2. 主机密钥未信任时后端回 `hostkey_unknown` + 指纹：必须让用户看到指纹并显式确认，
 //      确认（home.trust）成功后自动重测一次——否则用户要自己再点一次「测试连接」，
 //      很多人会以为信任没生效。
+//
+// 第十一轮新增：**已信任的主机密钥**那一行（标题 + 删除按钮，见 CONTRACT 21.5）。它是从设置页
+// 挪过来的，判据只有一条：**当前表单里的 host:port 在 known_hosts 里有没有记录**——
+//   - 新增会话且这台主机还没被信任 → 不显示（没有东西可删，留个点了没反应的按钮更糟）；
+//   - 点过「信任并继续」→ 重新拉一次列表，那一行立刻出现；
+//   - 编辑一个已信任的会话 → 一打开就在。
+// 所以「测试连接」不会让按钮出现：测试只回 `hostkey_unknown` + 指纹，**不写** known_hosts，
+// 写记录只发生在 `/api/sessions/trust`（也就是「信任并继续」）。
+//
+// 同一个判据还管着**「保存」按钮显不显示**：指纹没确认过（新增会话、或刚把信任删了）时先藏起来，
+// 页脚留一句提示把人引导到「测试连接 → 信任并继续」，走完那一步保存才出现（`canSave`）。
 import { computed, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import {
+  api,
   describeError,
   type AuthType,
+  type HostKeyRecord,
   type SessionInput,
   type SessionView,
   type TestOutcome
@@ -67,6 +80,93 @@ const testHost = ref('')
 /** 打开弹窗时的字段快照：用来判断「有未保存的改动」。 */
 const baseline = ref('')
 
+// ---------- 已信任的主机密钥（第十一轮：从设置页挪进来） ----------
+
+/** known_hosts 里的记录（只用来判断「当前 host:port 有没有」）。 */
+const trustedHosts = ref<HostKeyRecord[]>([])
+
+/**
+ * 当前表单里的 host:port 在 known_hosts 里的那条记录；没有就返回 null。
+ *
+ * 键的构造必须与后端 `hostKeyID` 一致（`host:port`，端口空/非法按 22）——所以这里用表单里的
+ * 字段而不是 `props.session`：用户在编辑时改了主机名，那一行要跟着反映**新主机**的信任状态。
+ */
+const trustedRecord = computed<HostKeyRecord | null>(() => {
+  const h = host.value.trim()
+  if (!h) return null
+  const p = Number(port.value)
+  const wanted = Number.isInteger(p) && p >= 1 && p <= 65535 ? p : 22
+  return trustedHosts.value.find((item) => item.host === h && item.port === wanted) ?? null
+})
+
+/** 确认框里点名的那台主机（`host:port`，22 端口省略——与设置页原来那句文案一致）。 */
+const trustedTarget = computed(() => {
+  const record = trustedRecord.value
+  if (!record) return ''
+  return record.port && record.port !== 22 ? `${record.host}:${record.port}` : record.host
+})
+
+/**
+ * 拉一遍信任列表。
+ *
+ * 拉不到就**当成没有记录**（那一行不显示），也不弹错：它只是个附带的开关，读失败不影响
+ * 保存/测试这些主流程；而「不显示」是保守方向——绝不会让用户对着一条没确认过的记录点删除。
+ */
+async function loadTrusted() {
+  try {
+    const res = await api.hostKeys()
+    trustedHosts.value = res.hosts ?? []
+    hostsLoaded.value = true
+  } catch {
+    trustedHosts.value = []
+  }
+}
+
+/**
+ * 这一份列表**读到过**没有（读成功才置真，读失败保持原值）。
+ *
+ * 与下面 `needsTrust` 的兜底有关：读失败时 `trustedHosts` 是空的，如果直接拿它当判据，一次接口
+ * 抖动就会把按钮变成「仅保存」并挂上一句没头没脑的提示。所以「不知道」要能与「确实没有」分开。
+ */
+const hostsLoaded = ref(false)
+
+/**
+ * 按钮文案与那句提示的判据（第十一轮用户要求）：**确认过没有信任记录**才算「还没信任」。
+ *
+ *   - 新增会话（这台主机没确认过指纹）、刚删掉信任、编辑时把地址改成没信任过的主机 → 真：
+ *     按钮写「仅保存」，旁边一句提示建议先「测试连接」确认指纹；
+ *   - 编辑一个已信任的会话 → 假：按钮就是普通的「保存」，提示不出现；
+ *   - 读不到列表（还在读 / 读失败）→ 假：那是我们自己的接口出了问题，不该让用户的按钮莫名
+ *     变成「仅保存」还多一句提示。
+ *
+ * 注意**不再隐藏按钮**：隐藏等于「连不上主机就存不了配置」，而用户可能只是先把会话存下来、
+ * 以后才连（原来的实现就是这么卡住的，用户当场指出）。「仅保存」走的是同一条 `submit()`，
+ * 区别只在文案与那句提示——指纹留到第一次连接时再确认。
+ */
+const needsTrust = computed(() => hostsLoaded.value && trustedRecord.value === null)
+
+const forgetVisible = ref(false)
+
+/** 「移除信任」：先确认（下次连接要重新认指纹，用户得知道这一点）。 */
+function askForget() {
+  if (!trustedRecord.value) return
+  forgetVisible.value = true
+}
+
+async function confirmForget() {
+  const record = trustedRecord.value
+  forgetVisible.value = false
+  if (!record) return
+  try {
+    await api.forgetHostKey(record.host, record.port)
+    toast.show(t('form_trusted_key_removed'), 'success')
+    await loadTrusted()
+  } catch (e) {
+    toast.show(t('form_trusted_key_remove_failed', { error: describeError(e) }), 'error')
+  }
+}
+
+
 function fields() {
   return {
     name: name.value,
@@ -100,6 +200,10 @@ function reset() {
   testResult.value = null
   testHost.value = ''
   baseline.value = JSON.stringify(fields())
+  // 信任列表可能在别处变过（另一个会话弹窗里刚信任/移除，或另一台设备），每次打开重拉一遍。
+  // hostsLoaded 先归零：重开一次就要重新判「保存」显不显示，不能沿用上一次的结论。
+  hostsLoaded.value = false
+  void loadTrusted()
 }
 
 watch(
@@ -232,6 +336,7 @@ async function trustAndRetest() {
     await home.trust(host.value.trim(), Number(port.value), res.fingerprint)
     toast.show(t('test_trust_ok'), 'success')
     trusting.value = false
+    await loadTrusted() // 信任记录刚写进去：那一行「已信任的主机密钥」要立刻出现
     await runTest() // 信任后自动重测
   } catch (e) {
     toast.show(t('test_trust_failed', { error: describeError(e) }), 'error')
@@ -527,30 +632,73 @@ function onDiscardVisible(v: boolean) {
                     {{ t('test_mismatch_hint') }}
                   </p>
                 </div>
+
+                <!-- 已信任的主机密钥（第十一轮从设置页挪进来）：**只有当前 host:port 已有记录时
+                     才出现**（没有记录就没东西可删；用户问过「创建会话时要不要隐藏」——就是这里：
+                     隐藏，点过「信任并继续」后立刻出现）。只留标题 + 删除按钮，不显示 keyType /
+                     指纹：这台主机的密钥细节在上面「测试连接」的结果里已经给过了，日常没人看。 -->
+                <div
+                  v-if="trustedRecord"
+                  class="flex items-center gap-2 border-t border-line pt-3 dark:border-line-dark"
+                >
+                  <span class="min-w-0 flex-1 text-xs font-medium text-ink-soft dark:text-ink-soft-dark">
+                    {{ t('form_trusted_key') }}
+                  </span>
+                  <button
+                    class="g-btn-ghost !h-8 !px-2 shrink-0 !text-danger hover:!bg-danger/10"
+                    :title="t('form_trusted_key_remove')"
+                    :aria-label="t('form_trusted_key_remove')"
+                    @click="askForget"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-4 w-4"
+                    >
+                      <path d="M3 6h18" />
+                      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                      <path d="M10 11v6M14 11v6" />
+                      <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                    </svg>
+                  </button>
+                </div>
               </div>
             </div>
 
-            <!-- 页脚：三个按钮都「有边框、不填色」（第七轮用户要求），靠文字区分主次 -->
+            <!-- 页脚：三个按钮都「有边框、不填色」（第七轮用户要求），靠文字区分主次。
+                 指纹没确认过时按钮写「仅保存」，并在**三个按钮之上**单独占一行放提示（第十一轮
+                 用户要求：改文案 + 不要挤在同一行）——先测一次确认指纹是最顺的路，但不能因此
+                 挡住只想先存下来的人（主机暂时连不上、或就想先建好配置），所以「仅保存」仍在。
+                 有信任记录时它就是普通的「保存」（见 needsTrust）。 -->
             <div
-              class="flex shrink-0 justify-end gap-2 border-t border-line px-5 py-3 dark:border-line-dark"
+              class="flex shrink-0 flex-col gap-2 border-t border-line px-5 py-3 dark:border-line-dark"
             >
-              <button class="g-btn-secondary !h-9 !px-4 text-sm" @click="requestClose">
-                {{ t('common_cancel') }}
-              </button>
-              <button
-                class="g-btn-secondary !h-9 !px-4 text-sm"
-                :disabled="testing || saving"
-                @click="runTest"
-              >
-                {{ testing ? t('form_testing') : t('form_test') }}
-              </button>
-              <button
-                class="g-btn-secondary !h-9 !px-5 text-sm"
-                :disabled="saving || testing"
-                @click="submit"
-              >
-                {{ saving ? t('form_saving') : t('common_save') }}
-              </button>
+              <p v-if="needsTrust" class="text-xs text-warning">
+                {{ t('form_trust_first') }}
+              </p>
+              <div class="flex items-center justify-end gap-2">
+                <button class="g-btn-secondary !h-9 !px-4 text-sm" @click="requestClose">
+                  {{ t('common_cancel') }}
+                </button>
+                <button
+                  class="g-btn-secondary !h-9 !px-4 text-sm"
+                  :disabled="testing || saving"
+                  @click="runTest"
+                >
+                  {{ testing ? t('form_testing') : t('form_test') }}
+                </button>
+                <button
+                  class="g-btn-secondary !h-9 !px-5 text-sm"
+                  :disabled="saving || testing"
+                  @click="submit"
+                >
+                  {{ saving ? t('form_saving') : needsTrust ? t('form_save_only') : t('common_save') }}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -567,5 +715,19 @@ function onDiscardVisible(v: boolean) {
     @confirm="onDiscardConfirm"
     @cancel="discardVisible = false"
     @update:visible="onDiscardVisible"
+  />
+
+  <!-- 移除信任前确认：下次连接要重新认一遍指纹，用户得知道这件事（这条记录不是凭据，
+       但它承担的是「防中间人」那一步）。 -->
+  <ConfirmDialog
+    :visible="forgetVisible"
+    :title="t('form_trusted_key_remove')"
+    :message="t('form_trusted_key_remove_confirm', { host: trustedRecord ? trustedTarget : '' })"
+    :danger="true"
+    :confirm-text="t('form_trusted_key_remove')"
+    :cancel-text="t('common_cancel')"
+    @confirm="confirmForget"
+    @cancel="forgetVisible = false"
+    @update:visible="(v) => { if (!v) forgetVisible = false }"
   />
 </template>

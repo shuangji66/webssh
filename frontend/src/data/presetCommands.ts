@@ -5,9 +5,13 @@
 // 名字与分组名都走 i18n（`qc_p_<id>` / `qc_g_<group>`），因此中英文都能显示。
 //
 // **auto 的取舍**：只读命令一律 `auto: true`（点一下就把结果打出来，这是这个页面存在的
-// 意义）；任何会改变系统状态的命令一律 `auto: false`——用户点一下只把命令**填进终端**，
-// 回车由他自己按。危险组的命令额外在界面上用警示色渲染。
-export type PresetGroup = 'sys' | 'proc' | 'disk' | 'net' | 'log' | 'svc' | 'user' | 'docker' | 'danger'
+// 意义）；会改变系统状态的命令 `auto: false`——用户点一下只把命令**填进终端**，回车由他
+// 自己按（现存唯一一条是「重启 SSH 服务」）。
+//
+// 第十一轮删掉了原先的「危险操作」分组（`reboot` / `poweroff`）与配套的警示色渲染：关机/重启
+// 这种命令不该出现在「点一下就发」的面板里（见 CONTRACT 21.2）。分组类型、分组顺序、以及
+// 弹窗里那套 `isDanger` 判据一并删掉——留一个永远为空的危险组就是死代码。
+export type PresetGroup = 'sys' | 'proc' | 'disk' | 'net' | 'log' | 'svc' | 'user' | 'docker'
 
 export interface PresetCmd {
   /** 稳定 id：i18n key 是 `qc_p_<id>` */
@@ -19,7 +23,7 @@ export interface PresetCmd {
   auto: boolean
 }
 
-/** 分组顺序即界面上的显示顺序；危险操作永远排最后。 */
+/** 分组顺序即界面上的显示顺序。 */
 export const PRESET_GROUPS: PresetGroup[] = [
   'sys',
   'proc',
@@ -28,12 +32,8 @@ export const PRESET_GROUPS: PresetGroup[] = [
   'log',
   'svc',
   'user',
-  'docker',
-  'danger'
+  'docker'
 ]
-
-/** 会改变系统状态的分组：渲染时用警示色，且其中每条都必须 auto: false。 */
-export const DANGER_GROUPS: PresetGroup[] = ['danger']
 
 export const PRESET_COMMANDS: PresetCmd[] = [
   // ---- 系统信息 ----
@@ -100,11 +100,7 @@ export const PRESET_COMMANDS: PresetCmd[] = [
   // ---- Docker ----
   { id: 'docker_ps', group: 'docker', content: 'docker ps -a', auto: true },
   { id: 'docker_stats', group: 'docker', content: 'docker stats --no-stream', auto: true },
-  { id: 'docker_df', group: 'docker', content: 'docker system df', auto: true },
-
-  // ---- 危险操作（都不自动执行）----
-  { id: 'reboot', group: 'danger', content: 'reboot', auto: false },
-  { id: 'poweroff', group: 'danger', content: 'poweroff', auto: false }
+  { id: 'docker_df', group: 'docker', content: 'docker system df', auto: true }
 ]
 
 /** 按分组切好、且保持 PRESET_GROUPS 顺序，便于模板直接渲染。 */

@@ -9,19 +9,22 @@
 //
 // 「常用指令」是**内置清单**（`data/presetCommands.ts`，前端纯展示数据）：只读、不能增删改，
 // 所以那一页不显示「+」，也不走后端的整体保存；名字与分组名都走 i18n（`qc_p_*` / `qc_g_*`），
-// 中英文都能显示。危险分组的命令一律 auto: false —— 点一下只填进终端，回车由用户自己按。
+// 中英文都能显示。清单里 auto: false 的命令点一下只填进终端，回车由用户自己按。
 //
 // 「专属」页只在会话里出现：首页没有会话上下文，藏掉比让它指向某个会话更诚实。
+//
+// 第十一轮删掉了面板底部的**页脚**（原来左边写「会改变系统状态的命令不会自动回车」、右边写
+// 「发送到 <终端名>」）：前者随「危险操作」分组（reboot / poweroff）一起删掉了；后者用户明确
+// 说不需要（原话「不会发送错的」）——指令发进哪个终端，由工具条上那个按钮所在的位置就已经决定。
+// 页脚没了之后弹窗只剩「头部 + 页签 + 列表」三段，列表自己滚（契约 21.2 / 21.4）。
 import { computed, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { describeError, type QuickCmd } from '@/serverapi'
 import {
-  DANGER_GROUPS,
   presetByGroup,
   presetGroupKey,
   presetNameKey,
-  type PresetCmd,
-  type PresetGroup
+  type PresetCmd
 } from '@/data/presetCommands'
 import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
 import { useHomeStore } from '@/stores/home'
@@ -51,17 +54,26 @@ const sessionUi = useSessionUiStore()
 const toast = useToastStore()
 
 /**
- * 面板高度**固定**为内容区的 90%（契约 11.6）。
+ * 面板高度**固定**为「视口 − 应用顶栏（会话标签栏）」的 90%（契约 21.3）。
  *
  * 为什么用固定高度而不是 max-h：max-h 只是「不超过」，内容少的面板会缩水 —— 三个页签的内容
  * 长短差很多（内置清单很长、自建列表可能为空），来回切就会看到面板忽高忽低。固定高度下切换
  * 页签时窗口边框不动，只有列表在滚。
  *
- * 算式与 `.region-center` 定位带完全一致（style.css）：内容区 = 壳层高（--vvh，已被虚拟键盘
- * 修正）− 顶栏（--header-h）− 移动端键条（--keypad-h）。所以它正好是定位带高度的 90%，
- * 在带内垂直居中，也不会被键盘盖住。不用 100vh：iOS 上键盘弹起时 vh 会算错。
+ * **不减底部辅助键条**（第十一轮用户要求）：定位带就是「顶栏以下到视口底部」，面板取它的 90%
+ * 并在带内垂直居中。触屏上弹窗因此会比以前高约 50px，底部可能压到辅助键条上——模态盖住键条
+ * 是正常的（键条在弹窗底下点不到，本来也不该点）。
+ *
+ * 算式用 `--vvh` / `--vvt`（已被虚拟键盘修正）而不是 `100vh`：iOS 上键盘弹起时 vh 会算错。
+ * 这两个常量必须与下面的 `BAND_STYLE` 一致，否则面板会在带内溢出（居中的 flex 会把溢出的
+ * 一半顶到顶栏里去）。
  */
-const PANEL_HEIGHT = 'calc((var(--vvh, 100dvh) - var(--header-h, 0px) - var(--keypad-h, 0px)) * 0.9)'
+const BAND_HEIGHT = 'calc(var(--vvh, 100dvh) - var(--header-h, 0px))'
+const BAND_STYLE = {
+  top: 'calc(var(--vvt, 0px) + var(--header-h, 0px))',
+  height: BAND_HEIGHT
+}
+const PANEL_HEIGHT = `calc(${BAND_HEIGHT} * 0.9)`
 
 const open = ref(props.visible)
 const sessionId = computed(() => props.sid ?? null)
@@ -88,13 +100,8 @@ const list = computed<QuickCmd[]>(() => {
   return qc.global
 })
 
-/** 内置清单：按用途分好组，顺序由 PRESET_GROUPS 决定（危险组永远排最后）。 */
+/** 内置清单：按用途分好组，顺序由 PRESET_GROUPS 决定。 */
 const presetGroups = computed(() => presetByGroup())
-
-/** 危险分组（会改变系统状态）用警示色渲染，且里面的命令一律不自动回车。 */
-function isDanger(group: PresetGroup): boolean {
-  return DANGER_GROUPS.includes(group)
-}
 
 /**
  * 只有「已成功加载」的分组才允许增删改：保存是整体覆盖，未加载就改会把服务端那份覆盖掉。
@@ -178,23 +185,6 @@ function currentControls() {
     : (terminals.activeOf(sid)?.uid ?? tabs.at(-1)?.uid ?? null)
   return paneControls.get(sid, uid)
 }
-
-/**
- * 弹窗当前会把指令发给哪个终端——只用于页脚提示。
- *
- * 用户的原话是「在弹窗点击指令都不知道输入到了哪个终端里」，所以除了把按钮放回会话工具条
- * （保证有明确的激活终端）之外，这里再把**目标终端的名字**显式写出来：用户点之前就知道
- * 这条命令会进哪个 shell，不用靠记忆判断「刚才激活的是哪个标签」。
- */
-const targetLabel = computed(() => {
-  const sid = sessionId.value
-  if (!sid) return ''
-  const sub = sessionUi.activeSubOf(sid)
-  if (sub === FILES_TAB) return ''
-  const tabs = terminals.tabsOf(sid)
-  const tab = tabs.find((item) => item.uid === sub) ?? terminals.activeOf(sid) ?? tabs.at(-1)
-  return tab ? terminals.titleOf(sid, tab) : ''
-})
 
 /**
  * 发给当前激活终端；返回是否真的发出去了（false = 没有可用终端）。
@@ -295,7 +285,12 @@ function close() {
     <Transition name="modal-fade">
       <div v-if="open" class="fixed inset-0 z-50">
         <div class="absolute inset-0 bg-black/50" @click="close"></div>
-        <div class="region-center absolute left-0 right-0 flex items-center justify-center md:px-4">
+        <!-- 定位带：顶栏以下到视口底部（**不**用 .region-center——那条带会再减掉底部辅助键条，
+             而本弹窗的高度按用户要求只减顶栏，带与面板必须同一个算式，见 BAND_STYLE）。 -->
+        <div
+          class="absolute left-0 right-0 flex items-center justify-center md:px-4"
+          :style="BAND_STYLE"
+        >
           <div
             class="pointer-events-auto relative flex w-[95%] flex-col rounded-xl border border-line bg-surface shadow-pop md:w-full md:max-w-lg dark:border-line-dark dark:bg-surface-dark"
             :style="{ height: PANEL_HEIGHT }"
@@ -352,35 +347,14 @@ function close() {
 
             <!-- 列表 -->
             <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-              <!-- 常用指令页：内置清单按用途分组，危险组用警示色 -->
+              <!-- 常用指令页：内置清单按用途分组 -->
               <template v-if="page === 'preset'">
                 <div
                   v-for="group in presetGroups"
                   :key="group.group"
                   class="mb-4 last:mb-0"
                 >
-                  <p
-                    class="mb-2 flex items-center gap-1.5 text-xs font-semibold"
-                    :class="
-                      isDanger(group.group)
-                        ? 'text-danger'
-                        : 'text-ink-soft dark:text-ink-soft-dark'
-                    "
-                  >
-                    <svg
-                      v-if="isDanger(group.group)"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.5"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      class="h-3.5 w-3.5"
-                    >
-                      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                      <path d="M12 9v4" />
-                      <path d="M12 17h.01" />
-                    </svg>
+                  <p class="mb-2 flex items-center gap-1.5 text-xs font-semibold text-ink-soft dark:text-ink-soft-dark">
                     {{ t(presetGroupKey(group.group)) }}
                   </p>
 
@@ -389,20 +363,12 @@ function close() {
                       v-for="cmd in group.items"
                       :key="cmd.id"
                       type="button"
-                      class="block w-full rounded-lg border px-3.5 py-2.5 text-left transition-colors"
-                      :class="
-                        isDanger(group.group)
-                          ? 'border-danger/40 hover:border-danger hover:bg-danger/5'
-                          : 'border-line hover:border-brand/50 dark:border-line-dark'
-                      "
+                      class="block w-full rounded-lg border border-line px-3.5 py-2.5 text-left transition-colors hover:border-brand/50 dark:border-line-dark"
                       :title="cmd.content"
                       @click="runPreset(cmd)"
                     >
                       <div class="flex min-w-0 items-center gap-2">
-                        <span
-                          class="min-w-0 truncate text-sm font-semibold"
-                          :class="isDanger(group.group) ? 'text-danger' : 'text-ink dark:text-ink-dark'"
-                        >
+                        <span class="min-w-0 truncate text-sm font-semibold text-ink dark:text-ink-dark">
                           {{ t(presetNameKey(cmd.id)) }}
                         </span>
                         <span
@@ -541,20 +507,6 @@ function close() {
                 </div>
               </div>
               </template>
-            </div>
-
-            <div class="shrink-0 border-t border-line px-5 py-2 dark:border-line-dark">
-              <!-- 常用指令页提示「哪些不会自动执行」；其余两页说明点一下会发生什么 -->
-              <p
-                class="text-[11px]"
-                :class="page === 'preset' ? 'text-warning' : 'text-ink-faint dark:text-ink-faint-dark'"
-              >
-                {{ page === 'preset'
-                  ? t('qc_preset_danger')
-                  : targetLabel
-                    ? t('qc_send_to', { name: targetLabel })
-                    : t('qc_send') }}
-              </p>
             </div>
           </div>
         </div>
