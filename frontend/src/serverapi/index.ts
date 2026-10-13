@@ -198,6 +198,9 @@ export interface FsOpResult {
   skipped: number
 }
 
+/** 支持的压缩格式：tar.gz（默认）与 zip。 */
+export type ArchiveFormat = 'tar.gz' | 'zip'
+
 /** 压缩结果：压缩包落在 archiveDir 里。 */
 export interface ArchiveResult {
   path: string
@@ -478,10 +481,13 @@ export const api = {
   fsMove: (sid: string, paths: string[], toDir: string) =>
     request<FsOpResult & { ok: boolean }>('/api/fs/move', { json: { sid, paths, toDir } }),
 
-  /** 压缩：调用远程主机的 tar，产物落在服务端固定的 archiveDir（/tmp/webssh-archive）。 */
-  fsCompress: (sid: string, paths: string[], name?: string) =>
+  /**
+   * 压缩：调用远程主机的 tar / zip，产物落在服务端固定的 archiveDir（/tmp/webssh-archive）。
+   * `format` 缺省 = `tar.gz`；`zip` 需要远端有 `zip` 命令（缺工具报 `no_archive_tool`）。
+   */
+  fsCompress: (sid: string, paths: string[], name?: string, format?: ArchiveFormat) =>
     request<{ ok: boolean; archive: ArchiveResult }>('/api/fs/compress', {
-      json: { sid, paths, name: name ?? '' }
+      json: { sid, paths, name: name ?? '', format: format ?? 'tar.gz' }
     }),
 
   /** 解压：调用远程主机的 tar / unzip，在原位解压。 */
