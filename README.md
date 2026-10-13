@@ -55,7 +55,7 @@ Tailwind 4 + xterm 6 的单页应用。
 | --- | --- |
 | 后端 | Go 1.27，`golang.org/x/crypto/ssh`（SSH 客户端）、`github.com/pkg/sftp`（SFTP），标准库 `net/http` + 自实现 WebSocket 帧编解码（无第三方 web 框架） |
 | 前端 | Vue 3.5 + Pinia 4 + TypeScript 6 + Tailwind CSS 4 + Vite 8 + xterm.js 6 + `@trimjs/web-app`（飞牛宿主 SDK） |
-| 交付 | 前端 `dist` 经 `//go:embed` 打进 Go 二进制 → 项目根目录的 `./webssh`；`fpk/` 是飞牛安装包脚手架 |
+| 交付 | 前端 `dist` 经 `//go:embed` 打进 Go 二进制 → 项目根目录的 `./webssh`；飞牛安装包（fpk）的打包工程在仓库外（见第 4 节） |
 | 测试 | 后端集成测试用 `internal/testssh`（进程内 SSH + SFTP 服务器，`github.com/creack/pty` **仅测试用**），不依赖外部 sshd |
 
 > 参考实现：本项目复用/借鉴了 `terminal`（本地 web 终端：会话管理、单挂载点接管、移动端适配、
@@ -91,7 +91,6 @@ make                        # 前端构建 + 内嵌 + go build → ./webssh
 make release V=1.0.1        # 发布构建（-s -w，版本号经 -ldflags 注入）
 make test                   # 后端单元 + 集成测试（用进程内 SSH/SFTP 服务器，不依赖外部 sshd）
 make typecheck              # 前端 vue-tsc 类型检查
-make fpk                    # 额外把二进制放进 fpk/app/bin/webssh（打包用）
 make clean
 ```
 
@@ -107,27 +106,40 @@ make clean
 
 ## 4. 部署（飞牛 fnOS）
 
-`fpk/` 目录就是应用包骨架（来自 fpkstudio 的 WebSSH 脚手架）：
+飞牛应用包（fpk）的脚手架**不在本仓库**，由 fpkstudio 工程维护：
+`/vol1/@appshare/fpkstudio/projects/WebSSH`。本仓库只产出 `./webssh`，打包时把二进制放进
+工程的 `app/bin/`，再用 fpkstudio 打包。工程目录结构：
 
 ```
-fpk/
+<fpkstudio 工程>/
 ├── manifest              应用元信息（appname=WebSSH，display_name=Web终端）
 ├── building/             打包用（building/manifest、settings.json）
 ├── cmd/main              生命周期脚本：start/stop/status，负责导出环境变量、启停二进制
 ├── cmd/*_callback        安装/升级/配置/卸载回调
 ├── config/privilege      run-as: root
-├── config/resource       api-scope: trim.file.userAccess / trim.file.userAcl（选飞牛文件用）
+├── config/resource       api-scope: trim.file.userAccess / trim.file.userAcl / trim.file.path
+│                         data-share: WebSSH（`TRIM_DATA_SHARE_PATHS` 的来源，「导出至飞牛」用）
 ├── app/ui/config         桌面入口：gatewayPrefix=/app/WebSSH，gatewaySocket=app.sock
 ├── app/ui/images/*       图标
+├── app/bin/webssh        本仓库 `make` 产出的二进制放这里
 └── wizard/uninstall      卸载向导（选择是否保留数据）
 ```
 
 - `cmd/main` 会导出 `WEBSSH_ADMIN_SOCK=${TRIM_APPDEST}/app.sock`、
   `WEBSSH_ADMIN_BASEURL=/app/WebSSH`、`WEBSSH_DATA_DIR=${TRIM_PKGVAR}/data`，
-  然后启动 `${TRIM_APPDEST}/bin/webssh`。打包时用 `make fpk` 把二进制放进 `fpk/app/bin/webssh`。
+  然后启动 `${TRIM_APPDEST}/bin/webssh`。
 - **权限**：`config/privilege` 里是 `run-as: root`。本应用不修改本机文件系统（它只连远程主机），
   之所以仍要 root，是为了读「登录用户用文件选择器授权给本应用」的飞牛文件
   （上传到远程主机时用）——授权给了应用，读取本身仍需具备权限。
+- **manifest 里两个字段决定「飞牛文件」这条路能不能走通**（飞牛开放 API 文档：
+  「如果应用需要调用 JS SDK，必须在 manifest 中声明 `micro_app=true`」；
+  「`disable_authorization_path` 仅当应用**不需要**用户选择文件或目录访问权限时才用 `true`」）：
+  - `micro_app = true`：应用页面按微应用加载，`@trimjs/web-app` 的宿主桥才可用；
+  - `disable_authorization_path = false`：本应用要用文件选择器拿用户授权，必须是 `false`。
+    写成 `true` 时，应用中心在**安装**（`PackageInfo`）与**每次启动**（`App` 实体）时都会把
+    本应用的 `trim.file.userAccess` / `trim.file.sharedAccess` 能力状态强制置为 `-1`，
+    于是选择器点「确定」时授权接口回 `31003 ErrCodeAppAuthException`（界面文案「应用鉴权异常」），
+    表现为「选好了文件，一确定就失败」。见第 10 节。
 - **反代**（不用飞牛统一网关时，例如 nginx）：
 
   ```nginx
@@ -230,14 +242,16 @@ $WEBSSH_DATA_DIR/
 webssh/
 ├── Makefile              构建入口（产物 ./webssh）
 ├── docs/CONTRACT.md      前后端接口 / 数据模型 / 分工边界（改接口先改它）
-├── fpk/                  飞牛应用包脚手架
 ├── backend/              Go 源码（package main）
-│   ├── main.go config.go logging.go      入口 / 配置 / 日志
-│   ├── store.go crypto.go hostkeys.go    数据目录 / 凭据加密 / 主机密钥
-│   ├── sshclient.go sessions.go terminal.go ssh 拨号 / 会话 / 终端（PTY+历史+单挂载点）
-│   ├── ws.go admin.go                    WebSocket 帧编解码 / 路由 + SPA + 缓存头
-│   ├── files.go quickcmds.go trimapi.go  SFTP 文件 API / 快捷指令 / 飞牛开放 API
-│   └── internal/testssh/                 进程内 SSH+SFTP 测试服务器（仅测试/联调）
+│   ├── main.go config.go protocol.go        入口 / 运行环境 / 终端控制协议常量
+│   ├── admin.go admin_routes.go static.go   mux + handler / 路由表 / SPA + 缓存头 + socket
+│   ├── sessions.go sessions_runtime.go      会话配置管理 / 已打开的会话（终端 + SFTP 容器）
+│   ├── terminal.go sftp.go files*.go        终端（PTY+历史+单挂载点）/ SFTP / 文件操作
+│   ├── fileops.go archive.go exportnas.go   复制移动 / 压缩解压 / 导出至飞牛
+│   ├── sshclient.go hostkeys.go             SSH 拨号 / 主机密钥 TOFU
+│   ├── credentials.go remote_exec.go        内存凭据 / 远程命令 helper
+│   ├── quickcmds.go trimapi.go              快捷指令 / 飞牛 API 的 HTTP 入口
+│   └── internal/                            子包：apierr / logx / secret / store / trimapi / ws / testssh
 └── frontend/
     ├── src/serverapi/                     API 客户端（契约的代码化）
     ├── src/i18n/                          中英文案（唯一来源）
@@ -259,6 +273,7 @@ webssh/
 | 提示「主机密钥不匹配」 | 目标主机重装过，或真的有人在中间。确认无误后到 设置 → 已信任的主机密钥 里移除旧记录，再重新测试连接 |
 | 文件管理报「SFTP 子系统不可用」 | 目标 sshd 的 `Subsystem sftp` 被注释或 `sftp-server` 未安装；终端仍可正常使用 |
 | 上传飞牛文件时提示不在宿主里 | 该功能依赖 `@trimjs/web-app` 的宿主桥（只能在飞牛的应用窗口里用），独立浏览器打开时用「本地文件」上传 |
+| 「飞牛文件」选好了文件、点确定却报「应用鉴权异常」 | 授权接口（`/app-center/openapi/v1/user/authorization-paths`）被应用中心拒了：**打包工程**的 manifest 里 `disable_authorization_path` 必须是 `false`（见第 4 节）。改成 `false` 后重新打包、重新安装（版本号要升，否则装不上），能力状态才会重建 |
 | 提示「该会话没有保存凭据，请先输入凭据」 | 建会话时关掉了「保存凭据」：凭据只在后端内存里，会话关闭或后端重启后就要重新输入。想省事就在编辑里打开开关（会加密落盘） |
 | 导出至飞牛是灰的 / 报未配置共享目录 | 进程环境里没有 `TRIM_DATA_SHARE_PATHS`（正常部署由飞牛注入）。该功能的目标目录写死为这个变量的第一个路径 |
 | 找不到「设置」 | 设置按钮在**首页**工具条右侧（会话页里不再放它，避免与全局设置重复） |

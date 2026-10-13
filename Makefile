@@ -4,7 +4,6 @@
 #   make release V=1.0.1   # release（-s -w 裁剪 + 版本号覆盖）
 #   make test              # 后端单元测试（含内嵌 SSH/SFTP 测试服务器）
 #   make typecheck         # 前端 vue-tsc 类型检查
-#   make fpk               # 把二进制放进 fpk 暂存区（打包用）
 #   make clean             # 清理构建产物
 #
 # 产物是项目根目录的 ./webssh（前端 dist 经 //go:embed 打进 backend/embed 编译进去）。
@@ -48,7 +47,7 @@ ifneq ($(strip $(NODE_BIN)),)
 export PATH := $(NODE_BIN):$(PATH)
 endif
 
-.PHONY: all dev release build test typecheck fpk clean
+.PHONY: all dev release build test typecheck clean
 
 all: dev
 
@@ -90,15 +89,9 @@ test:
 typecheck:
 	cd "$(FRONTEND)" && npm install --no-audit --no-fund && npm run type-check
 
-# 把二进制放进 fpk 暂存区（fpk/app/ 下的目录结构即安装后的应用目录）。
-# 用 fpkstudio 打包时把 fpk/ 作为项目目录即可。
-fpk: dev
-	mkdir -p "$(ROOT)/fpk/app/bin"
-	cp -f "$(OUT)" "$(ROOT)/fpk/app/bin/webssh"
-	chmod 755 "$(ROOT)/fpk/app/bin/webssh"
-	@echo "==> Staged: fpk/app/bin/webssh"
-
+# 飞牛应用包（fpk）的脚手架**不在本仓库**：打包工程由 fpkstudio 维护
+# （`/vol1/@appshare/fpkstudio/projects/WebSSH`）。本仓库只产出 ./webssh，
+# 打包时把该二进制放进工程的 app/bin/ 即可；manifest 的硬性字段见 README 第 4 节。
 clean:
 	rm -rf "$(EMBED)"
 	rm -f "$(OUT)"
-	rm -f "$(ROOT)/fpk/app/bin/webssh"

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -23,8 +25,6 @@ import (
 
 // 连接类裸码（契约第 4.1 节）。
 const (
-	codeNoCredential    = "no_credential"
-	codeKeyParse        = "key_parse"
 	codeDNS             = "dns"
 	codeDialTimeout     = "dial_timeout"
 	codeDialRefused     = "dial_refused"
@@ -34,8 +34,6 @@ const (
 	codeHostKeyMismatch = "hostkey_mismatch"
 	codeAuthFailed      = "auth_failed"
 	codeAuthUnsupported = "auth_unsupported"
-	codeShellFailed     = "shell_failed"
-	codeSFTPUnavailable = "sftp_unavailable"
 )
 
 // 连接阶段（TestOutcome.stage，前端 TestStage 的取值）。
@@ -80,7 +78,7 @@ type testOutcome struct {
 
 // dialRequest 是一次拨号的全部输入。
 type dialRequest struct {
-	cfg        *sessionConfig
+	cfg        *store.Session
 	password   string
 	privateKey string
 	passphrase string
@@ -104,20 +102,20 @@ func buildAuthMethods(req dialRequest) ([]ssh.AuthMethod, *connectError) {
 	switch req.cfg.AuthType {
 	case authTypeKey:
 		if req.privateKey == "" {
-			return nil, &connectError{Code: codeNoCredential, Stage: stageAuth, Detail: "该会话使用密钥认证，但没有可用的私钥"}
+			return nil, &connectError{Code: apierr.CodeNoCredential, Stage: stageAuth, Detail: "该会话使用密钥认证，但没有可用的私钥"}
 		}
 		signer, err := parsePrivateKey(req.privateKey, req.passphrase)
 		if err != nil {
-			return nil, &connectError{Code: codeKeyParse, Stage: stageAuth, Detail: "私钥解析失败：" + err.Error()}
+			return nil, &connectError{Code: apierr.CodeKeyParse, Stage: stageAuth, Detail: "私钥解析失败：" + err.Error()}
 		}
 		return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil
 	case authTypePassword:
 		if req.password == "" {
-			return nil, &connectError{Code: codeNoCredential, Stage: stageAuth, Detail: "该会话使用密码认证，但没有可用的密码"}
+			return nil, &connectError{Code: apierr.CodeNoCredential, Stage: stageAuth, Detail: "该会话使用密码认证，但没有可用的密码"}
 		}
 		return []ssh.AuthMethod{ssh.Password(req.password)}, nil
 	default:
-		return nil, &connectError{Code: codeNoCredential, Stage: stageAuth, Detail: fmt.Sprintf("未知的认证方式 %q", req.cfg.AuthType)}
+		return nil, &connectError{Code: apierr.CodeNoCredential, Stage: stageAuth, Detail: fmt.Sprintf("未知的认证方式 %q", req.cfg.AuthType)}
 	}
 }
 
@@ -316,11 +314,11 @@ func attemptedMethods(msg string) string {
 func probeSFTP(client *ssh.Client) *connectError {
 	sess, err := client.NewSession()
 	if err != nil {
-		return &connectError{Code: codeShellFailed, Stage: stageShell, Detail: "无法打开会话通道：" + err.Error()}
+		return &connectError{Code: apierr.CodeShellFailed, Stage: stageShell, Detail: "无法打开会话通道：" + err.Error()}
 	}
 	defer sess.Close()
 	if err := sess.RequestSubsystem("sftp"); err != nil {
-		return &connectError{Code: codeSFTPUnavailable, Stage: stageShell, Detail: "远端没有可用的 SFTP 子系统（sshd 未配置 Subsystem sftp）：" + err.Error()}
+		return &connectError{Code: apierr.CodeSFTPUnavailable, Stage: stageShell, Detail: "远端没有可用的 SFTP 子系统（sshd 未配置 Subsystem sftp）：" + err.Error()}
 	}
 	return nil
 }

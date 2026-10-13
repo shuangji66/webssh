@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"webssh/backend/internal/logx"
 )
 
 // trimDefaultSocket 是飞牛开放 API 网关（trim.file.*）的 socket，只在没有
@@ -102,7 +103,7 @@ func dialTimeoutFromEnv() time.Duration {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		warnf("WEBSSH_DIAL_TIMEOUT=%q 不是合法的时长（如 15s），已回退默认 %s", raw, def)
+		logx.Warnf("WEBSSH_DIAL_TIMEOUT=%q 不是合法的时长（如 15s），已回退默认 %s", raw, def)
 		return def
 	}
 	return d

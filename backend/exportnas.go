@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/pkg/sftp"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/logx"
 )
 
 // ---------------------------------------------------------------------------
@@ -27,7 +29,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // handleFsExportToNas 把远程一个条目复制到本机共享目录。
-func (m *AdminMux) handleFsExportToNas(w http.ResponseWriter, r *http.Request) *apiError {
+func (m *AdminMux) handleFsExportToNas(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req struct {
 		SID       string `json:"sid"`
 		Path      string `json:"path"`
@@ -38,7 +40,7 @@ func (m *AdminMux) handleFsExportToNas(w http.ResponseWriter, r *http.Request) *
 	}
 	root := strings.TrimSpace(m.renv.ExportRoot)
 	if root == "" {
-		return errNoSharePath("没有配置飞牛共享目录（TRIM_DATA_SHARE_PATHS 为空），无法导出到本机")
+		return apierr.NoSharePath("没有配置飞牛共享目录（TRIM_DATA_SHARE_PATHS 为空），无法导出到本机")
 	}
 	rt, apiErr := m.sessions.runtimeFor(req.SID)
 	if apiErr != nil {
@@ -75,7 +77,7 @@ func (m *AdminMux) handleFsExportToNas(w http.ResponseWriter, r *http.Request) *
 		// 同名冲突：默认不覆盖（契约 11.4：前端拿到 duplicate 后再问用户是否覆盖）。
 		if _, err := os.Lstat(dest); err == nil {
 			if !req.Overwrite {
-				return errDuplicate("本机共享目录里已存在同名项：%s（可选择覆盖）", dest)
+				return apierr.Duplicate("本机共享目录里已存在同名项：%s（可选择覆盖）", dest)
 			}
 			// 覆盖 = 先整份删掉再写。不清掉的话，一个目录导出到已存在的同名目录里会变成
 			// 「新旧内容混在一起」——用户以为拿到的是远程那份，实际多了别的文件。
@@ -88,7 +90,7 @@ func (m *AdminMux) handleFsExportToNas(w http.ResponseWriter, r *http.Request) *
 			// 失败清掉半成品：一个写了一半的文件/目录留在共享目录里，用户很可能直接把它
 			// 当成导出的结果拿走（尤其是目录，少的那几个文件根本看不出来）。
 			if rmErr := os.RemoveAll(dest); rmErr != nil {
-				warnf("清理导出半成品 %s 失败：%v", dest, rmErr)
+				logx.Warnf("清理导出半成品 %s 失败：%v", dest, rmErr)
 			}
 			return err
 		}
@@ -101,9 +103,9 @@ func (m *AdminMux) handleFsExportToNas(w http.ResponseWriter, r *http.Request) *
 	if files == 0 && size == 0 {
 		// 源是个只有软链接的目录之类：什么都没导出。不报错（这不是故障），但要让日志
 		// 留一条——用户看到「导出成功 0 个文件」时可以据此排查。
-		warnf("导出至飞牛：%s 里没有可导出的普通文件", req.Path)
+		logx.Warnf("导出至飞牛：%s 里没有可导出的普通文件", req.Path)
 	}
-	return respond(w, map[string]any{
+	return apierr.Respond(w, map[string]any{
 		"ok":     true,
 		"export": map[string]any{"path": local, "size": size, "files": files},
 	})
@@ -137,7 +139,7 @@ func exportRemoteEntry(ctx context.Context, c *sftp.Client, remote, local string
 	}
 	switch {
 	case fi.Mode()&os.ModeSymlink != 0:
-		warnf("导出至飞牛：跳过软链接 %s", remote)
+		logx.Warnf("导出至飞牛：跳过软链接 %s", remote)
 		return 0, 0, nil
 
 	case fi.IsDir():
@@ -200,7 +202,7 @@ func exportRemoteFile(ctx context.Context, c *sftp.Client, remote, local string,
 	}
 	// 显式 chmod：飞牛存储卷上 O_CREAT 给的模式位可能被忽略（会落成 0000，连自己都读不回来）。
 	if err := os.Chmod(local, 0o644); err != nil {
-		warnf("设置 %s 权限失败：%v", local, err)
+		logx.Warnf("设置 %s 权限失败：%v", local, err)
 	}
 	return n, 1, nil
 }

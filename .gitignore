@@ -1,7 +1,5 @@
 # 构建产物：内嵌前端资源的二进制（项目根目录）
 /webssh
-# fpk 打包暂存区里放置的二进制
-/fpk/app/bin/
 
 # 前端构建产物 / 依赖
 /frontend/dist/

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"webssh/backend/internal/logx"
+	"webssh/backend/internal/store"
 )
 
 // embeddedFS 是构建时打进二进制的**前端产物**（Makefile 把 frontend/dist 复制到
@@ -26,7 +28,7 @@ var appVersion = "dev"
 // 前端把它当作「后端是否换过进程」的唯一判据：进程重启后所有内存态会话（终端 + SFTP）
 // 都不复存在，页面必须清空会话标签（配置仍在，可以重新打开），而不是拿旧 id 去挂载
 // 一个已经消失的终端。
-var bootID = newID()
+var bootID = store.NewID()
 
 func main() {
 	renv := loadRuntimeEnv()
@@ -35,7 +37,7 @@ func main() {
 	//    「活着但一打开就报错」比直接退出更难排查（supervisor 能看见退出码）。
 	mux, err := newAdminMux(renv)
 	if err != nil {
-		warnf("初始化失败：%v", err)
+		logx.Warnf("初始化失败：%v", err)
 		os.Exit(1)
 	}
 	mux.SetSPA(embeddedFS)
@@ -43,14 +45,14 @@ func main() {
 	// 2) socket 已经被占用时退出：两个实例抢同一个 socket 会互相删对方的文件，
 	//    表现为「界面时好时坏」，而两个进程各自都觉得自己正常。
 	if _, err := net.Dial("unix", renv.AdminSock); err == nil {
-		warnf("admin socket %s 已被占用，退出", renv.AdminSock)
+		logx.Warnf("admin socket %s 已被占用，退出", renv.AdminSock)
 		os.Exit(1)
 	}
 
 	// 3) **先绑定成功再进信号等待**：绑定失败就退出（而不是空转）。
 	ln, err := listenAdminSocket(renv)
 	if err != nil {
-		warnf("绑定 admin socket %s 失败：%v", renv.AdminSock, err)
+		logx.Warnf("绑定 admin socket %s 失败：%v", renv.AdminSock, err)
 		os.Exit(1)
 	}
 	srv := &http.Server{Handler: mux.buildHandler()}
@@ -68,7 +70,7 @@ func main() {
 	select {
 	case <-sig:
 	case serr := <-srvErr:
-		warnf("admin socket 服务异常退出：%v", serr)
+		logx.Warnf("admin socket 服务异常退出：%v", serr)
 		exitCode = 1
 	}
 
@@ -81,7 +83,7 @@ func main() {
 	_ = srv.Close()
 	mux.sessions.closeAll()
 	if err := os.Remove(renv.AdminSock); err != nil && !errors.Is(err, os.ErrNotExist) {
-		warnf("删除 socket %s 失败：%v", renv.AdminSock, err)
+		logx.Warnf("删除 socket %s 失败：%v", renv.AdminSock, err)
 	}
 	os.Exit(exitCode)
 }

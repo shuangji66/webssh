@@ -1,5 +1,0 @@
-#!/bin/bash
-
-mkdir -p ${TRIM_PKGVAR}/session
-
-exit 0

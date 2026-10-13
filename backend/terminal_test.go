@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"webssh/backend/internal/ws"
 )
 
 // tidPayloadRe 与前端 serverapi 的 TID_PAYLOAD_RE 一致（服务端下发的终端 id）。
@@ -260,25 +261,25 @@ func TestTerminalFrameLimits(t *testing.T) {
 	requirePTY(t)
 	a := newTestApp(t, appOptions{})
 	sid := a.newSSHSession(t)
-	ws := a.dialWS(t, sid, "")
-	tid := waitForTID(t, ws)
-	ws.mustCollectUntil(shellPrompt, testTimeout)
+	conn := a.dialWS(t, sid, "")
+	tid := waitForTID(t, conn)
+	conn.mustCollectUntil(shellPrompt, testTimeout)
 
 	// 超过单帧上限（1 MiB）→ 服务端断开这个连接（读取时会按长度字段先拒绝，不分配内存），
 	// 但终端不受影响。写这帧本身可能因服务端已断开而拿到 EPIPE，那是预期内的。
-	big := strings.Repeat("A", maxFrameBytes+1024)
-	_ = ws.tryWriteFrame(opText, []byte(big))
+	big := strings.Repeat("A", ws.MaxFrameBytes+1024)
+	_ = conn.tryWriteFrame(ws.OpText, []byte(big))
 	closed := false
 	for i := 0; i < 5 && !closed; i++ {
-		op, _, err := ws.readFrame(2 * time.Second)
-		if err != nil || op == opClose {
+		op, _, err := conn.readFrame(2 * time.Second)
+		if err != nil || op == ws.OpClose {
 			closed = true
 		}
 	}
 	if !closed {
 		t.Fatal("超过单帧上限的连接没有被断开")
 	}
-	ws.close()
+	conn.close()
 
 	// 终端还在（只解挂载）
 	_, list := a.get(t, "/api/sessions")
@@ -290,8 +291,8 @@ func TestTerminalFrameLimits(t *testing.T) {
 	// 分片消息（text + continuation）要按整条消息处理，不能被截断。
 	ws2 := a.dialWS(t, sid, tid)
 	ws2.mustCollectUntil(oscReady, testTimeout)
-	ws2.writeFragment(opText, []byte("\x1b]resize;7"), false)
-	ws2.writeFragment(opCont, []byte("7;33\x07"), true)
+	ws2.writeFragment(ws.OpText, []byte("\x1b]resize;7"), false)
+	ws2.writeFragment(ws.OpContinuation, []byte("7;33\x07"), true)
 	ws2.writeText("stty size\r")
 	ws2.mustCollectUntil("33 77", testTimeout)
 }

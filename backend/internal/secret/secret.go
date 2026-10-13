@@ -1,4 +1,14 @@
-package main
+// Package secret 负责凭据的落盘加密（AES-256-GCM）与主密钥管理。
+//
+// **威胁模型（如实写清，别夸大）**：这一层加密防的是「拿到磁盘快照 / 备份 / 卷拷贝的人
+// 直接读到明文密码」。它**不防**「已经能以同权限读取数据目录的攻击者」——master.key 就
+// 躺在密文旁边，能读密文的人多半也能读密钥。
+// 想避免密钥与密文同放，用 WEBSSH_MASTER_KEY 从外部注入（由启动脚本 / 容器 secret 提供），
+// 这样数据目录的备份里就没有可用密钥。
+//
+// AAD 绑定 `webssh:v1:<field>:<sid>`：把某个字段的密文剪到另一个字段或另一个会话上，
+// 解密会直接失败（GCM 的认证标签覆盖 AAD），而不是悄悄用一个错误的凭据去连别的机器。
+package secret
 
 import (
 	"crypto/aes"
@@ -13,19 +23,6 @@ import (
 	"strings"
 )
 
-// ---------------------------------------------------------------------------
-// 凭据加密（AES-256-GCM）
-//
-// **威胁模型（如实写清，别夸大）**：这一层加密防的是「拿到磁盘快照 / 备份 / 卷拷贝的人
-// 直接读到明文密码」。它**不防**「已经能以同权限读取数据目录的攻击者」——master.key 就
-// 躺在密文旁边，能读密文的人多半也能读密钥。
-// 想避免密钥与密文同放，用 WEBSSH_MASTER_KEY 从外部注入（由启动脚本 / 容器 secret 提供），
-// 这样数据目录的备份里就没有可用密钥。
-//
-// AAD 绑定 `webssh:v1:<field>:<sid>`：把某个字段的密文剪到另一个字段或另一个会话上，
-// 解密会直接失败（GCM 的认证标签覆盖 AAD），而不是悄悄用一个错误的凭据去连别的机器。
-// ---------------------------------------------------------------------------
-
 const (
 	// masterKeyFile 是主密钥文件名（数据目录根下）。
 	masterKeyFile = "master.key"
@@ -38,27 +35,28 @@ const (
 // 凭据字段名：既是落盘字段名，也是 AAD 的第二个成分。**改这里会让已存的密文全部解不开**
 // （AAD 不匹配 → GCM 认证失败），所以只在协议版本升级（secretVersion）时一起动。
 const (
-	fieldPassword   = "password"
-	fieldPrivateKey = "privateKey"
-	fieldPassphrase = "passphrase"
+	FieldPassword   = "password"
+	FieldPrivateKey = "privateKey"
+	FieldPassphrase = "passphrase"
 )
 
-// secret 是凭据字段的落盘形态：{"v":1,"ct":"<base64(nonce||ciphertext)>"}。
-type secret struct {
+// Secret 是凭据字段的落盘形态：{"v":1,"ct":"<base64(nonce||ciphertext)>"}。
+type Secret struct {
 	V  int    `json:"v"`
 	CT string `json:"ct"`
 }
 
-type cryptor struct {
+// Cryptor 是加密器：只持有 AEAD，无状态，可并发使用（cipher.AEAD 本身并发安全）。
+type Cryptor struct {
 	aead cipher.AEAD
 }
 
-// loadCryptor 取得主密钥并构造 AEAD。
+// Load 取得主密钥并构造 AEAD。
 //
 // 密钥来源二选一：WEBSSH_MASTER_KEY（外部提供，优先）或数据目录里的 master.key。
 // 环境变量给了但**解不出来必须直接失败**，绝不「回退到本地文件」：那种静默回退的表现是
 // 用户换了密钥后旧会话全部解密失败，而进程却正常启动、只是每个会话都报「密码失效」。
-func loadCryptor(dataDir, envKey string) (*cryptor, error) {
+func Load(dataDir, envKey string) (*Cryptor, error) {
 	var key []byte
 	if strings.TrimSpace(envKey) != "" {
 		k, err := decodeMasterKey(envKey)
@@ -81,7 +79,7 @@ func loadCryptor(dataDir, envKey string) (*cryptor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("初始化 AES-GCM 失败：%w", err)
 	}
-	return &cryptor{aead: aead}, nil
+	return &Cryptor{aead: aead}, nil
 }
 
 // decodeMasterKey 解析外部提供的主密钥：32 字节的 base64（标准/URL 编码都认）或 hex。
@@ -145,12 +143,12 @@ func loadOrCreateMasterKey(path string) ([]byte, error) {
 }
 
 // aad 是本项目的附加认证数据：版本 + 字段名 + 会话 id。
-func (c *cryptor) aad(field, sid string) []byte {
+func (c *Cryptor) aad(field, sid string) []byte {
 	return []byte(fmt.Sprintf("webssh:v%d:%s:%s", secretVersion, field, sid))
 }
 
-// encrypt 加密一个凭据字段。明文为空串时返回 nil（表示「没有这个凭据」）。
-func (c *cryptor) encrypt(field, sid, plain string) (*secret, error) {
+// Encrypt 加密一个凭据字段。明文为空串时返回 nil（表示「没有这个凭据」）。
+func (c *Cryptor) Encrypt(field, sid, plain string) (*Secret, error) {
 	if plain == "" {
 		return nil, nil
 	}
@@ -159,14 +157,14 @@ func (c *cryptor) encrypt(field, sid, plain string) (*secret, error) {
 		return nil, fmt.Errorf("生成随机数失败：%w", err)
 	}
 	ct := c.aead.Seal(nil, nonce, []byte(plain), c.aad(field, sid))
-	return &secret{V: secretVersion, CT: base64.StdEncoding.EncodeToString(append(nonce, ct...))}, nil
+	return &Secret{V: secretVersion, CT: base64.StdEncoding.EncodeToString(append(nonce, ct...))}, nil
 }
 
-// decrypt 解密一个凭据字段。nil / 空密文 = 该字段没有值（返回 ""）。
+// Decrypt 解密一个凭据字段。nil / 空密文 = 该字段没有值（返回 ""）。
 //
 // 解密失败**必须**把错误带出去：静默当成空密码的表现是「密码莫名其妙失效了」，
 // 而真正的原因（换了 master.key / 密文被搬过字段）永远查不出来。
-func (c *cryptor) decrypt(field, sid string, s *secret) (string, error) {
+func (c *Cryptor) Decrypt(field, sid string, s *Secret) (string, error) {
 	if s == nil || strings.TrimSpace(s.CT) == "" {
 		return "", nil
 	}

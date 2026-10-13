@@ -14,6 +14,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"webssh/backend/internal/secret"
+	"webssh/backend/internal/store"
 	"webssh/backend/internal/testssh"
 )
 
@@ -27,8 +29,8 @@ func TestSessionSaveValidation(t *testing.T) {
 	})
 	view, _ := out["session"].(map[string]any)
 	sid := strOf(view, "id")
-	if len(sid) != idLen {
-		t.Fatalf("id = %q，期望 %d 位十六进制", sid, idLen)
+	if len(sid) != 32 {
+		t.Fatalf("id = %q，期望 %d 位十六进制", sid, 32)
 	}
 	if strOf(view, "name") != "nas" || strOf(view, "host") != "10.0.0.1" || numOf(view, "port") != 2222 ||
 		strOf(view, "user") != "root" || strOf(view, "authType") != "password" ||
@@ -139,7 +141,7 @@ func TestCredentialEncryptionAtRest(t *testing.T) {
 	}
 
 	// master.key：32 字节、0600。
-	keyPath := filepath.Join(a.renv.DataDir, masterKeyFile)
+	keyPath := filepath.Join(a.renv.DataDir, "master.key")
 	st, err := os.Stat(keyPath)
 	if err != nil {
 		t.Fatalf("master.key 不存在：%v", err)
@@ -148,8 +150,8 @@ func TestCredentialEncryptionAtRest(t *testing.T) {
 		t.Errorf("master.key 权限 = %o，期望 600", perm)
 	}
 	key, err := os.ReadFile(keyPath)
-	if err != nil || len(key) != masterKeyLen {
-		t.Fatalf("master.key 长度 = %d（err=%v），期望 %d", len(key), err, masterKeyLen)
+	if err != nil || len(key) != 32 {
+		t.Fatalf("master.key 长度 = %d（err=%v），期望 %d", len(key), err, 32)
 	}
 
 	// 落盘内容里不能有明文。
@@ -157,12 +159,12 @@ func TestCredentialEncryptionAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取会话文件失败：%v", err)
 	}
-	for _, secret := range []string{plainPassword, plainPassphrase, "OPENSSH PRIVATE KEY", pemText} {
-		if strings.Contains(string(raw), secret) {
-			t.Errorf("会话文件里出现了明文凭据 %q：%s", secret, snippetOf(raw))
+	for _, plain := range []string{plainPassword, plainPassphrase, "OPENSSH PRIVATE KEY", pemText} {
+		if strings.Contains(string(raw), plain) {
+			t.Errorf("会话文件里出现了明文凭据 %q：%s", plain, snippetOf(raw))
 		}
 	}
-	var sc sessionConfig
+	var sc store.Session
 	if err := json.Unmarshal(raw, &sc); err != nil {
 		t.Fatalf("会话文件不是合法 JSON：%v", err)
 	}
@@ -179,34 +181,34 @@ func TestCredentialEncryptionAtRest(t *testing.T) {
 		t.Fatalf("解密结果不对：%q / %q / %q", password, privateKey, passphrase)
 	}
 	// AAD 绑定：把密文搬到另一个字段 / 另一个会话必须解不开（不能悄悄用一个错误的凭据）。
-	if _, err := a.mux.crypt.decrypt(fieldPrivateKey, sid, sc.Password); err == nil {
+	if _, err := a.mux.crypt.Decrypt(secret.FieldPrivateKey, sid, sc.Password); err == nil {
 		t.Error("密码密文搬到 privateKey 字段竟然能解开")
 	}
-	if _, err := a.mux.crypt.decrypt(fieldPassword, "another-session", sc.Password); err == nil {
+	if _, err := a.mux.crypt.Decrypt(secret.FieldPassword, "another-session", sc.Password); err == nil {
 		t.Error("密码密文搬到别的会话竟然能解开")
 	}
-	if _, err := a.mux.crypt.decrypt(fieldPassword, sid, &secret{V: 1, CT: "AAAA"}); err == nil {
+	if _, err := a.mux.crypt.Decrypt(secret.FieldPassword, sid, &secret.Secret{V: 1, CT: "AAAA"}); err == nil {
 		t.Error("乱码密文竟然能解开")
 	}
 	// 信封版本不支持时也要报错
-	if _, err := a.mux.crypt.decrypt(fieldPassword, sid, &secret{V: 99, CT: sc.Password.CT}); err == nil {
+	if _, err := a.mux.crypt.Decrypt(secret.FieldPassword, sid, &secret.Secret{V: 99, CT: sc.Password.CT}); err == nil {
 		t.Error("不支持的版本号应当报错")
 	}
 }
 
 // TestMasterKeyFromEnv 校验 WEBSSH_MASTER_KEY 外部提供主密钥（数据目录里不落密钥文件）。
 func TestMasterKeyFromEnv(t *testing.T) {
-	raw := make([]byte, masterKeyLen)
+	raw := make([]byte, 32)
 	for i := range raw {
 		raw[i] = byte(i)
 	}
 	a := newTestApp(t, appOptions{noSSH: true, masterKeyEnv: base64.StdEncoding.EncodeToString(raw)})
-	if _, err := os.Stat(filepath.Join(a.renv.DataDir, masterKeyFile)); err == nil {
+	if _, err := os.Stat(filepath.Join(a.renv.DataDir, "master.key")); err == nil {
 		t.Fatal("用环境变量提供主密钥时不该再生成 master.key")
 	}
 	out := a.ok(t, "/api/sessions/save", map[string]any{"host": "h", "user": "u", "authType": "password", "password": "pw"})
 	sid := strOf(out["session"], "id")
-	sc, err := a.mux.st.loadSession(sid)
+	sc, err := a.mux.st.LoadSession(sid)
 	if err != nil {
 		t.Fatalf("读取会话失败：%v", err)
 	}
@@ -264,7 +266,7 @@ func TestSessionInputSemantics(t *testing.T) {
 	if upd["session"].(map[string]any)["hasPassword"] != false {
 		t.Fatalf("password 传空串应清除：%v", upd["session"])
 	}
-	sc, err := a.mux.st.loadSession(sid)
+	sc, err := a.mux.st.LoadSession(sid)
 	if err != nil {
 		t.Fatalf("读取会话失败：%v", err)
 	}
@@ -322,7 +324,7 @@ func TestSessionPartialUpdateWhileOpen(t *testing.T) {
 	}
 
 	// 3) 落盘的配置也必须是原身份（并入内存态是同一份值）
-	sc, err := a.mux.st.loadSession(sid)
+	sc, err := a.mux.st.LoadSession(sid)
 	if err != nil {
 		t.Fatalf("读取会话失败：%v", err)
 	}
@@ -460,7 +462,7 @@ func TestSessionsSurviveRestart(t *testing.T) {
 	if strOf(after["runtime"], "bootId") == bootBefore {
 		t.Error("重启后 bootId 必须变（前端靠它清掉失效的会话标签）")
 	}
-	if len(strOf(after["runtime"], "bootId")) != idLen {
+	if len(strOf(after["runtime"], "bootId")) != 32 {
 		t.Errorf("重启用例里的 bootId 形态不对：%v", after["runtime"])
 	}
 	_, list := b.get(t, "/api/sessions")

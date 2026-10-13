@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"webssh/backend/internal/trimapi"
 )
 
 // ---------------------------------------------------------------------------
@@ -39,7 +40,7 @@ func TestQuickCmdsGlobalAndSession(t *testing.T) {
 		t.Fatalf("命令数 = %d：%v", len(cmds), cmds)
 	}
 	first, _ := cmds[0].(map[string]any)
-	if strOf(first, "id") == "" || len(strOf(first, "id")) != idLen {
+	if strOf(first, "id") == "" || len(strOf(first, "id")) != 32 {
 		t.Errorf("缺失的 id 应当由服务端补齐：%v", first)
 	}
 	if strOf(first, "name") != "磁盘" || strOf(first, "content") != "df -h" || first["auto"] != true {
@@ -137,7 +138,7 @@ func startFakeGateway(t *testing.T, resp func(req map[string]any) (int, any)) *f
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer "+os.Getenv(trimEnvToken) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+os.Getenv(trimapi.EnvToken) {
 			w.WriteHeader(http.StatusUnauthorized)
 			io.WriteString(w, `{"code":1000002,"msg":"bad token"}`)
 			return
@@ -189,9 +190,9 @@ func TestTrimUnavailable(t *testing.T) {
 
 // TestTrimACL 校验开放 API 调用：token、reqId、uid 来源与结果映射。
 func TestTrimACL(t *testing.T) {
-	t.Setenv(trimEnvToken, "test-token")
+	t.Setenv(trimapi.EnvToken, "test-token")
 	g := startFakeGateway(t, func(req map[string]any) (int, any) {
-		if req["req"] != trimReqCheckUserACL {
+		if req["req"] != "trim.file.checkUserACL" {
 			return http.StatusOK, map[string]any{"code": 1, "msg": "unexpected req"}
 		}
 		data, _ := req["data"].(map[string]any)
@@ -248,7 +249,7 @@ func TestTrimACL(t *testing.T) {
 
 // TestTrimPermissionError 校验 code 1000002 被翻成「权限不足」并带上排查方向。
 func TestTrimPermissionError(t *testing.T) {
-	t.Setenv(trimEnvToken, "test-token")
+	t.Setenv(trimapi.EnvToken, "test-token")
 	g := startFakeGateway(t, func(req map[string]any) (int, any) {
 		return http.StatusForbidden, map[string]any{"code": 1000002, "msg": "管理员权限或 API Scope 不足"}
 	})
@@ -268,7 +269,7 @@ func TestTrimPermissionError(t *testing.T) {
 
 // TestUploadFromNasACLDenied 校验「用户对本机文件没有读权限」时拒绝上传。
 func TestUploadFromNasACLDenied(t *testing.T) {
-	t.Setenv(trimEnvToken, "test-token")
+	t.Setenv(trimapi.EnvToken, "test-token")
 	g := startFakeGateway(t, func(req map[string]any) (int, any) {
 		data, _ := req["data"].(map[string]any)
 		paths, _ := data["path"].([]any)
@@ -295,7 +296,7 @@ func TestTrimClientErrorMapping(t *testing.T) {
 		return http.StatusOK, map[string]any{"code": 0, "data": []any{}}
 	})
 	a := newTestApp(t, appOptions{trimSocket: g.sock})
-	t.Setenv(trimEnvToken, "")
+	t.Setenv(trimapi.EnvToken, "")
 	_, out := a.get(t, "/api/trim/status")
 	trim, _ := out["trim"].(map[string]any)
 	if trim["available"] != false {
@@ -309,8 +310,8 @@ func TestTrimClientErrorMapping(t *testing.T) {
 	})
 	_ = bad
 	b := newTestApp(t, appOptions{trimSocket: bad.sock})
-	client := newTrimClient(b.renv)
-	if _, err := client.checkUserACL(context.Background(), 0, []string{"/x"}); err == nil {
+	client := trimapi.NewClient(b.renv.TrimSocket, b.renv.TrimApp)
+	if _, err := client.CheckUserACL(context.Background(), 0, []string{"/x"}); err == nil {
 		t.Error("非法 JSON 响应应当返回错误")
 	}
 }

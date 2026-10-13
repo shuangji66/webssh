@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -33,15 +35,17 @@ type quickCmdsFile struct {
 	Commands []quickCmd `json:"commands"`
 }
 
-func (s *store) loadQuickCmds(sid string) ([]quickCmd, *apiError) {
+// loadQuickCmds / saveQuickCmds 是 main 包的自由函数（不是 store.Store 的方法）：
+// quickCmd 与 apierr.Error 都属于 API 层，store 包只提供通用的 ReadJSON/WriteJSON 与路径。
+func loadQuickCmds(st *store.Store, sid string) ([]quickCmd, *apierr.Error) {
 	var f quickCmdsFile
-	err := s.readJSON(s.quickCmdsPath(sid), &f)
+	err := st.ReadJSON(st.QuickCmdsPath(sid), &f)
 	switch {
 	case err == nil:
 	case errors.Is(err, os.ErrNotExist):
 		// 还没有任何指令：正常的空状态，不是错误。
 	default:
-		return nil, errInternal("读取快捷指令失败：%v", err)
+		return nil, apierr.Internal("读取快捷指令失败：%v", err)
 	}
 	if f.Commands == nil {
 		f.Commands = []quickCmd{}
@@ -49,9 +53,9 @@ func (s *store) loadQuickCmds(sid string) ([]quickCmd, *apiError) {
 	return f.Commands, nil
 }
 
-func (s *store) saveQuickCmds(sid string, cmds []quickCmd) *apiError {
-	if err := s.writeJSON(s.quickCmdsPath(sid), quickCmdsFile{Version: 1, Commands: cmds}, 0o600); err != nil {
-		return errInternal("保存快捷指令失败：%v", err)
+func saveQuickCmds(st *store.Store, sid string, cmds []quickCmd) *apierr.Error {
+	if err := st.WriteJSON(st.QuickCmdsPath(sid), quickCmdsFile{Version: 1, Commands: cmds}, 0o600); err != nil {
+		return apierr.Internal("保存快捷指令失败：%v", err)
 	}
 	return nil
 }
@@ -60,9 +64,9 @@ func (s *store) saveQuickCmds(sid string, cmds []quickCmd) *apiError {
 //
 // 自动补 id 而不是拒绝：新增一条指令时前端可能只发 {name, content, auto}，
 // 为「没带 id」回一个 400 只会让用户看到一句没头没脑的报错。
-func sanitizeQuickCmds(in []quickCmd) ([]quickCmd, *apiError) {
+func sanitizeQuickCmds(in []quickCmd) ([]quickCmd, *apierr.Error) {
 	if len(in) > maxQuickCmds {
-		return nil, errTooLarge("快捷指令最多 %d 条（收到 %d 条）", maxQuickCmds, len(in))
+		return nil, apierr.TooLarge("快捷指令最多 %d 条（收到 %d 条）", maxQuickCmds, len(in))
 	}
 	out := make([]quickCmd, 0, len(in))
 	seen := make(map[string]bool, len(in))
@@ -70,10 +74,10 @@ func sanitizeQuickCmds(in []quickCmd) ([]quickCmd, *apiError) {
 		c.Name = strings.TrimSpace(c.Name)
 		c.Content = strings.TrimSpace(c.Content)
 		if c.Name == "" || c.Content == "" {
-			return nil, errInvalid("快捷指令需要名称与命令内容")
+			return nil, apierr.Invalid("快捷指令需要名称与命令内容")
 		}
-		if c.ID == "" || !validID(c.ID) {
-			c.ID = newID()
+		if c.ID == "" || !store.ValidID(c.ID) {
+			c.ID = store.NewID()
 		}
 		if seen[c.ID] {
 			// 同一 id 出现两次：保留先出现的那条（前端按 id 做列表 key，重复 id 会让渲染错乱）。
@@ -85,11 +89,11 @@ func sanitizeQuickCmds(in []quickCmd) ([]quickCmd, *apiError) {
 	return out, nil
 }
 
-func (m *AdminMux) quickCmdScope(sid string) (*sessionConfig, *apiError) {
+func (m *AdminMux) quickCmdScope(sid string) (*store.Session, *apierr.Error) {
 	if sid == "" {
 		return nil, nil // 全局
 	}
-	if !validID(sid) {
+	if !store.ValidID(sid) {
 		return nil, errSessionGone("会话不存在")
 	}
 	sc, ok := m.sessions.getConfig(sid)
@@ -100,7 +104,7 @@ func (m *AdminMux) quickCmdScope(sid string) (*sessionConfig, *apiError) {
 }
 
 // handleQuickCmdsList 读取一张表（sid 为空 = 全局）。
-func (m *AdminMux) handleQuickCmdsList(w http.ResponseWriter, r *http.Request) *apiError {
+func (m *AdminMux) handleQuickCmdsList(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req struct {
 		SID string `json:"sid"`
 	}
@@ -110,15 +114,15 @@ func (m *AdminMux) handleQuickCmdsList(w http.ResponseWriter, r *http.Request) *
 	if _, apiErr := m.quickCmdScope(req.SID); apiErr != nil {
 		return apiErr
 	}
-	cmds, apiErr := m.st.loadQuickCmds(req.SID)
+	cmds, apiErr := loadQuickCmds(m.st, req.SID)
 	if apiErr != nil {
 		return apiErr
 	}
-	return respond(w, map[string]any{"ok": true, "scope": scopeOf(req.SID), "commands": cmds})
+	return apierr.Respond(w, map[string]any{"ok": true, "scope": scopeOf(req.SID), "commands": cmds})
 }
 
 // handleQuickCmdsSave 整表保存。
-func (m *AdminMux) handleQuickCmdsSave(w http.ResponseWriter, r *http.Request) *apiError {
+func (m *AdminMux) handleQuickCmdsSave(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req struct {
 		SID      string     `json:"sid"`
 		Commands []quickCmd `json:"commands"`
@@ -133,10 +137,10 @@ func (m *AdminMux) handleQuickCmdsSave(w http.ResponseWriter, r *http.Request) *
 	if apiErr != nil {
 		return apiErr
 	}
-	if apiErr := m.st.saveQuickCmds(req.SID, cmds); apiErr != nil {
+	if apiErr := saveQuickCmds(m.st, req.SID, cmds); apiErr != nil {
 		return apiErr
 	}
-	return respond(w, map[string]any{"ok": true, "scope": scopeOf(req.SID), "commands": cmds})
+	return apierr.Respond(w, map[string]any{"ok": true, "scope": scopeOf(req.SID), "commands": cmds})
 }
 
 // scopeOf 是响应里的 scope 字段：`global` / `session`（前端只用它区分两张表）。

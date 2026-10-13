@@ -11,7 +11,8 @@
 >   移动端适配、字体切换、单挂载点语义、`bootID` 恢复机制、构建方式（Makefile）。
 > - `../fpkstudio`：标签页 + 面包屑 + 文件管理双模式、SFTP/文件操作 API 的形态、飞牛开放 API
 >   调用方式（`pickUserFile` / `checkUserACL`）、前端资源缓存头与 baseurl 注入。
-> - `/vol1/@appshare/fpkstudio/projects/WebSSH`：fpk 脚手架（已复制进本仓库 `fpk/`）。
+> - `/vol1/@appshare/fpkstudio/projects/WebSSH`：飞牛应用包（fpk）的打包工程，**不在本仓库**；
+>   本仓库只产出 `./webssh`，打包时把二进制放进该工程的 `app/bin/`。
 
 ---
 
@@ -47,26 +48,51 @@
 
 ---
 
-## 2. 后端文件布局（`backend/`，Go 1.27，`package main`）
+## 2. 后端文件布局（`backend/`，Go 1.27）
+
+入口与 HTTP 编排是 `package main`（`backend/*.go`）；可独立测试的子系统在 `backend/internal/` 下。
+一个文件一个关注点，文件过大时按职责继续拆（见 AGENTS.md 第 8 节）。
+
+### 2.1 `package main`（`backend/`）
 
 | 文件 | 职责 |
 | --- | --- |
 | `main.go` | 入口：环境解析 → 目录准备 → socket 绑定 → 信号等待 → 优雅退出；`appVersion`（`-ldflags` 注入）；`bootID` |
 | `config.go` | `RuntimeEnv`（全部来自环境变量）+ 默认值 |
-| `logging.go` | 极简日志：只记异常/失败（不记例行启动停止） |
-| `store.go` | 数据目录布局、原子 JSON 读写（tmp + rename）、会话配置 CRUD |
-| `crypto.go` | `master.key` 管理与 AES-256-GCM 字段加解密（密码 / 私钥 / 口令） |
+| `protocol.go` | 终端控制协议常量：OSC 控制帧、close 4001、历史/尺寸上限（与前端一对，见第 6 节） |
 | `hostkeys.go` | known_hosts 的 TOFU 记录（读写 + 指纹计算 + 匹配判断） |
 | `sshclient.go` | SSH 拨号：认证方式组装、主机密钥回调、超时、`ssh.Client` 生命周期 |
-| `sessions.go` | `SessionRuntime`（打开的会话）：终端 + SFTP 的容器、打开/关闭/列表/回收 |
+| `sessions.go` | 会话配置的管理：字段校验、保存/删除、测试连接、信任主机密钥 |
+| `sessions_runtime.go` | `sessionRuntime`（已打开的会话）：终端 + SFTP 的容器、打开/关闭/列表/回收 |
 | `terminal.go` | 单个终端：`ssh.Session` + PTY + 历史文件 + 单挂载点 attach/detach/resize |
-| `ws.go` | WebSocket 帧编解码（照抄 terminal 的实现，含上限与关闭码） |
-| `admin.go` | mux、路由、JSON 助手、错误码映射、SPA 与缓存头、base href 注入 |
-| `files.go` | SFTP 文件操作 API（list/mkdir/create/rename/remove/upload/upload-from-nas/download/read） |
+| `admin.go` | `AdminMux`、JSON 助手、会话/终端/主机密钥的 HTTP handler |
+| `admin_routes.go` | 路由表（路径 → handler）与 WebSocket 升级判定 |
+| `static.go` | SPA 回退、缓存头三分类、base href 注入、unix socket 绑定、网关身份 |
+| `sftp.go` | SFTP 会话生命周期、远程路径校验、SFTP 错误映射 |
+| `files.go` | 文件列表与信息（list / info） |
+| `files_write.go` | 新建文件 / 新建目录 / 重命名 / 删除 |
+| `files_upload.go` | 上传（本地文件、目录、飞牛文件） |
+| `files_download.go` | 下载（含目录打包 zip）与文本读取 |
+| `fileops.go` | 复制 / 移动 |
+| `archive.go` | 压缩 / 解压 |
+| `exportnas.go` | 导出至飞牛共享目录 |
 | `quickcmds.go` | 全局 + 会话专属快捷指令的持久化与 API |
-| `trimapi.go` | 飞牛开放 API 客户端（`trim.file.checkUserACL`） |
-| `testssh/` | **仅测试用**：进程内 SSH + SFTP 服务器（密码/密钥认证、PTY、sftp 子系统），供集成测试与本地联调 |
+| `trimapi.go` | `/api/trim/*` 的 HTTP 入口（客户端在 `internal/trimapi`） |
+| `credentials.go` | 「不保存凭据」会话的内存凭据 |
+| `remote_exec.go` | 远程命令 helper（exec 通道 + `shellQuote` + 超时 + ctx 取消） |
 | `*_test.go` | 单元/集成测试 |
+
+### 2.2 `internal/`（可独立测试的子系统）
+
+| 包 | 职责 |
+| --- | --- |
+| `internal/apierr/` | API 错误码与 JSON 响应：裸码契约、状态码映射、`ok/code/error` 信封 |
+| `internal/logx/` | 极简日志：只记异常/失败（不记例行启动停止） |
+| `internal/secret/` | `master.key` 管理与 AES-256-GCM 字段加解密（密码 / 私钥 / 口令） |
+| `internal/store/` | 数据目录布局、原子 JSON 读写（tmp + rename）、`Session`/`SessionView`/`SessionInput` |
+| `internal/trimapi/` | 飞牛开放 API 客户端（`trim.file.checkUserACL`） |
+| `internal/ws/` | WebSocket 帧编解码（含单帧/单消息上限） |
+| `internal/testssh/` | **仅测试用**：进程内 SSH + SFTP 服务器（密码/密钥认证、PTY、sftp 子系统），供集成测试与本地联调 |
 
 约束：
 
@@ -489,7 +515,7 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 `frontend/package.json`、`vite.config.ts`、`tsconfig.json`、`env.d.ts`、`index.html`、
 `src/main.ts`、`src/style.css`、`src/serverapi/index.ts`、`src/i18n/*`、`src/utils/*`、
 `src/composables/{useTheme,useViewportHeight,useMobileLayout}.ts`、`src/stores/sessionUi.ts`、
-`docs/CONTRACT.md`、`Makefile`、`.gitignore`、`fpk/*`、`backend/go.mod`（依赖已定）。
+`docs/CONTRACT.md`、`Makefile`、`.gitignore`、`backend/go.mod`（依赖已定）。
 
 需要新增 i18n key / 新增 API 字段 / 改 store 接口时：**先告诉 Lead**，不要自行改这些文件。
 （并行编辑同一文件必然互相覆盖。）

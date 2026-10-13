@@ -19,7 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"webssh/backend/internal/store"
 	"webssh/backend/internal/testssh"
+	"webssh/backend/internal/ws"
 )
 
 // ---------------------------------------------------------------------------
@@ -147,7 +149,7 @@ func newUnixClient(sock string) *http.Client {
 func (a *testApp) restart(t *testing.T) *testApp {
 	t.Helper()
 	// 模拟新进程：bootId 是进程级随机标识，重启必然不同。
-	bootID = newID()
+	bootID = store.NewID()
 	// 旧连接池里可能还连着上一个服务实例：必须丢掉（否则请求会打到已经「重启」过的进程上，
 	// 表现就是「重启后内存态居然还在」）。
 	a.client.CloseIdleConnections()
@@ -398,8 +400,8 @@ func (a *testApp) dialWS(t *testing.T, sid, tid string) *wsClient {
 	if res.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("WebSocket 握手失败：%s", res.Status)
 	}
-	if got := res.Header.Get("Sec-WebSocket-Accept"); got != wsAcceptKey(key) {
-		t.Fatalf("Sec-WebSocket-Accept = %q，期望 %q", got, wsAcceptKey(key))
+	if got := res.Header.Get("Sec-WebSocket-Accept"); got != ws.AcceptKey(key) {
+		t.Fatalf("Sec-WebSocket-Accept = %q，期望 %q", got, ws.AcceptKey(key))
 	}
 	w := &wsClient{t: t, conn: conn, br: br}
 	t.Cleanup(w.close)
@@ -419,14 +421,14 @@ func (w *wsClient) close() {
 // writeText 发送一条掩码文本帧（客户端 → 服务端必须掩码）。
 func (w *wsClient) writeText(payload string) {
 	w.t.Helper()
-	w.writeFrame(opText, []byte(payload))
+	w.writeFrame(ws.OpText, []byte(payload))
 }
 
 func (w *wsClient) writeFrame(op byte, payload []byte) {
 	w.writeFragment(op, payload, true)
 }
 
-// writeFragment 发送一帧，fin=false 表示后面还有续帧（opCont）。
+// writeFragment 发送一帧，fin=false 表示后面还有续帧（ws.OpContinuation）。
 func (w *wsClient) writeFragment(op byte, payload []byte, fin bool) {
 	w.t.Helper()
 	w.closeMu.Lock()
@@ -471,7 +473,7 @@ func maskFrameWith(op byte, payload []byte, fin bool) []byte {
 // readFrame 读一帧；超时返回 error。
 func (w *wsClient) readFrame(timeout time.Duration) (byte, []byte, error) {
 	_ = w.conn.SetReadDeadline(time.Now().Add(timeout))
-	op, _, payload, err := wsReadFrame(w.br)
+	op, _, payload, err := ws.ReadFrame(w.br)
 	return op, payload, err
 }
 
@@ -483,9 +485,9 @@ func (w *wsClient) readText(timeout time.Duration) (string, error) {
 			return "", err
 		}
 		switch op {
-		case opText, opBin:
+		case ws.OpText, ws.OpBinary:
 			return string(payload), nil
-		case opClose:
+		case ws.OpClose:
 			return "", io.EOF
 		}
 	}
@@ -558,7 +560,7 @@ func (w *wsClient) closeCode(timeout time.Duration) uint16 {
 		if err != nil {
 			w.t.Fatalf("等待关闭帧失败：%v", err)
 		}
-		if op == opClose {
+		if op == ws.OpClose {
 			if len(payload) < 2 {
 				return 0
 			}

@@ -22,8 +22,8 @@ func TestInfoResponse(t *testing.T) {
 	if rt["version"] != "test-version" {
 		t.Errorf("version = %v，期望 test-version", rt["version"])
 	}
-	if boot := strOf(rt, "bootId"); len(boot) != idLen {
-		t.Errorf("bootId = %q，期望 %d 位十六进制（前端靠它判断后端是否换进程）", boot, idLen)
+	if boot := strOf(rt, "bootId"); len(boot) != 32 {
+		t.Errorf("bootId = %q，期望 %d 位十六进制（前端靠它判断后端是否换进程）", boot, 32)
 	}
 	if rt["dataDir"] != a.renv.DataDir {
 		t.Errorf("dataDir = %v，期望 %v", rt["dataDir"], a.renv.DataDir)

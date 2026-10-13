@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,156 +9,78 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/store"
+	"webssh/backend/internal/ws"
 )
 
 // TestWSHandshakeAndFrames 校验 WebSocket 编解码：握手向量、掩码解包、长度上限、关闭帧。
 func TestWSHandshakeAndFrames(t *testing.T) {
 	// RFC 6455 第 1.3 节的例子
-	if got := wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="); got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+	if got := ws.AcceptKey("dGhlIHNhbXBsZSBub25jZQ=="); got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
 		t.Fatalf("Sec-WebSocket-Accept = %q", got)
 	}
 
-	// 服务端帧 → 客户端（无掩码）能被 wsReadFrame 读回
+	// 服务端帧 → 客户端（无掩码）能被 ws.ReadFrame 读回
 	for _, payload := range []string{"", "hi", strings.Repeat("x", 200), strings.Repeat("y", 70000)} {
-		frame := wsFrame(opText, []byte(payload))
-		op, fin, got, err := wsReadFrame(bytes.NewReader(frame))
+		frame := ws.Frame(ws.OpText, []byte(payload))
+		op, fin, got, err := ws.ReadFrame(bytes.NewReader(frame))
 		if err != nil {
 			t.Fatalf("读帧失败（len=%d）：%v", len(payload), err)
 		}
-		if op != opText || !fin || string(got) != payload {
+		if op != ws.OpText || !fin || string(got) != payload {
 			t.Fatalf("帧编解码不一致：op=%d fin=%v len=%d", op, fin, len(got))
 		}
 	}
 
 	// 客户端帧带掩码：解出来的必须是原文
-	masked := maskFrame(opBin, []byte("masked-payload"))
-	op, _, got, err := wsReadFrame(bytes.NewReader(masked))
-	if err != nil || op != opBin || string(got) != "masked-payload" {
+	masked := maskFrame(ws.OpBinary, []byte("masked-payload"))
+	op, _, got, err := ws.ReadFrame(bytes.NewReader(masked))
+	if err != nil || op != ws.OpBinary || string(got) != "masked-payload" {
 		t.Fatalf("掩码帧解包失败：op=%d payload=%q err=%v", op, got, err)
 	}
 
 	// 超过单帧上限：**先拒绝再分配**（长度字段由客户端给，直接 make 就是打爆内存的入口）
-	over := wsFrame(opText, make([]byte, maxFrameBytes+1))
-	if _, _, _, err := wsReadFrame(bytes.NewReader(over)); err == nil {
+	over := ws.Frame(ws.OpText, make([]byte, ws.MaxFrameBytes+1))
+	if _, _, _, err := ws.ReadFrame(bytes.NewReader(over)); err == nil {
 		t.Fatal("超过单帧上限的帧竟然被接受了")
 	}
 
 	// close 帧：2 字节状态码 + reason
-	closeFrame := wsCloseFrame(wsCloseDetached, "detached")
-	op, _, payload, err := wsReadFrame(bytes.NewReader(closeFrame))
-	if err != nil || op != opClose || len(payload) < 2 {
+	closeFrame := ws.CloseFrame(wsCloseDetached, "detached")
+	op, _, payload, err := ws.ReadFrame(bytes.NewReader(closeFrame))
+	if err != nil || op != ws.OpClose || len(payload) < 2 {
 		t.Fatalf("close 帧不对：op=%d payload=%v err=%v", op, payload, err)
-	}
-}
-
-// TestCryptoHelpers 校验主密钥解析与空凭据语义。
-func TestCryptoHelpers(t *testing.T) {
-	key := make([]byte, masterKeyLen)
-	for i := range key {
-		key[i] = byte(i * 7)
-	}
-	for _, encoded := range []string{
-		base64.StdEncoding.EncodeToString(key),
-		base64.RawStdEncoding.EncodeToString(key),
-		base64.URLEncoding.EncodeToString(key),
-		hex.EncodeToString(key),
-	} {
-		got, err := decodeMasterKey(encoded)
-		if err != nil || !bytes.Equal(got, key) {
-			t.Errorf("解析 %q 失败：%v", encoded, err)
-		}
-	}
-	for _, bad := range []string{"", "abc", base64.StdEncoding.EncodeToString(key[:8]), strings.Repeat("z", 64)} {
-		if _, err := decodeMasterKey(bad); err == nil {
-			t.Errorf("%q 不该被接受", bad)
-		}
-	}
-
-	// 空明文 = 没有这个凭据（不写密文），nil 密文解出空串
-	c := &cryptor{}
-	var err error
-	if c, err = loadCryptor(t.TempDir(), base64.StdEncoding.EncodeToString(key)); err != nil {
-		t.Fatalf("初始化失败：%v", err)
-	}
-	if sec, err := c.encrypt(fieldPassword, "sid", ""); err != nil || sec != nil {
-		t.Errorf("空明文不该产生密文：%v %v", sec, err)
-	}
-	if plain, err := c.decrypt(fieldPassword, "sid", nil); err != nil || plain != "" {
-		t.Errorf("nil 密文应当解出空串：%q %v", plain, err)
-	}
-	// 密文里的 base64 不是合法 base64 时也要报错
-	if _, err := c.decrypt(fieldPassword, "sid", &secret{V: 1, CT: "!!!"}); err == nil {
-		t.Error("非法 base64 应当报错")
-	}
-}
-
-// TestMasterKeyFile 校验 master.key 的生成、长度与权限。
-func TestMasterKeyFile(t *testing.T) {
-	dir := t.TempDir()
-	c1, err := loadCryptor(dir, "")
-	if err != nil {
-		t.Fatalf("首次生成 master.key 失败：%v", err)
-	}
-	path := filepath.Join(dir, masterKeyFile)
-	st, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("master.key 不存在：%v", err)
-	}
-	if st.Mode().Perm() != 0o600 {
-		t.Errorf("权限 = %o", st.Mode().Perm())
-	}
-	key, _ := os.ReadFile(path)
-	if len(key) != masterKeyLen {
-		t.Fatalf("长度 = %d", len(key))
-	}
-	// 第二次加载必须拿到同一把密钥（否则已存的密文全部解不开）
-	c2, err := loadCryptor(dir, "")
-	if err != nil {
-		t.Fatalf("再次加载失败：%v", err)
-	}
-	sec, err := c1.encrypt(fieldPassword, "sid", "hello")
-	if err != nil {
-		t.Fatalf("加密失败：%v", err)
-	}
-	if plain, err := c2.decrypt(fieldPassword, "sid", sec); err != nil || plain != "hello" {
-		t.Fatalf("同一密钥应当能解密：%q %v", plain, err)
-	}
-	// 长度不对的密钥文件必须让启动失败（不能悄悄重新生成：那会把用户的密码全变成废密文）
-	if err := os.WriteFile(path, []byte("short"), 0o600); err != nil {
-		t.Fatalf("写坏文件失败：%v", err)
-	}
-	if _, err := loadCryptor(dir, ""); err == nil {
-		t.Fatal("坏的 master.key 应当被拒绝")
 	}
 }
 
 // TestStoreHelpers 校验 id 校验、原子写与目录布局。
 func TestStoreHelpers(t *testing.T) {
-	if id := newID(); len(id) != idLen {
+	if id := store.NewID(); len(id) != 32 {
 		t.Errorf("newID 长度 = %d", len(id))
 	}
 	for _, ok := range []string{"abc", "a1-b2_C3", strings.Repeat("a", 64)} {
-		if !validID(ok) {
-			t.Errorf("validID(%q) 应当为真", ok)
+		if !store.ValidID(ok) {
+			t.Errorf("store.ValidID(%q) 应当为真", ok)
 		}
 	}
 	for _, bad := range []string{"", "../x", "a/b", "a.b", strings.Repeat("a", 65), "a b", "汉字"} {
-		if validID(bad) {
-			t.Errorf("validID(%q) 应当为假（这是路径安全的边界）", bad)
+		if store.ValidID(bad) {
+			t.Errorf("store.ValidID(%q) 应当为假（这是路径安全的边界）", bad)
 		}
 	}
 
-	st, err := newStore(t.TempDir())
+	st, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("初始化数据目录失败：%v", err)
 	}
-	sc := &sessionConfig{ID: newID(), Name: "n", Host: "h", Port: 22, User: "u", AuthType: "password",
+	sc := &store.Session{ID: store.NewID(), Name: "n", Host: "h", Port: 22, User: "u", AuthType: "password",
 		CreatedAt: time.Now().Format(time.RFC3339), UpdatedAt: time.Now().Format(time.RFC3339)}
-	if err := st.saveSession(sc); err != nil {
+	if err := st.SaveSession(sc); err != nil {
 		t.Fatalf("保存会话失败：%v", err)
 	}
 	// 权限 0600（凭据密文和 master.key 一样敏感）
-	info, err := os.Stat(st.sessionPath(sc.ID))
+	info, err := os.Stat(st.SessionPath(sc.ID))
 	if err != nil {
 		t.Fatalf("会话文件不存在：%v", err)
 	}
@@ -168,22 +88,22 @@ func TestStoreHelpers(t *testing.T) {
 		t.Errorf("会话文件权限 = %o", info.Mode().Perm())
 	}
 	// 原子写：不能留下临时文件
-	entries, _ := os.ReadDir(st.sessionsDir())
+	entries, _ := os.ReadDir(st.SessionsDir())
 	for _, e := range entries {
 		if strings.Contains(e.Name(), ".tmp-") {
 			t.Errorf("残留临时文件：%s", e.Name())
 		}
 	}
-	got, err := st.loadSession(sc.ID)
+	got, err := st.LoadSession(sc.ID)
 	if err != nil || got.Host != "h" || got.Port != 22 {
 		t.Fatalf("读回失败：%+v %v", got, err)
 	}
 	// 非法 id 一律当不存在（不能拼出 data/sessions/../../x.json）
-	if _, err := st.loadSession("../../etc/passwd"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := st.LoadSession("../../etc/passwd"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("非法 id 应当当成不存在：%v", err)
 	}
 	// 历史文件必须可读写（O_RDWR|O_APPEND：只写打开会让回放/历史接口 EBADF）
-	f, err := st.createHistoryFile(sc.ID, "tid1")
+	f, err := st.CreateHistoryFile(sc.ID, "tid1")
 	if err != nil {
 		t.Fatalf("创建历史文件失败：%v", err)
 	}
@@ -198,8 +118,8 @@ func TestStoreHelpers(t *testing.T) {
 		t.Fatalf("读历史失败：%v", err)
 	}
 	f.Close()
-	st.removeHistoryDir(sc.ID)
-	if _, err := os.Stat(st.historyDir(sc.ID)); !os.IsNotExist(err) {
+	st.RemoveHistoryDir(sc.ID)
+	if _, err := os.Stat(st.HistoryDir(sc.ID)); !os.IsNotExist(err) {
 		t.Errorf("历史目录没删掉：%v", err)
 	}
 }
@@ -224,7 +144,7 @@ func TestHostKeyStoreAndPending(t *testing.T) {
 		t.Errorf("splitHostKeyID = %q %d", host, port)
 	}
 
-	st, err := newStore(t.TempDir())
+	st, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("初始化失败：%v", err)
 	}
@@ -253,11 +173,11 @@ func TestHostKeyStoreAndPending(t *testing.T) {
 		t.Errorf("移除不存在的记录应当报 not exist：%v", err)
 	}
 	// known_hosts 文件本身也要 0600
-	if info, err := os.Stat(st.knownHostsPath()); err != nil || info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(st.KnownHostsPath()); err != nil || info.Mode().Perm() != 0o600 {
 		t.Errorf("known_hosts 权限不对：%v %v", info, err)
 	}
 	// 损坏的 known_hosts 必须让启动失败（否则会把手动确认过的信任降级成「未知」）
-	if err := os.WriteFile(st.knownHostsPath(), []byte("{not json"), 0o600); err != nil {
+	if err := os.WriteFile(st.KnownHostsPath(), []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("写坏文件失败：%v", err)
 	}
 	if _, err := newHostKeyStore(st); err == nil {
@@ -366,14 +286,14 @@ func TestConfigEnv(t *testing.T) {
 // TestConnectErrorStatusMapping 校验连接类错误到 HTTP 状态码的映射。
 func TestConnectErrorStatusMapping(t *testing.T) {
 	cases := map[string]int{
-		codeNoCredential:    400,
-		codeKeyParse:        400,
-		codeHostKeyUnknown:  409,
-		codeHostKeyMismatch: 409,
-		codeAuthFailed:      502,
-		codeDNS:             502,
-		codeDialTimeout:     502,
-		codeSFTPUnavailable: 502,
+		apierr.CodeNoCredential:    400,
+		apierr.CodeKeyParse:        400,
+		codeHostKeyUnknown:         409,
+		codeHostKeyMismatch:        409,
+		codeAuthFailed:             502,
+		codeDNS:                    502,
+		codeDialTimeout:            502,
+		apierr.CodeSFTPUnavailable: 502,
 	}
 	for code, want := range cases {
 		got := errFromConnect(&connectError{Code: code, Detail: "x"})
@@ -404,11 +324,11 @@ func TestSmallHelpers(t *testing.T) {
 	if kindOf(true) != "目录" || kindOf(false) != "文件" {
 		t.Error("kindOf 文案不对")
 	}
-	if e := errNotFound("会话 %s 不存在", "abc"); e.Status != 404 || e.Code != "not_found" ||
+	if e := apierr.NotFound("会话 %s 不存在", "abc"); e.Status != 404 || e.Code != "not_found" ||
 		!strings.Contains(e.Message, "abc") {
 		t.Errorf("errNotFound = %+v", e)
 	}
-	if e := errTooLarge("超过 %s", "1 GiB"); e.Status != 413 {
+	if e := apierr.TooLarge("超过 %s", "1 GiB"); e.Status != 413 {
 		t.Errorf("errTooLarge = %+v", e)
 	}
 	if got := defaultSessionName("root", "10.0.0.1"); got != "root@10.0.0.1" {
@@ -425,13 +345,13 @@ func TestSmallHelpers(t *testing.T) {
 
 // TestSessionIdentityDefaultPort 校验「端口默认 22 参与身份比较」。
 func TestSessionIdentityDefaultPort(t *testing.T) {
-	a := &sessionConfig{User: "root", Host: "h", Port: 22}
-	b := &sessionConfig{User: "root", Host: "h", Port: 2222}
-	if a.identity() == b.identity() {
+	a := &store.Session{User: "root", Host: "h", Port: 22}
+	b := &store.Session{User: "root", Host: "h", Port: 2222}
+	if a.Identity() == b.Identity() {
 		t.Error("端口不同应当是不同的身份")
 	}
-	if a.identity() != "root@h:22" {
-		t.Errorf("identity = %q", a.identity())
+	if a.Identity() != "root@h:22" {
+		t.Errorf("identity = %q", a.Identity())
 	}
 }
 

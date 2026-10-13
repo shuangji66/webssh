@@ -13,6 +13,10 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/logx"
+	"webssh/backend/internal/store"
+	"webssh/backend/internal/ws"
 )
 
 // 下面这对是「shell 已退出」的终端在服务端的保留时长（契约第 4.4 节）：这段时间内挂载
@@ -79,7 +83,7 @@ type terminal struct {
 }
 
 // start 请求 PTY 并启动远程 shell。
-func (t *terminal) start(cols, rows uint16) *apiError {
+func (t *terminal) start(cols, rows uint16) *apierr.Error {
 	// TERM 必须是 xterm-256color：前端是 xterm.js，远端按它决定能力集（颜色 / 括号粘贴 /
 	// 光标形状）。设成 vt100 或空会让界面变成 8 色、方向键也不对。
 	modes := ssh.TerminalModes{
@@ -88,11 +92,11 @@ func (t *terminal) start(cols, rows uint16) *apiError {
 		ssh.TTY_OP_OSPEED: 14400,
 	}
 	if err := t.sess.RequestPty("xterm-256color", int(rows), int(cols), modes); err != nil {
-		return errShellFailed("远端拒绝分配 PTY：%v", err)
+		return apierr.ShellFailed("远端拒绝分配 PTY：%v", err)
 	}
 	stdin, err := t.sess.StdinPipe()
 	if err != nil {
-		return errShellFailed("无法创建 stdin 管道：%v", err)
+		return apierr.ShellFailed("无法创建 stdin 管道：%v", err)
 	}
 	// stdout 与 stderr 接到**同一个** pipe：带 PTY 时远端一般已把 stderr 合并进 stdout，
 	// 但扩展数据（以及没开 PTY 的远端实现）仍可能走 stderr 通道；分两条流收到一起会让
@@ -108,7 +112,7 @@ func (t *terminal) start(cols, rows uint16) *apiError {
 	t.stdin = stdin
 	t.out = pr
 	if err := t.sess.Shell(); err != nil {
-		return errShellFailed("无法启动远程 shell：%v", err)
+		return apierr.ShellFailed("无法启动远程 shell：%v", err)
 	}
 	go t.watchExit(pw)
 	return nil
@@ -121,7 +125,7 @@ func (t *terminal) start(cols, rows uint16) *apiError {
 // 「关闭过程中的 EOF / ErrClosed 一律视为正常终止」，所以这里只在真正意外时报一条日志。
 func (t *terminal) watchExit(out *io.PipeWriter) {
 	if err := t.sess.Wait(); err != nil && !isNormalSessionEnd(err) {
-		warnf("终端 %s 的 SSH 会话异常结束：%v", t.id, err)
+		logx.Warnf("终端 %s 的 SSH 会话异常结束：%v", t.id, err)
 	}
 	_ = out.Close()
 }
@@ -149,7 +153,7 @@ func (t *terminal) pump() {
 					_, _ = t.hist.Write(chunk)
 				}
 				if c := t.mounted(); c != nil {
-					t.writeConn(c, wsFrame(opText, chunk))
+					t.writeConn(c, ws.Frame(ws.OpText, chunk))
 				}
 			}
 			t.histMu.Unlock()
@@ -173,8 +177,8 @@ func (t *terminal) pump() {
 			_, _ = t.hist.Write(note)
 		}
 		if c := t.mounted(); c != nil {
-			t.writeConn(c, wsFrame(opText, note))
-			t.writeConn(c, wsFrame(opText, []byte(oscExit)))
+			t.writeConn(c, ws.Frame(ws.OpText, note))
+			t.writeConn(c, ws.Frame(ws.OpText, []byte(oscExit)))
 		}
 	}
 	t.histMu.Unlock()
@@ -195,13 +199,13 @@ func (t *terminal) isOwner(c net.Conn) bool {
 	return t.conn != nil && t.conn == c
 }
 
-// writeConn 向已挂载连接写一帧，带写超时（见 connWriteTimeout）。调用方必须持有 histMu。
+// writeConn 向已挂载连接写一帧，带写超时（见 ws.WriteTimeout）。调用方必须持有 histMu。
 //
 // 超时/出错说明该端已不读数据：解除挂载 + 关掉连接（让对端若还活着就立刻看到「连接已
 // 关闭」，而不是停在「看着连着、其实没输出」），绝不让一次失联的写把 histMu 长期占住——
 // 否则同终端的挂载与 history 接口会被一起堵死。
 func (t *terminal) writeConn(c net.Conn, frame []byte) {
-	if err := writeFramed(c, frame); err != nil {
+	if err := ws.WriteFramed(c, frame); err != nil {
 		t.detach(c)
 		_ = c.Close()
 	}
@@ -228,7 +232,7 @@ func (t *terminal) attach(c net.Conn) (net.Conn, error) {
 					n, rerr := t.hist.Read(chunk)
 					if n > 0 {
 						// 回放同样带写超时：新端不读数据时不能让 histMu 一直被占着。
-						if werr := writeFramed(c, wsFrame(opText, chunk[:n])); werr != nil {
+						if werr := ws.WriteFramed(c, ws.Frame(ws.OpText, chunk[:n])); werr != nil {
 							return nil, werr
 						}
 					}
@@ -239,13 +243,13 @@ func (t *terminal) attach(c net.Conn) (net.Conn, error) {
 			}
 		}
 	}
-	if err := writeFramed(c, wsFrame(opText, []byte(oscReady))); err != nil {
+	if err := ws.WriteFramed(c, ws.Frame(ws.OpText, []byte(oscReady))); err != nil {
 		return nil, err
 	}
 	// 已经退出的终端：历史里只有「[process exited]」这段文本，控制帧没写进历史文件。
 	// 不补一帧 oscExit 的话，重新挂载的客户端会以为 shell 还活着（看不到退出提示）。
 	if t.isExited() {
-		if err := writeFramed(c, wsFrame(opText, []byte(oscExit))); err != nil {
+		if err := ws.WriteFramed(c, ws.Frame(ws.OpText, []byte(oscExit))); err != nil {
 			return nil, err
 		}
 	}
@@ -277,8 +281,8 @@ func (t *terminal) kickDetached(c net.Conn) {
 	t.histMu.Lock()
 	defer t.histMu.Unlock()
 	_ = c.SetWriteDeadline(time.Now().Add(time.Second))
-	_, _ = c.Write(wsFrame(opText, []byte(oscDetached)))
-	_, _ = c.Write(wsCloseFrame(wsCloseDetached, "detached"))
+	_, _ = c.Write(ws.Frame(ws.OpText, []byte(oscDetached)))
+	_, _ = c.Write(ws.CloseFrame(wsCloseDetached, "detached"))
 	_ = c.Close()
 }
 
@@ -413,7 +417,7 @@ func (t *terminal) close() {
 			_ = t.hist.Close()
 			t.hist = nil
 			if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
-				warnf("删除终端历史文件 %s 失败：%v", name, err)
+				logx.Warnf("删除终端历史文件 %s 失败：%v", name, err)
 			}
 		}
 		t.histMu.Unlock()
@@ -457,7 +461,7 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	if proto != "" {
 		protoHdr = "\r\nSec-WebSocket-Protocol: " + proto
 	}
-	if _, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAcceptKey(key) + protoHdr + "\r\n\r\n")); err != nil {
+	if _, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws.AcceptKey(key) + protoHdr + "\r\n\r\n")); err != nil {
 		_ = conn.Close()
 		return
 	}
@@ -469,8 +473,8 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// gone 分支：文本帧给人看（非本前端的客户端也能看懂），末尾的 oscGone 给前端判定用。
 	gone := func(detail string) {
 		frame := []byte("\r\n\x1b[31m" + detail + "\x1b[0m\r\n" + oscGone)
-		_ = writeFramed(conn, wsFrame(opText, frame))
-		_ = writeFramed(conn, wsCloseFrame(1000, "gone"))
+		_ = ws.WriteFramed(conn, ws.Frame(ws.OpText, frame))
+		_ = ws.WriteFramed(conn, ws.CloseFrame(1000, "gone"))
 		_ = conn.Close()
 	}
 
@@ -487,7 +491,7 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 			gone("新建终端失败：" + apiErr.Message)
 			return
 		}
-		if err := writeFramed(conn, wsFrame(opText, []byte("\x1b]tid;"+t.id+"\x07"))); err != nil {
+		if err := ws.WriteFramed(conn, ws.Frame(ws.OpText, []byte("\x1b]tid;"+t.id+"\x07"))); err != nil {
 			// 挂载失败（多半是写不出去）：这个终端已经没人能认领了（id 虽然发出过，
 			// 但连接已坏、前端拿不到），直接回收，避免表里留一个孤儿终端。
 			t.close()
@@ -503,7 +507,7 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		target = t
 	} else {
-		if !validID(tid) {
+		if !store.ValidID(tid) {
 			gone("终端不存在")
 			return
 		}
@@ -530,18 +534,18 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// 按 FIN 位累积成完整消息后再处理，避免长粘贴被截断。
 	var msgBuf []byte
 	for {
-		op, fin, payload, rerr := wsReadFrame(brw)
+		op, fin, payload, rerr := ws.ReadFrame(brw)
 		if rerr != nil {
 			break
 		}
 		switch op {
-		case opText, opBin, opCont:
-			if op != opCont {
+		case ws.OpText, ws.OpBinary, ws.OpContinuation:
+			if op != ws.OpContinuation {
 				msgBuf = msgBuf[:0]
 			}
 			// 分片累积也要有上限：否则客户端可以无限续帧，msgBuf 会一直涨到进程 OOM。
-			if len(msgBuf)+len(payload) > maxMessageBytes {
-				warnf("终端 %s 收到超长消息（>%d 字节），断开该连接", target.id, maxMessageBytes)
+			if len(msgBuf)+len(payload) > ws.MaxMessageBytes {
+				logx.Warnf("终端 %s 收到超长消息（>%d 字节），断开该连接", target.id, ws.MaxMessageBytes)
 				goto done
 			}
 			msgBuf = append(msgBuf, payload...)
@@ -549,9 +553,9 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			handleClientMessage(target, conn, msgBuf)
-		case opPing:
-			_ = writeFramed(conn, wsFrame(opPong, payload))
-		case opClose:
+		case ws.OpPing:
+			_ = ws.WriteFramed(conn, ws.Frame(ws.OpPong, payload))
+		case ws.OpClose:
 			goto done
 		}
 	}
@@ -580,14 +584,14 @@ func handleClientMessage(t *terminal, c net.Conn, msg []byte) {
 			return
 		}
 		if err := t.resize(c, uint16(cols), uint16(rows)); err != nil && !errors.Is(err, errNotOwner) {
-			warnf("终端 %s 调整尺寸失败：%v", t.id, err)
+			logx.Warnf("终端 %s 调整尺寸失败：%v", t.id, err)
 		}
 	case strings.HasPrefix(s, "\x1b]ping") && strings.HasSuffix(s, "\x07"):
 		// 心跳：只用来让代理 / NAT 别把空闲连接断掉，不写入 PTY。
 	default:
 		// 非操作端的残留输入在服务端丢弃（见 writeInput 的说明）。
 		if err := t.writeInput(c, msg); err != nil && !errors.Is(err, errNotOwner) {
-			warnf("终端 %s 写入输入失败：%v", t.id, err)
+			logx.Warnf("终端 %s 写入输入失败：%v", t.id, err)
 		}
 	}
 }

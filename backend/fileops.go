@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/pkg/sftp"
+	"webssh/backend/internal/apierr"
 )
 
 // ---------------------------------------------------------------------------
@@ -52,7 +53,7 @@ type fsOpResult struct {
 }
 
 // handleFsCopy 远端内部复制（SFTP 读 + 写）。
-func (m *AdminMux) handleFsCopy(w http.ResponseWriter, r *http.Request) *apiError {
+func (m *AdminMux) handleFsCopy(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req fsOpRequest
 	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
 		return apiErr
@@ -106,7 +107,7 @@ func (m *AdminMux) handleFsCopy(w http.ResponseWriter, r *http.Request) *apiErro
 	if res.Files == nil {
 		res.Files = []uploadedFile{}
 	}
-	return respond(w, map[string]any{"ok": true, "files": res.Files, "skipped": res.Skipped})
+	return apierr.Respond(w, map[string]any{"ok": true, "files": res.Files, "skipped": res.Skipped})
 }
 
 // handleFsMove 远端内部移动（优先 SFTP Rename）。
@@ -115,7 +116,7 @@ func (m *AdminMux) handleFsCopy(w http.ResponseWriter, r *http.Request) *apiErro
 // （sshd 的 sftp-server 只会回一个笼统的 SSH_FX_FAILURE），所以这里没法精确区分。**绝不**
 // 因此静默降级成「复制 + 删除」：那会在中途失败时留下两份数据或一份都没有，而用户以为
 // 移动成功了。失败就是把真实原因（尽可能全）报出来，让用户改用复制。
-func (m *AdminMux) handleFsMove(w http.ResponseWriter, r *http.Request) *apiError {
+func (m *AdminMux) handleFsMove(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req fsOpRequest
 	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
 		return apiErr
@@ -171,7 +172,7 @@ func (m *AdminMux) handleFsMove(w http.ResponseWriter, r *http.Request) *apiErro
 	if res.Files == nil {
 		res.Files = []uploadedFile{}
 	}
-	return respond(w, map[string]any{"ok": true, "files": res.Files, "skipped": res.Skipped})
+	return apierr.Respond(w, map[string]any{"ok": true, "files": res.Files, "skipped": res.Skipped})
 }
 
 // requireRemoteDir 解析并校验「目标目录」。
@@ -302,11 +303,11 @@ func copyRemoteFile(ctx context.Context, c *sftp.Client, src, dest string, fi os
 // 权限类失败直接报 permission（这是最常见、也最需要用户去改权限的一种）；其余一律报
 // conflict + 一段把「跨设备」这个最可能的原因写清楚的文案——SFTP 层拿不到 errno，
 // 硬猜一个更具体的码只会误导。
-func moveFailure(src, dest string, err error) *apiError {
+func moveFailure(src, dest string, err error) *apierr.Error {
 	msg := err.Error()
 	if errors.Is(err, os.ErrPermission) || looksLikePermission(msg) {
-		return errPermission("移动失败：%s → %s（%v）", src, dest, err)
+		return apierr.Permission("移动失败：%s → %s（%v）", src, dest, err)
 	}
-	return errConflict("移动失败：%s → %s（%v）。如果两者不在同一个文件系统（例如不同挂载卷），"+
+	return apierr.Conflict("移动失败：%s → %s（%v）。如果两者不在同一个文件系统（例如不同挂载卷），"+
 		"SFTP 的 Rename 无法跨设备移动，请改用「复制」再删除源文件。", src, dest, err)
 }

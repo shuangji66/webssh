@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"webssh/backend/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -52,7 +53,7 @@ type hostKeyView struct {
 
 type hostKeyStore struct {
 	mu    sync.Mutex
-	st    *store
+	st    *store.Store
 	hosts map[string]hostKeyRecord
 }
 
@@ -77,10 +78,10 @@ func splitHostKeyID(id string) (string, int) {
 	return host, port
 }
 
-func newHostKeyStore(st *store) (*hostKeyStore, error) {
+func newHostKeyStore(st *store.Store) (*hostKeyStore, error) {
 	h := &hostKeyStore{st: st, hosts: map[string]hostKeyRecord{}}
 	var f knownHostsFile
-	err := st.readJSON(st.knownHostsPath(), &f)
+	err := st.ReadJSON(st.KnownHostsPath(), &f)
 	switch {
 	case err == nil:
 		if f.Hosts != nil {
@@ -92,7 +93,7 @@ func newHostKeyStore(st *store) (*hostKeyStore, error) {
 		// 文件存在但读不了 / 解析失败：**不能**当成「没有信任记录」继续跑，
 		// 否则下次连接会把 hostkey_mismatch 降级成 hostkey_unknown，用户被引导着
 		// 重新信任一把可疑的密钥。这里直接把错误抛给启动流程。
-		return nil, fmt.Errorf("读取 %s 失败：%w", st.knownHostsPath(), err)
+		return nil, fmt.Errorf("读取 %s 失败：%w", st.KnownHostsPath(), err)
 	}
 	return h, nil
 }
@@ -148,7 +149,7 @@ func (h *hostKeyStore) list() []hostKeyView {
 }
 
 func (h *hostKeyStore) flushLocked() error {
-	return h.st.writeJSON(h.st.knownHostsPath(), knownHostsFile{Version: 1, Hosts: h.hosts}, 0o600)
+	return h.st.WriteJSON(h.st.KnownHostsPath(), knownHostsFile{Version: 1, Hosts: h.hosts}, 0o600)
 }
 
 // recordOf 把本次握手看到的主机密钥转成记录形态。

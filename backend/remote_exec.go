@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/logx"
 )
 
 // ---------------------------------------------------------------------------
@@ -110,7 +112,7 @@ const maxErrLinesRunes = 300
 //
 // 返回的 error 只表示**基础设施失败**（拨号 / 开会话通道 / 超时取消）；远端命令退出码非 0
 // 不是 error，它放在 remoteResult.Code 里，由调用方决定怎么翻译成错误码。
-func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteResult, *apiError) {
+func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteResult, *apierr.Error) {
 	cfg, ok := r.config()
 	if !ok {
 		return remoteResult{}, errSessionGone("会话不存在：%s", r.id)
@@ -131,17 +133,17 @@ func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteR
 
 	sess, err := res.client.NewSession()
 	if err != nil {
-		return remoteResult{}, errShellFailed("无法打开 SSH 会话通道：%v", err)
+		return remoteResult{}, apierr.ShellFailed("无法打开 SSH 会话通道：%v", err)
 	}
 	defer sess.Close()
 
 	stdout, err := sess.StdoutPipe()
 	if err != nil {
-		return remoteResult{}, errShellFailed("无法创建 stdout 管道：%v", err)
+		return remoteResult{}, apierr.ShellFailed("无法创建 stdout 管道：%v", err)
 	}
 	stderr, err := sess.StderrPipe()
 	if err != nil {
-		return remoteResult{}, errShellFailed("无法创建 stderr 管道：%v", err)
+		return remoteResult{}, apierr.ShellFailed("无法创建 stderr 管道：%v", err)
 	}
 
 	var outBuf, errBuf limitedBuffer
@@ -151,7 +153,7 @@ func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteR
 	go func() { defer copied.Done(); _, _ = io.Copy(&errBuf, stderr) }()
 
 	if err := sess.Start("sh -c " + shellQuote(command)); err != nil {
-		return remoteResult{}, errShellFailed("无法在远端执行命令：%v", err)
+		return remoteResult{}, apierr.ShellFailed("无法在远端执行命令：%v", err)
 	}
 
 	waited := make(chan error, 1)
@@ -176,7 +178,7 @@ func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteR
 				// *ExitMissingError：远端没回 exit-status（连接被掐、sshd 崩了）。
 				// 当成「失败但原因未知」，同时留一条日志，否则这类问题在服务端毫无痕迹。
 				code = -1
-				warnf("会话 %s 的远程命令没有拿到退出状态：%v", r.id, err)
+				logx.Warnf("会话 %s 的远程命令没有拿到退出状态：%v", r.id, err)
 			}
 		}
 		return remoteResult{Stdout: outBuf.String(), Stderr: errBuf.String(), Code: code, Truncated: outBuf.truncated || errBuf.truncated}, nil
@@ -188,9 +190,9 @@ func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteR
 		_ = sess.Close()
 		_ = res.client.Close()
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return remoteResult{}, failErr(504, "internal", "远程命令超过 %s 还没结束，已终止", remoteCommandTimeout)
+			return remoteResult{}, apierr.Fail(504, "internal", "远程命令超过 %s 还没结束，已终止", remoteCommandTimeout)
 		}
-		return remoteResult{}, errAborted("远程命令已取消")
+		return remoteResult{}, apierr.Aborted("远程命令已取消")
 	}
 }
 

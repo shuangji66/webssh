@@ -2,6 +2,8 @@ package main
 
 import (
 	"strings"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -25,7 +27,7 @@ import (
 //
 // 刻意用值类型 + 一个方法集很小的结构：它会被复制进 dialRequest，不共享可变状态。
 // 注意它**没有 String() 方法**，也不实现 fmt.Stringer——那正是「一不小心就把密码打进
-// 日志」的入口（`warnf("%v", cred)`）。
+// 日志」的入口（`logx.Warnf("%v", cred)`）。
 type memoryCredential struct {
 	password   string
 	privateKey string
@@ -125,7 +127,7 @@ func (m *sessionManager) dropAllCachedCredentials() {
 }
 
 // storedCredential 解密落盘的那份凭据。
-func (m *sessionManager) storedCredential(sc *sessionConfig) (memoryCredential, *apiError) {
+func (m *sessionManager) storedCredential(sc *store.Session) (memoryCredential, *apierr.Error) {
 	p, k, pp, apiErr := m.credentials(sc)
 	if apiErr != nil {
 		return memoryCredential{}, apiErr
@@ -138,21 +140,21 @@ func (m *sessionManager) storedCredential(sc *sessionConfig) (memoryCredential, 
 // 优先级：请求里的（用户当场输入，最权威）→ 落盘的 → 内存缓存 → 都没有就
 // `credential_required`（409）。最后这一步正是「不保存凭据时必须每次输入」的判据：
 // 前端拿到它就去弹凭据输入框，填完再 open 一次。
-func (m *sessionManager) resolveCredential(sc *sessionConfig, req openCredentials) (memoryCredential, *apiError) {
+func (m *sessionManager) resolveCredential(sc *store.Session, req openCredentials) (memoryCredential, *apierr.Error) {
 	if req.provided() {
 		mc := req.credential()
 		if !mc.hasAuthCredential(sc.AuthType) {
-			return memoryCredential{}, errCredentialRequired("请求里带了凭据，但缺少该会话认证方式（%s）需要的那一项", sc.AuthType)
+			return memoryCredential{}, apierr.CredentialRequired("请求里带了凭据，但缺少该会话认证方式（%s）需要的那一项", sc.AuthType)
 		}
 		return mc, nil
 	}
-	if sc.credentialsSaved() {
+	if sc.CredentialsSaved() {
 		return m.storedCredential(sc)
 	}
 	if mc, ok := m.cachedCredential(sc.ID); ok {
 		return mc, nil
 	}
-	return memoryCredential{}, errCredentialRequired("会话「%s」没有保存凭据，请在打开时输入%s", sc.Name, credentialKindName(sc.AuthType))
+	return memoryCredential{}, apierr.CredentialRequired("会话「%s」没有保存凭据，请在打开时输入%s", sc.Name, credentialKindName(sc.AuthType))
 }
 
 // dialCredential 给「终端 / SFTP / 远程命令」用的凭据解析：没有请求体，凭据只能来自
@@ -160,14 +162,14 @@ func (m *sessionManager) resolveCredential(sc *sessionConfig, req openCredential
 //
 // 与 resolveCredential 的差别只有一点：这里不会产生 credential_required（那个码是给
 // open 用的），拿不到凭据就报 no_credential —— 与「会话存了密码但字段被清空」是同一条路径。
-func (m *sessionManager) dialCredential(sc *sessionConfig) (memoryCredential, *apiError) {
-	if sc.credentialsSaved() {
+func (m *sessionManager) dialCredential(sc *store.Session) (memoryCredential, *apierr.Error) {
+	if sc.CredentialsSaved() {
 		return m.storedCredential(sc)
 	}
 	if mc, ok := m.cachedCredential(sc.ID); ok {
 		return mc, nil
 	}
-	return memoryCredential{}, errNoCredential("会话「%s」没有可用的凭据（它不保存凭据，且本进程内还没有人为它输入过）", sc.Name)
+	return memoryCredential{}, apierr.NoCredential("会话「%s」没有可用的凭据（它不保存凭据，且本进程内还没有人为它输入过）", sc.Name)
 }
 
 // storedOrCachedCredential 给「没有请求体」的场景取一份凭据：先落盘、再内存缓存。
@@ -176,8 +178,8 @@ func (m *sessionManager) dialCredential(sc *sessionConfig) (memoryCredential, *a
 // 但会话可能正开着 / 刚开过，内存里有那份凭据——拿它去测比报「没有可用凭据」有用得多。
 // 什么都没有时返回空凭据，由调用方按连接失败处理（success=false + no_credential），
 // 而不是在这里报 HTTP 错误（连接测试的失败是结果、不是接口错误）。
-func (m *sessionManager) storedOrCachedCredential(sc *sessionConfig) (memoryCredential, *apiError) {
-	if sc.credentialsSaved() {
+func (m *sessionManager) storedOrCachedCredential(sc *store.Session) (memoryCredential, *apierr.Error) {
+	if sc.CredentialsSaved() {
 		return m.storedCredential(sc)
 	}
 	if mc, ok := m.cachedCredential(sc.ID); ok {

@@ -30,6 +30,13 @@
 - 每次构建都 `go clean -cache`：这是刻意的，保证 embed 资产的变化一定被编进去。
 - 改动前端后必须重新 `make`；只改源码不重新构建，二进制里跑的还是旧资源。
 - 静态资源缓存头**必须**保持三种分类（见第 4 节），改错会让用户永远拿到旧页面。
+- **飞牛应用包（fpk）的脚手架不在本仓库**：打包工程由 fpkstudio 维护
+  （`/vol1/@appshare/fpkstudio/projects/WebSSH`），本仓库只产出 `./webssh`，打包时把该二进制
+  放进工程的 `app/bin/`。该工程 `manifest` 的两个字段是「飞牛文件」功能的硬前提，改动前先看
+  第 4 节：`micro_app=true`（微应用 + JS SDK 宿主桥）、`disable_authorization_path=false`
+  （要用文件选择器拿授权）。`disable_authorization_path=true` 会让应用中心把本应用的
+  `trim.file.userAccess` 能力状态置成 `-1`，选择器点「确定」时授权接口直接回 `31003`
+  （界面「应用鉴权异常」）。
 
 ## 3. 并行开发的边界（冻结文件）
 
@@ -37,7 +44,7 @@
 `frontend/package.json`、`vite.config.ts`、`tsconfig.json`、`env.d.ts`、`index.html`、
 `src/main.ts`、`src/style.css`、`src/serverapi/index.ts`、`src/i18n/*`、`src/utils/*`、
 `src/composables/{useTheme,useViewportHeight,useMobileLayout}.ts`、`src/stores/sessionUi.ts`、
-`docs/CONTRACT.md`、`Makefile`、`.gitignore`、`fpk/*`、`backend/go.mod`（依赖清单）。
+`docs/CONTRACT.md`、`Makefile`、`.gitignore`、`backend/go.mod`（依赖清单）。
 
 需要新 i18n 文案、新 API 字段、改 store 签名时：**先改 `docs/CONTRACT.md` 并知会所有人**，
 再改实现。并行编辑同一文件必然互相覆盖。
@@ -56,7 +63,7 @@
   删 socket → **保留数据目录**（会话配置必须活过重启）。
 - `bootID`（每次启动随机）经 `/api/info` 下发，前端据此判断「后端换进程了 → 内存态会话全没了」。
 
-**路由与静态资源（`admin.go`）**
+**路由与静态资源（`admin.go` / `admin_routes.go` / `static.go`）**
 
 - `GET /api/info`、`/api/sessions`、`/api/hostkeys`、`/api/trim/status` 之外，**带参数的接口一律
   POST + JSON body**。原因：「查询串在网关/反代链路上不保证原样送达」是实测过的坑，
@@ -68,7 +75,7 @@
 - `index.html` 的 base 注入：`<base href="<baseurl>/">` + 把 `./assets/` 改写成
   `<baseurl>/assets/`。`baseurl` 为空时两者都不做。
 
-**会话与终端（`sessions.go` / `terminal.go`）**
+**会话与终端（`sessions.go` / `sessions_runtime.go` / `terminal.go`）**
 
 - 会话配置（磁盘）与「已打开的会话」（内存 `SessionRuntime`）是两回事：
   `open` 幂等，`close` 才终止终端 + SFTP，进程重启后只有配置活着。
@@ -85,7 +92,7 @@
   回收后重新挂载会收到 `gone` 控制帧。
 - 浏览器断开**只解挂载**：终端继续跑、输出继续写历史文件，刷新后可重新挂载回放。
 
-**WebSocket（`ws.go`）**
+**WebSocket（`internal/ws`）**
 
 - 自实现帧编解码（握手用 `Sec-WebSocket-Accept`）。**必须有上限**：单帧 1 MiB、整条消息
   4 MiB、`resize` 行列 1–1000。客户端给的长度字段直接决定内存分配，没有上限就是一个
@@ -94,7 +101,7 @@
 - 「会话/终端不存在」要附 `\x1b]gone\x07` 控制帧，前端**只认这个**——
   用人类可读文本（如 `session not found`）判定会被终端里 `echo` 出来的同样文本误判。
 
-**文件（`files.go`）**
+**文件（`sftp.go` / `files.go` / `files_write.go` / `files_upload.go` / `files_download.go`）**
 
 - 目标路径一律 `path.Clean` 并拒绝 `..` 逃逸；`remove` 的 `dir` 参数必须与真实类型一致
   （不然会误删整棵树）。
@@ -122,7 +129,7 @@
 - 压缩/解压/导出的上限与取舍（条目数 2000、产物 4 GiB、软链接跳过、跨设备 move 报 conflict）
   都写在 `docs/CONTRACT.md` 第 12.1 节，改之前先读。
 
-**数据与凭据（`store.go` / `crypto.go` / `hostkeys.go`）**
+**数据与凭据（`internal/store` / `internal/secret` / `hostkeys.go`）**
 
 - 所有落盘写操作：互斥锁串行 + tmp 文件 + `rename` 原子替换。
 - 凭据三字段（password/privateKey/passphrase）用 AES-256-GCM 加密，AAD 绑定
@@ -201,7 +208,7 @@
   关闭单个终端要先确认（会终止远端 shell）。卡片右上角是三个仅图标按钮，不标注认证方式，
   也不显示状态灯/时间。终端状态点的配色只有一份：`terminals.termStatusDotClass()`。
 - **清空会话名**：后端 `save` 里「显式空串 = 清除、字段缺省 = 保持原值」（与凭据/备注同一套）；
-  展示名统一走 `sessionConfig.displayName()` / 前端 `sessionLabel()`（空 → `user@host`）。
+  展示名统一走 `store.Session.DisplayName()` / 前端 `sessionLabel()`（空 → `user@host`）。
   `home.renameSession` **只发 `{id, name}`**，不要把本地缓存的 host/user/authType 回传——
   那会覆盖别的设备刚做的改动。
 - **压缩包的输出目录在远程主机上**（`/tmp/webssh-archive`，`WEBSSH_ARCHIVE_DIR` 可换）：
@@ -273,7 +280,7 @@
 | C→S | `\x1b]resize;<cols>;<rows>\x07` | 调整 PTY 尺寸 |
 | C→S | `\x1b]ping\x07` | 心跳（不写 PTY） |
 
-后端 `terminal.go` 的常量与前端 `serverapi/index.ts` 的常量是**一对**，改名/改值必须同步，
+后端 `protocol.go` 的常量与前端 `serverapi/index.ts` 的常量是**一对**，改名/改值必须同步，
 否则表现是「终端连上但完全没有输出」或「被顶掉不提示」。
 
 错误码同样是契约：后端返回裸码（`duplicate`、`hostkey_unknown`…），前端映射成 i18n 的

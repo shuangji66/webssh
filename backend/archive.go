@@ -9,6 +9,8 @@ import (
 	"path"
 	"strings"
 	"time"
+	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/logx"
 )
 
 // ---------------------------------------------------------------------------
@@ -37,14 +39,14 @@ const (
 // resolveArchiveFormat 校验请求里的 format：缺省（含空串）= tar.gz，也接受 zip，
 // 其余一律 invalid——**不猜**（例如把 "tgz" 当 tar.gz 收下）会让「前端发错了字段值」这类
 // 问题永远查不出来，而用户会以为「我选了 zip，出来的却是 tar.gz」。
-func resolveArchiveFormat(raw string) (string, *apiError) {
+func resolveArchiveFormat(raw string) (string, *apierr.Error) {
 	switch strings.TrimSpace(raw) {
 	case "", archiveFormatTarGz:
 		return archiveFormatTarGz, nil
 	case archiveFormatZip:
 		return archiveFormatZip, nil
 	default:
-		return "", errInvalid("不支持的压缩格式：%q（只支持 %s 与 %s）", raw, archiveFormatTarGz, archiveFormatZip)
+		return "", apierr.Invalid("不支持的压缩格式：%q（只支持 %s 与 %s）", raw, archiveFormatTarGz, archiveFormatZip)
 	}
 }
 
@@ -111,7 +113,7 @@ const archiveProbeUnwritable = 73
 // 探测放在远端 shell 里做（一次命令搞定，不用发两次）：
 // `-d` 与 `-w` 都要查：`-w` 判的是当前登录用户的实际权限（比在服务端猜 uid/权限位可靠），
 // `-d` 则保证配置成一个**文件**时也走回退分支，不会把文件当目录去打包。
-func (r *sessionRuntime) resolveArchiveDir(ctx context.Context, root string) (string, *apiError) {
+func (r *sessionRuntime) resolveArchiveDir(ctx context.Context, root string) (string, *apierr.Error) {
 	user := ""
 	if cfg, ok := r.config(); ok {
 		user = cfg.User
@@ -146,11 +148,11 @@ func (r *sessionRuntime) resolveArchiveDir(ctx context.Context, root string) (st
 		if dir := firstLine(res.Stdout); res.ok() && dir != "" {
 			return strings.TrimSpace(dir), nil
 		}
-		warnf("会话 %s 的归档目录探针没有结论（退出码 %d：%s），按配置目录继续", r.id, res.Code, res.diagnostic())
+		logx.Warnf("会话 %s 的归档目录探针没有结论（退出码 %d：%s），按配置目录继续", r.id, res.Code, res.diagnostic())
 		return root, nil
 	}
 	{
-		return "", errPermission(
+		return "", apierr.Permission(
 			"远端压缩包输出目录不可写：%s、%s、%s 都试过了（第三档是登录用户家目录下的隐藏目录）。"+
 				"压缩包是在**远程主机**上生成的，和运行本应用的机器无关；"+
 				"请给远端登录用户写权限，或用环境变量 WEBSSH_ARCHIVE_DIR 换一个可写目录。原始输出：%s",
@@ -191,7 +193,7 @@ func firstLine(out string) string {
 // handleFsCompress 把远程的若干条目打成 <archiveDir>/<name>.<ext>（契约 11.5 / 13.5）。
 //
 // format 决定用哪个工具与后缀：tar.gz（缺省，`tar -czf`）或 zip（`zip -qry`）。
-func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *apiError {
+func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req struct {
 		SID    string   `json:"sid"`
 		Paths  []string `json:"paths"`
@@ -205,13 +207,13 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	if root == "" {
 		// 正常配置下不会发生（有默认值），但配置被显式设成空串时要如实报错，
 		// 而不是拼出一个相对路径、把压缩包写进莫名其妙的目录。
-		return errInternal("未配置压缩包输出目录（WEBSSH_ARCHIVE_DIR）")
+		return apierr.Internal("未配置压缩包输出目录（WEBSSH_ARCHIVE_DIR）")
 	}
 	if len(req.Paths) == 0 {
-		return errInvalid("缺少 paths")
+		return apierr.Invalid("缺少 paths")
 	}
 	if len(req.Paths) > maxCompressItems {
-		return errInvalid("一次最多压缩 %d 个条目（本次 %d 个）：请改为压缩它们所在的目录", maxCompressItems, len(req.Paths))
+		return apierr.Invalid("一次最多压缩 %d 个条目（本次 %d 个）：请改为压缩它们所在的目录", maxCompressItems, len(req.Paths))
 	}
 	format, apiErr := resolveArchiveFormat(req.Format)
 	if apiErr != nil {
@@ -286,9 +288,9 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	// 意外巨大的包会把整个主机的临时空间吃掉，那比「这次压缩失败」严重得多。
 	if size > maxTransferBytes {
 		removeArchiveQuietly(rt, out)
-		return errTooLarge("压缩包超过单次上限 %s（实际 %s），已删除产物：请分批压缩", humanSize(maxTransferBytes), humanSize(size))
+		return apierr.TooLarge("压缩包超过单次上限 %s（实际 %s），已删除产物：请分批压缩", humanSize(maxTransferBytes), humanSize(size))
 	}
-	return respond(w, map[string]any{
+	return apierr.Respond(w, map[string]any{
 		"ok":      true,
 		"archive": map[string]any{"path": out, "size": size, "dir": archiveDir},
 	})
@@ -396,7 +398,7 @@ func prepareArchiveTarget(sess *sftpSession, out string) error {
 		return err
 	}
 	if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
-		return errInvalid("压缩包名字与一个已存在的目录重名：%s（请换个名字）", out)
+		return apierr.Invalid("压缩包名字与一个已存在的目录重名：%s（请换个名字）", out)
 	}
 	if err := sess.client.Remove(out); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -413,19 +415,19 @@ func prepareArchiveTarget(sess *sftpSession, out string) error {
 // 而它可能自带别的归档后缀（`docs.tar.gz`、`backup.zip`）。这时**换掉**而不是在后面再挂
 // 一个——`docs.tar.gz.zip` 这种名字看着就像出了问题。只有认识的后缀才换，
 // `notes.txt` 这种普通后缀保留（`notes.txt.zip` 是合理结果）。
-func archiveName(raw, format string) (string, *apiError) {
+func archiveName(raw, format string) (string, *apierr.Error) {
 	name := strings.TrimSpace(raw)
 	if name == "" {
 		name = "webssh-" + time.Now().Format("20060102-150405")
 	}
 	if len(name) > 128 {
-		return "", errInvalid("压缩包名字过长（最多 128 字符）")
+		return "", apierr.Invalid("压缩包名字过长（最多 128 字符）")
 	}
 	if strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
-		return "", errInvalid("压缩包名字不能包含路径分隔符：%q", raw)
+		return "", apierr.Invalid("压缩包名字不能包含路径分隔符：%q", raw)
 	}
 	if strings.ContainsFunc(name, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
-		return "", errInvalid("压缩包名字不能包含控制字符：%q", raw)
+		return "", apierr.Invalid("压缩包名字不能包含控制字符：%q", raw)
 	}
 	ext := archiveExtOf(format)
 	if !strings.HasSuffix(name, ext) {
@@ -434,7 +436,7 @@ func archiveName(raw, format string) (string, *apiError) {
 	// 只剩后缀的名字（".zip" / ".tar.gz"）会生成一个隐藏文件：用户在归档目录里列不出来，
 	// 只会看到「压缩成功了但找不到产物」。与其让他对着这一步发呆，不如当场拒绝。
 	if strings.TrimSuffix(name, ext) == "" {
-		return "", errInvalid("压缩包名字不能只有后缀：%q", raw)
+		return "", apierr.Invalid("压缩包名字不能只有后缀：%q", raw)
 	}
 	return name, nil
 }
@@ -459,7 +461,7 @@ func knownArchiveExt(name string) string {
 }
 
 // handleFsExtract 就地解压（契约 11.5）：dir 返回压缩包所在目录。
-func (m *AdminMux) handleFsExtract(w http.ResponseWriter, r *http.Request) *apiError {
+func (m *AdminMux) handleFsExtract(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req fsReq
 	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
 		return apiErr
@@ -503,7 +505,7 @@ func (m *AdminMux) handleFsExtract(w http.ResponseWriter, r *http.Request) *apiE
 		// -o：不加的话 unzip 会为每个同名文件交互式地问一句（远端没有 stdin，直接卡住超时）。
 		command = "unzip -o " + shellQuote(target) + " -d " + shellQuote(dir)
 	default:
-		return errArchiveUnsupported("不支持的压缩包格式：%s（只支持 tar 家族与 zip）", path.Base(target))
+		return apierr.ArchiveUnsupported("不支持的压缩包格式：%s（只支持 tar 家族与 zip）", path.Base(target))
 	}
 
 	res, runErr := rt.runRemote(r.Context(), command)
@@ -513,7 +515,7 @@ func (m *AdminMux) handleFsExtract(w http.ResponseWriter, r *http.Request) *apiE
 	if !res.ok() {
 		return archiveCommandError("解压失败", res)
 	}
-	return respond(w, map[string]any{"ok": true, "dir": dir})
+	return apierr.Respond(w, map[string]any{"ok": true, "dir": dir})
 }
 
 // archiveCommandError 把「tar/unzip 跑了但非 0 退出」翻成错误码。
@@ -522,7 +524,7 @@ func (m *AdminMux) handleFsExtract(w http.ResponseWriter, r *http.Request) *apiE
 // （有专门的文案），而不是一句笼统的内部错误。其余按输出里的权限字样区分 permission /
 // internal，并且**一定带上命令输出的关键行**——真正的原因就写在远端那条命令的输出里，
 // 隐掉它等于让用户去猜。
-func archiveCommandError(action string, res remoteResult) *apiError {
+func archiveCommandError(action string, res remoteResult) *apierr.Error {
 	detail := res.diagnostic()
 	if res.Truncated {
 		detail += "（输出过长已截断）"
@@ -532,11 +534,11 @@ func archiveCommandError(action string, res remoteResult) *apiError {
 	}
 	switch {
 	case res.Code == 127 || looksLikeMissingTool(detail):
-		return errNoArchiveTool("%s：远端主机上没有这个工具（%s）", action, detail)
+		return apierr.NoArchiveTool("%s：远端主机上没有这个工具（%s）", action, detail)
 	case looksLikePermission(detail):
-		return errPermission("%s：%s", action, detail)
+		return apierr.Permission("%s：%s", action, detail)
 	default:
-		return errInternal("%s：%s", action, detail)
+		return apierr.Internal("%s：%s", action, detail)
 	}
 }
 
@@ -567,12 +569,12 @@ func removeArchiveQuietly(rt *sessionRuntime, out string) {
 			return err
 		}
 		if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
-			warnf("清理压缩产物 %s 时发现它是目录，已跳过（不动用户数据）", out)
+			logx.Warnf("清理压缩产物 %s 时发现它是目录，已跳过（不动用户数据）", out)
 			return nil
 		}
 		return sess.client.Remove(out)
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		warnf("清理压缩产物 %s 失败：%v", out, err)
+		logx.Warnf("清理压缩产物 %s 失败：%v", out, err)
 	}
 }
