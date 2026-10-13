@@ -161,6 +161,8 @@ export const en: Record<string, string> = {
   session_full_files: 'Full file manager',
   session_crumb_root: 'Root',
   session_crumb_home: 'Home',
+  session_rename_title: 'Rename terminal tab',
+  session_rename_prompt: 'New name',
   session_close_confirm_title: 'Close terminal tab',
   session_close_confirm_msg: 'Close “{title}”? The terminal session and its remote shell will be terminated.',
   session_terminal_exited: 'Remote shell exited',
@@ -168,7 +170,6 @@ export const en: Record<string, string> = {
 
   // ===== terminal pane =====
   term_restoring: 'Restoring terminal history…',
-  term_heartbeat: '',
   term_closed: 'Connection closed. Reconnect or refresh to continue',
   term_ws_error: 'WebSocket error, or closed by fnOS',
   term_not_found: 'Terminal not found',
@@ -186,6 +187,7 @@ export const en: Record<string, string> = {
   term_labels_expand: 'Expand labels',
   term_search_prev: 'Previous',
   term_search_next: 'Next',
+  term_rename_failed: 'Rename failed: {error}',
   term_keypad_prev_page: 'Previous page',
   term_keypad_next_page: 'Next page',
 
@@ -230,6 +232,9 @@ export const en: Record<string, string> = {
   files_open_terminal_here: 'Open terminal here',
   files_download_started: 'Downloading “{name}”',
   files_download_failed: 'Download failed: {error}',
+  files_preview_binary: 'This file is not text and cannot be previewed',
+  files_preview_title: 'Preview: {name}',
+  files_preview_failed: 'Failed to read the file: {error}',
   files_symlink: 'symlink',
   files_broken_symlink: 'broken symlink',
   files_dir: 'Directory',
@@ -330,6 +335,7 @@ export const en: Record<string, string> = {
   settings_trim_unavailable: 'fnOS host unavailable: {message}',
   about_title: 'About',
   about_desc: 'A web terminal built with Go and Vue 3: SSH straight to remote hosts, SFTP file management, fully local.',
+  about_repo_url: 'https://github.com/shuangji66/FnDepot',
   about_github: 'GitHub',
 
   // ===== confirm dialog defaults =====

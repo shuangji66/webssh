@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "type-check": "vue-tsc --noEmit -p tsconfig.json"
+    "type-check": "vue-tsc --noEmit -p tsconfig.json",
+    "check:i18n": "node scripts/check-i18n.mjs",
+    "check": "npm run type-check && npm run check:i18n"
   },
   "dependencies": {
     "@automann/maple-mono-cn": "7.9.2",

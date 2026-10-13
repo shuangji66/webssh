@@ -162,6 +162,8 @@ export const zh: Record<string, string> = {
   session_full_files: '完整文件管理',
   session_crumb_root: '根目录',
   session_crumb_home: '家目录',
+  session_rename_title: '重命名终端标签',
+  session_rename_prompt: '新名称',
   session_close_confirm_title: '关闭终端标签',
   session_close_confirm_msg: '关闭「{title}」？该终端会话及其在远程主机上的 shell 会被终止。',
   session_terminal_exited: '远程 shell 已退出',
@@ -169,7 +171,6 @@ export const zh: Record<string, string> = {
 
   // ===== 终端面板 =====
   term_restoring: '正在恢复终端历史…',
-  term_heartbeat: '',
   term_closed: '连接已关闭，重连或刷新后继续',
   term_ws_error: 'WebSocket 错误或被飞牛关闭',
   term_not_found: '终端不存在',
@@ -187,6 +188,7 @@ export const zh: Record<string, string> = {
   term_labels_expand: '展开功能名',
   term_search_prev: '上一个',
   term_search_next: '下一个',
+  term_rename_failed: '重命名失败：{error}',
   term_keypad_prev_page: '上一页',
   term_keypad_next_page: '下一页',
 
@@ -231,6 +233,9 @@ export const zh: Record<string, string> = {
   files_open_terminal_here: '在此目录打开终端',
   files_download_started: '开始下载「{name}」',
   files_download_failed: '下载失败：{error}',
+  files_preview_binary: '该文件不是文本文件，无法预览',
+  files_preview_title: '预览：{name}',
+  files_preview_failed: '读取文件失败：{error}',
   files_symlink: '符号链接',
   files_broken_symlink: '失效链接',
   files_dir: '目录',
@@ -331,6 +336,7 @@ export const zh: Record<string, string> = {
   settings_trim_unavailable: '飞牛宿主不可用：{message}',
   about_title: '关于',
   about_desc: '基于 Go 与 Vue 3 的 web 终端：SSH 直连远程主机，SFTP 管理文件，纯本地部署。',
+  about_repo_url: 'https://github.com/shuangji66/FnDepot',
   about_github: 'GitHub',
 
   // ===== 确认框默认文案 =====

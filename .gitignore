@@ -24,3 +24,6 @@
 .vscode/
 .DS_Store
 *.log
+
+# 误在 backend/ 目录里跑 go build 留下的产物
+/backend/backend
