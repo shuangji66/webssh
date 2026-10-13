@@ -393,3 +393,18 @@ body {
 .modal-fade-leave-to {
   opacity: 0;
 }
+
+/* ===== 移动端输入控件字号固定 16px =====
+ * iOS Safari 在聚焦 `font-size < 16px` 的输入框时会自动放大整个页面（缩放后不会自己缩回），
+ * 表现是「点一下输入框，页面就变大了、布局错位」。这里把所有输入控件在窄屏下钉到 16px。
+ *
+ * ⚠️ 排除 xterm 自己的隐藏输入框（.xterm-helper-textarea）：它的字号由终端字号决定，
+ * xterm 用**内联样式**设置（内联样式优先级高于本规则，理论上不会被覆盖），显式排除是为了
+ * 避免将来有人给 xterm 的样式加上 !important 时把 IME 的光标定位搞乱。 */
+@media (max-width: 767px) {
+  input:not(.xterm-helper-textarea),
+  textarea:not(.xterm-helper-textarea),
+  select {
+    font-size: 16px;
+  }
+}

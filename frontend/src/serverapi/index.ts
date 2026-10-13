@@ -108,6 +108,12 @@ export interface SessionView {
   authType: AuthType
   hasPassword: boolean
   hasPrivateKey: boolean
+  /**
+   * 是否把凭据加密落盘。为 false（表单里关掉「保存凭据」）时数据目录里不写密码/私钥，
+   * 凭据只活在后端内存里：会话关闭或后端重启后，下次 open 必须先输入凭据
+   * （后端回 credential_required）。
+   */
+  credentialSaved: boolean
   /** 私钥对应公钥的 SHA256 指纹（展示用，不是敏感信息） */
   keyFingerprint?: string
   note: string
@@ -128,6 +134,16 @@ export interface SessionInput {
   privateKey?: string
   passphrase?: string
   note?: string
+  /** false = 不落盘凭据（只在本进程内存里用于连接）；缺省 = true。 */
+  saveCredential?: boolean
+}
+
+/** 打开会话时的可选凭据：会话没保存凭据（credentialSaved=false）时必填。 */
+export interface OpenSessionInput {
+  id: string
+  password?: string
+  privateKey?: string
+  passphrase?: string
 }
 
 export type TestStage = 'ok' | 'resolve' | 'dial' | 'handshake' | 'hostkey' | 'auth' | 'shell'
@@ -175,6 +191,28 @@ export interface FsEntry {
   broken?: boolean
 }
 
+/** 批量文件操作（复制/移动/粘贴）的结果。 */
+export interface FsOpResult {
+  files: { path: string; size: number }[]
+  /** 因目标同名而跳过的数量（复制/移动遇到同名一律跳过，不覆盖） */
+  skipped: number
+}
+
+/** 压缩结果：压缩包落在 archiveDir 里。 */
+export interface ArchiveResult {
+  path: string
+  size: number
+  dir: string
+}
+
+/** 导出至飞牛的结果。 */
+export interface ExportResult {
+  /** 本机（NAS）上的落盘路径 */
+  path: string
+  size: number
+  files: number
+}
+
 export interface QuickCmd {
   id: string
   name: string
@@ -218,6 +256,10 @@ export interface RuntimeInfo {
   adminSock: string
   adminBaseURL: string
   hostname: string
+  /** 远程压缩包的固定输出目录（默认 /tmp/webssh-archive） */
+  archiveDir: string
+  /** 导出至飞牛的目标目录（TRIM_DATA_SHARE_PATHS 取第一个冒号之前的部分）；空 = 不可用 */
+  exportRoot: string
   trim: TrimStatus
   gateway: GatewayUser
 }
@@ -387,8 +429,12 @@ export const api = {
   trustHostKey: (host: string, port: number, fingerprint: string) =>
     request<{ ok: boolean }>('/api/sessions/trust', { json: { host, port, fingerprint } }),
 
-  openSession: (id: string) =>
-    request<{ ok: boolean; state: SessionState }>('/api/sessions/open', { json: { id } }),
+  /**
+   * 打开会话。`credentialSaved === false` 的会话必须在这里带上凭据，否则返回
+   * `credential_required`（此时前端弹凭据输入框，用户填完再调一次）。
+   */
+  openSession: (input: OpenSessionInput) =>
+    request<{ ok: boolean; state: SessionState }>('/api/sessions/open', { json: input }),
 
   /** 关闭会话：终止它下面所有终端与 SFTP 连接（配置保留）。 */
   closeSession: (id: string) => request<{ ok: boolean }>('/api/sessions/close', { json: { id } }),
@@ -423,6 +469,30 @@ export const api = {
 
   fsRemove: (sid: string, path: string, dir: boolean) =>
     request<{ ok: boolean }>('/api/fs/remove', { json: { sid, path, dir } }),
+
+  /** 批量复制到目标目录（远端内部复制；同名跳过）。 */
+  fsCopy: (sid: string, paths: string[], toDir: string) =>
+    request<FsOpResult & { ok: boolean }>('/api/fs/copy', { json: { sid, paths, toDir } }),
+
+  /** 批量移动到目标目录（粘贴剪切板用；同名跳过）。 */
+  fsMove: (sid: string, paths: string[], toDir: string) =>
+    request<FsOpResult & { ok: boolean }>('/api/fs/move', { json: { sid, paths, toDir } }),
+
+  /** 压缩：调用远程主机的 tar，产物落在服务端固定的 archiveDir（/tmp/webssh-archive）。 */
+  fsCompress: (sid: string, paths: string[], name?: string) =>
+    request<{ ok: boolean; archive: ArchiveResult }>('/api/fs/compress', {
+      json: { sid, paths, name: name ?? '' }
+    }),
+
+  /** 解压：调用远程主机的 tar / unzip，在原位解压。 */
+  fsExtract: (sid: string, path: string) =>
+    request<{ ok: boolean; dir: string }>('/api/fs/extract', { json: { sid, path } }),
+
+  /** 导出至飞牛：把远程文件/目录拉回本机共享目录（TRIM_DATA_SHARE_PATHS 的第一个路径）。 */
+  fsExportToNas: (sid: string, path: string, overwrite: boolean) =>
+    request<{ ok: boolean; export: ExportResult }>('/api/fs/export-to-nas', {
+      json: { sid, path, overwrite }
+    }),
 
   /** 从飞牛（本机 NAS）已有的文件上传到远程主机：服务端读取本地路径后经 SFTP 写入。 */
   fsUploadFromNas: (sid: string, dir: string, source: string, overwrite: boolean) =>

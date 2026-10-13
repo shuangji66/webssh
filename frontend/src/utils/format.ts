@@ -96,3 +96,64 @@ export function sessionLabel(s: { name: string; user: string; host: string }): s
 export function sessionTarget(s: { host: string; port: number }): string {
   return s.port && s.port !== 22 ? `${s.host}:${s.port}` : s.host
 }
+
+// ---------- 权限 / 排序 / shell 引用（文件管理与「在此目录新建终端」用） ----------
+
+/**
+ * 把后端给的符号权限串换算成八进制（`-rwxr-xr-x` → `0755`）。
+ *
+ * 为什么在前端换算而不是让后端多回一个字段：符号串已经包含了全部信息（含 setuid/setgid/
+ * sticky），换算在纯字符串上是确定性的，不必为一个展示开关加接口字段。
+ * 兼容三种输入：10 字符符号串、纯数字串（`644` / `0644` / `4755`）、以及认不出来的串（返回空串，
+ * 界面显示空白而不是胡说一个权限）。
+ */
+export function modeToOctal(mode: string): string {
+  const m = (mode || '').trim()
+  if (!m) return ''
+  if (/^[0-7]{3,4}$/.test(m)) return m.padStart(4, '0')
+  if (m.length < 10) return ''
+  const digit = (r: string, w: string, x: string) => {
+    let v = 0
+    if (r === 'r') v += 4
+    if (w === 'w') v += 2
+    // 's'/'t' 出现在执行位上时表示「执行位 + 特殊位」（'S'/'T' 表示只有特殊位）
+    if (x === 'x' || x === 's' || x === 't') v += 1
+    return v
+  }
+  const owner = digit(m[1]!, m[2]!, m[3]!)
+  const group = digit(m[4]!, m[5]!, m[6]!)
+  const other = digit(m[7]!, m[8]!, m[9]!)
+  let special = 0
+  if (m[3] === 's' || m[3] === 'S') special += 4
+  if (m[6] === 's' || m[6] === 'S') special += 2
+  if (m[9] === 't' || m[9] === 'T') special += 1
+  return `${special}${owner}${group}${other}`
+}
+
+export type SortKey = 'name' | 'size' | 'mtime'
+export type SortDir = 'asc' | 'desc'
+
+/** 目录永远排在文件前面；同类型再按 key 比较。`key` 为空表示不排序（由调用方保持原顺序）。 */
+export function compareEntries(
+  a: { name: string; dir: boolean; size: number; mtime: string },
+  b: { name: string; dir: boolean; size: number; mtime: string },
+  key: SortKey,
+  dir: SortDir
+): number {
+  if (a.dir !== b.dir) return a.dir ? -1 : 1
+  let cmp: number
+  if (key === 'size' && !a.dir && !b.dir) {
+    cmp = a.size - b.size
+  } else if (key === 'mtime') {
+    cmp = a.mtime.localeCompare(b.mtime)
+  } else {
+    // 自然序：file2 排在 file10 前面（数字按数值比较）
+    cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+  }
+  return dir === 'desc' ? -cmp : cmp
+}
+
+/** POSIX shell 单引号安全引用（远程命令里拼接路径必须走它）。 */
+export function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`
+}

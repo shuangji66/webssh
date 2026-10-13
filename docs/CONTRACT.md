@@ -574,3 +574,128 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   （`Password field is not contained in a form`）；这是浏览器给密码管理器的建议，不是错误。
 - `SettingsDialog` / `UploadDialog` 里的若干「label + 按钮组/开关」没有做 `aria-labelledby`
   关联（第 10.2 节第 3 条只覆盖了真正的输入框）。
+
+---
+
+## 11. 第二轮需求的接口变更（本轮实现的唯一依据）
+
+本节列出「首页/会话/文件管理/快捷指令」这一轮改造涉及的全部接口与行为。与前面各节冲突时，
+**以本节为准**；实现完成后本节内容会并入第 10 节的实施记录。
+
+### 11.1 会话与凭据
+
+1. **应用级标签改名**：`首页` → `会话`（i18n `app_tab_home` 的值改为「会话」/「Sessions」）。
+   首页视图标题保持「远程会话」。
+2. 首页去掉**搜索框**与副标题（原 `home_search`/`home_search_empty`/`home_subtitle` 文案作废）。
+3. **凭据保存开关**：`SessionInput` 新增 `saveCredential?: boolean`（缺省 = `true`）。
+   - `true`：与现在一致——密码/私钥/口令加密落盘。
+   - `false`：**不落盘**（三个字段都不写），配置里 `credentialSaved: false`；
+     凭据只在本进程内存里保存，用于该会话后续的终端/SFTP 连接。
+   - `SessionView` 新增 `credentialSaved: boolean`（前端据此在卡片上标注「不保存凭据」）。
+   - `POST /api/sessions/open` 的请求体新增可选的 `password` / `privateKey` / `passphrase`：
+     当会话 `credentialSaved == false` 且内存里没有凭据时，open **必须**带凭据，否则返回
+     `credential_required`（409）。带凭据时先用它拨号，成功后再把凭据留在内存（供该会话的
+     后续终端与 SFTP 复用）。**会话关闭（或进程退出）后内存凭据即失效**，下次 open 会再次
+     要求输入——这就是「不保存时每次连接都要输入」的落地方式。
+   - `POST /api/sessions/test` 一直都可以带明文凭据（表单里就是这样用的），无需改动。
+   - 编辑一个 `credentialSaved == false` 的会话时，表单里**不显示**「留空 = 不修改」的提示
+     （因为没有可保留的东西），打开开关就等于把凭据存下来。
+4. **卡片上的终端数量可点击**：点开一个弹窗，列出该会话当前打开的每个终端
+   （显示 `终端 N`、可改名、创建时间、单个关闭按钮、新建按钮）。
+   弹窗里的**会话名称**与会话标签名**双向同步**：弹窗改名 → `/api/sessions/save` 更新配置 +
+   应用标签标题；应用标签双击改名 → 同样调用 `/api/sessions/save` 更新配置。
+   为此前端新增 `home.renameSession(id, name)`；`appTabs.setTitle` 只作为展示层缓存。
+5. `terminals` 新增：`add(sid, opts?: { initialCommand?: string })` 与
+   `openTerminalAt(sid, dir)`（= 新开一个终端并在其中 `cd` 到该目录）。
+   `TermTab` 新增 `initialCommand?: string`；`TerminalPane` 在 WS `onopen` 后**只发一次**
+   并清空该字段（用它实现「在此目录新建终端」，避免「先建标签再等 connected 才发命令」的竞态）。
+
+### 11.2 会话视图（桌面 / 移动两种形态）
+
+- **桌面**：子标签栏**不再有常驻的「文件管理」子标签**，只有终端子标签 + `+`。
+  左栏（面包屑区 + 目录树）常驻（去掉原来的显隐按钮）。左栏顶部是**按钮条**而不是路径：
+  `[家目录] [完整文件管理（图标，切换双模式）] [在此目录新建终端] [刷新]`。
+  「完整文件管理」把主区域切换成文件管理器；再点一次（或点子标签栏里的终端标签）切回终端。
+  状态放在 `sessionUi.mainMode(sid)`：`'terminal' | 'files'`。
+- **移动（窄屏）**：子标签栏保留「文件管理」固定子标签 + 终端子标签（没有左栏可用）；
+  打开会话默认落在**终端**；面包屑/目录树**不渲染**。
+- `sessionUi` 变更：新增 `mainModeOf/setMainMode/toggleMainMode`；**删除** `leftVisible`
+  （用户要求去掉折叠按钮）。
+
+### 11.3 左栏（面包屑区）
+
+- **不显示路径**（没有「根目录 / vol1 / 1000 …」那串），只保留按钮条。
+- 目录树显示**完整**的远程目录树：以远程 `/` 为根，懒加载展开。
+  首次进入会话时**自动展开到登录用户的家目录**并把该节点高亮/滚入视野。
+- 「家目录」按钮：全部折叠，只展开登录用户家目录那一条链路。
+- **点目录不再跳转文件管理**：只更新「当前目录」（与文件管理器**共用同一个当前目录**）
+  并展开/高亮；主区域保持不动。
+- 树的右键/「…」菜单补全（目录可用的全部动作）：
+  新建文件夹 / 新建文件 / 上传到此目录 / 在此目录新建终端 / 粘贴 / 重命名 / 删除 /
+  压缩为 tar.gz / 导出至飞牛 / 复制完整路径 / 刷新。
+
+### 11.4 文件管理器
+
+- **排序**：列表视图的「名称 / 大小 / 修改时间」表头可点，循环
+  `升序 → 降序 → 取消`（取消 = 回到服务端顺序）。目录始终排在文件前面。
+  状态在 `sftp` store 的 `sort: { key: 'name'|'size'|'mtime'|null, dir: 'asc'|'desc' }`，
+  持久化到 localStorage。
+- **权限显示模式**：工具栏按钮在**符号**（`-rw-r--r--`）与**八进制**（`0644`）之间切换，
+  持久化。八进制由前端从符号串换算（`utils/format.ts` 的 `modeToOctal`，含 setuid/setgid/sticky）。
+- **更多菜单**：去掉「打开」（行本身仍可点开）；新增
+  `复制 / 剪切 / 粘贴 / 压缩为 tar.gz / 解压 / 导出至飞牛 / 在此目录新建终端`。
+  菜单顺序：粘贴（有剪贴板时）/ 重命名 / 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 /
+  压缩为 tar.gz / 解压（可解压时）/ 复制完整路径 / 在此目录新建终端。
+- **剪贴板**：`sftp` 状态里 `clipboard: { sid, op: 'copy'|'cut', paths: string[] } | null`。
+  - **粘贴一次后清空**（无论成功与否：失败时保留剪贴板并提示原因更友好——本实现取「成功后清空、
+    失败保留」并在文档里写明）。
+  - **不能跨会话粘贴**：`clipboard.sid !== 当前 sid` 时菜单里「粘贴」禁用并提示
+    `files_clipboard_cross_session`。
+- **导出至飞牛**：把远程文件/目录复制到本机（NAS）共享目录。
+  目标目录 = 环境变量 `TRIM_DATA_SHARE_PATHS` 取**第一个冒号之前**的部分
+  （等价于 bash 的 `${TRIM_DATA_SHARE_PATHS%%:*}`）；`/api/info` 的 `exportRoot` 下发该值
+  （为空/未设置时该菜单项禁用并提示 `files_export_nas_unavailable`）。
+  同名冲突返回 `duplicate`（前端提示后可选择覆盖）。
+- **压缩 / 解压**（调用远程主机的 `tar` / `unzip`）：
+  - 压缩：默认 `tar -czf <输出>/<名字>.tar.gz -C <父目录> <项>`，输出目录固定为
+    `/tmp/webssh-archive`（可用环境变量 `WEBSSH_ARCHIVE_DIR` 覆盖，仅服务端可配）。
+    完成后前端**跳转到该目录**（因为它在 /tmp 下，用户能立刻看到产物并下载/导出）。
+  - 解压：在原位解压（`tar -xf` / `unzip -o`，按扩展名识别），同名文件不覆盖（tar 不加 `-k`，
+    但先解到临时目录再合并？——简化为：直接用归档工具原样解压，冲突时归档工具自己的行为为准，
+    失败/无权限一律回 `permission` / `internal` 并带上命令 stderr 的关键行）。
+  - 工具缺失（`tar`/`unzip` 不在）、不支持的后缀、无权限 → 明确错误码 + toast。
+- 原「下载」不变：仍然是浏览器下载（`/api/fs/download`）。
+
+### 11.5 新增/变更的后端接口
+
+| 方法 | 路径 | 请求体 | 响应 |
+| --- | --- | --- | --- |
+| POST | `/api/sessions/open` | `{id, password?, privateKey?, passphrase?}` | `{ok, state}`（无凭据时 `credential_required`） |
+| POST | `/api/fs/copy` | `{sid, paths:[], toDir}` | `{ok, files:[{path,size}]}`（同名 `duplicate`） |
+| POST | `/api/fs/move` | `{sid, paths:[], toDir}` | `{ok, files:[{path,size}]}` |
+| POST | `/api/fs/compress` | `{sid, paths:[], name?}` | `{ok, archive:{path,size,dir}}` |
+| POST | `/api/fs/extract` | `{sid, path}` | `{ok, dir}` |
+| POST | `/api/fs/export-to-nas` | `{sid, path, overwrite?}` | `{ok, export:{path,size,files}}` |
+
+- `/api/info` 的 `runtime` 新增 `archiveDir` 与 `exportRoot`（为空表示不可用）。
+- 新错误码：`credential_required`。
+- 复制/压缩/导出都要有大小上限与 ctx 取消（沿用现有约束）；所有远程命令参数必须 shell 安全
+  引用（单引号转义）。
+
+### 11.6 快捷指令
+
+- 会话工具条里的「快捷指令」与「设置」按钮**删除**（顶栏已有全局入口）。
+- 弹窗改为**三页**：`常用指令 | 全局 | 专属`。
+  - 「常用指令」是内置清单（`frontend/src/data/presetCommands.ts`，按用途分组：系统信息 /
+    资源与进程 / 磁盘与目录 / 网络 / 日志 / 服务 / 用户 / Docker / 危险操作），
+    每条都标好是否自动执行（只读命令 `auto: true`，会改状态的 `auto: false`）。
+    清单里的名字用 i18n key（`qc_p_<id>` 名称、`qc_g_<id>` 分组名）。
+  - 「全局」与「专属」保持现状（增删改 + 上下移动）。
+- 弹窗尺寸：**高度固定**为「壳层高 − 应用顶栏（会话标签栏）− 移动端键条」的 **90%**；
+  宽度桌面保持现状，窄屏 `95%`；整体居中（用 `.region-center` 定位带）。
+
+### 11.7 移动端
+
+- 打开会话默认进入终端（桌面与窄屏一致）。
+- 移动端的输入控件字号统一 **16px**（防 iOS 聚焦自动放大）；xterm 自己的
+  `.xterm-helper-textarea` 不在此列（它的字号由终端字号决定，xterm 用内联样式设置）。
