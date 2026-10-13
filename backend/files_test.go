@@ -491,3 +491,39 @@ func TestFsCloseSessionRemovesHistoryAndSftp(t *testing.T) {
 	// 用一条已经不存在的会话再试一次：session_gone（而不是内部错误）
 	a.fail(t, "/api/fs/list", map[string]any{"sid": sid, "path": ""}, "not_open", 0)
 }
+
+// TestRemotePathKeepsSurroundingSpaces 回归：路径里的首尾空格**不能**被裁掉。
+//
+// 症状（e2e 实测）：名字以空格结尾的目录能在 fs/list 里列出来（它来自 SFTP 的真实条目），
+// 但拿同一个路径去 list/export/compress 全部回 `not_found`——因为查询入口把路径
+// TrimSpace 成了另一个不存在的名字。裁空格看起来「更健壮」，实际是把合法路径改坏了。
+func TestRemotePathKeepsSurroundingSpaces(t *testing.T) {
+	a := newTestApp(t, appOptions{exportRoot: t.TempDir()})
+	sid := a.newSSHSession(t)
+	root := a.ssh.Root()
+
+	weird := root + "/trailing "
+	if res, out := a.post(t, "/api/fs/mkdir", map[string]any{"sid": sid, "path": weird}); res.StatusCode != 200 {
+		t.Fatalf("创建带尾空格的目录失败：%d %v", res.StatusCode, out)
+	}
+
+	// list 该目录本身：必须 200（修复前这里会 404）
+	res, out := a.post(t, "/api/fs/list", map[string]any{"sid": sid, "path": weird})
+	if res.StatusCode != 200 {
+		t.Fatalf("list 带尾空格的目录失败：%d %v", res.StatusCode, out)
+	}
+	entries, _ := out["entries"].([]any)
+	if len(entries) != 0 {
+		t.Fatalf("新目录应当是空的，得到 %v", entries)
+	}
+
+	// 导出该目录也必须能找到它（走的是同一条路径解析）
+	if res, out := a.post(t, "/api/fs/export-to-nas", map[string]any{"sid": sid, "path": weird}); res.StatusCode != 200 {
+		t.Fatalf("导出带尾空格的目录失败：%d %v", res.StatusCode, out)
+	}
+
+	// 删除时也不能裁
+	if res, out := a.post(t, "/api/fs/remove", map[string]any{"sid": sid, "path": weird, "dir": true}); res.StatusCode != 200 {
+		t.Fatalf("删除带尾空格的目录失败：%d %v", res.StatusCode, out)
+	}
+}

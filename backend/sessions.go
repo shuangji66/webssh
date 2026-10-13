@@ -24,19 +24,22 @@ const (
 
 // sessionView 是「远程会话配置」的对外形态，**不含任何明文凭据**。
 type sessionView struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	Host           string `json:"host"`
-	Port           int    `json:"port"`
-	User           string `json:"user"`
-	AuthType       string `json:"authType"`
-	HasPassword    bool   `json:"hasPassword"`
-	HasPrivateKey  bool   `json:"hasPrivateKey"`
-	KeyFingerprint string `json:"keyFingerprint,omitempty"`
-	Note           string `json:"note"`
-	CreatedAt      string `json:"createdAt"`
-	UpdatedAt      string `json:"updatedAt"`
-	LastUsedAt     string `json:"lastUsedAt,omitempty"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	User          string `json:"user"`
+	AuthType      string `json:"authType"`
+	HasPassword   bool   `json:"hasPassword"`
+	HasPrivateKey bool   `json:"hasPrivateKey"`
+	// CredentialSaved 为 false 表示这份配置里没有任何凭据（前端据此标注「不保存凭据」，
+	// 并在打开时先弹凭据输入框）。契约 11.1：字段必须下发。
+	CredentialSaved bool   `json:"credentialSaved"`
+	KeyFingerprint  string `json:"keyFingerprint,omitempty"`
+	Note            string `json:"note"`
+	CreatedAt       string `json:"createdAt"`
+	UpdatedAt       string `json:"updatedAt"`
+	LastUsedAt      string `json:"lastUsedAt,omitempty"`
 }
 
 // sessionInput 是新增 / 编辑会话的输入。
@@ -54,6 +57,14 @@ type sessionInput struct {
 	PrivateKey *string `json:"privateKey"`
 	Passphrase *string `json:"passphrase"`
 	Note       *string `json:"note"`
+	// SaveCredential 对应表单里的「保存凭据」开关（契约 11.1）：false = 三个凭据字段
+	// 一概不落盘，凭据只在该会话打开期间留在内存里。
+	//
+	// 缺省语义按「新建 / 更新」分开：新建缺省 = true（与第一轮一致）；更新缺省 = 保持原值
+	// ——前端改会话名（home.renameSession）时只发 name/host/user/authType，若把缺省当 true，
+	// 一次改名就把「不保存凭据」的会话改成「保存凭据」（而它根本没有凭据可存），下次 open
+	// 会从 credential_required 退化成 no_credential。
+	SaveCredential *bool `json:"saveCredential"`
 }
 
 // terminalInfo 是一个终端的摘要（契约第 4.3 节 TerminalInfo）。
@@ -90,8 +101,11 @@ type sessionManager struct {
 	mu sync.Mutex
 	// configs 是会话配置的内存镜像。**更新一律换成新对象**（见 save）：其他协程可能
 	// 正拿着旧指针在拨号，就地改字段会数据竞争（`go test -race` 会报）。
-	configs  map[string]*sessionConfig
+	configs map[string]*sessionConfig
+	// runtimes 是「已打开」的会话；memCreds 是「不保存凭据」的会话在内存里的明文凭据
+	// （按会话 id，见 credentials.go）。两者都只在进程内存里，重启即消失。
 	runtimes map[string]*sessionRuntime
+	memCreds map[string]*memoryCredential
 }
 
 func newSessionManager(renv *RuntimeEnv, st *store, crypt *cryptor, hks *hostKeyStore) (*sessionManager, error) {
@@ -103,6 +117,7 @@ func newSessionManager(renv *RuntimeEnv, st *store, crypt *cryptor, hks *hostKey
 		pending:  newPendingKeys(),
 		configs:  map[string]*sessionConfig{},
 		runtimes: map[string]*sessionRuntime{},
+		memCreds: map[string]*memoryCredential{},
 	}
 	// 历史文件没有跨进程的意义（见 purgeStaleHistory 的说明）。
 	st.purgeStaleHistory()
@@ -153,16 +168,19 @@ func (m *sessionManager) credentials(sc *sessionConfig) (password, privateKey, p
 	return password, privateKey, passphrase, nil
 }
 
-// dialRequestOf 组装一次拨号所需的输入（凭据按需解密）。
+// dialRequestOf 组装一次拨号所需的输入（凭据按需取：落盘解密或内存缓存，见 dialCredential）。
 func (m *sessionManager) dialRequestOf(sc *sessionConfig) (dialRequest, *apiError) {
-	password, privateKey, passphrase, apiErr := m.credentials(sc)
+	mc, apiErr := m.dialCredential(sc)
 	if apiErr != nil {
 		return dialRequest{}, apiErr
 	}
-	return dialRequest{cfg: sc, password: password, privateKey: privateKey, passphrase: passphrase}, nil
+	return dialRequest{cfg: sc, password: mc.password, privateKey: mc.privateKey, passphrase: mc.passphrase}, nil
 }
 
-// validate 校验会话的身份字段（校验通过后返回规整化的副本）。
+// validateSessionFields 校验会话的身份字段（校验通过后返回规整化的副本）。
+//
+// 只负责「校验一组已经定下来的值」；「请求里没给的字段该用什么值」由 resolveSessionFields
+// 决定（见那里的说明：更新语义下空值一律保留原值）。
 func validateSessionFields(host string, port int, user, authType string) (string, string, int, *apiError) {
 	host = strings.TrimSpace(host)
 	user = strings.TrimSpace(user)
@@ -191,12 +209,45 @@ func validateSessionFields(host string, port int, user, authType string) (string
 	return host, user, port, nil
 }
 
+// resolveSessionFields 按**部分更新**语义把请求里的身份字段合并到现有配置上，再统一校验。
+//
+// 规则（cur == nil 表示新建）：
+//   - 新建：host/user/authType 必填，port 缺省 = 22；
+//   - 更新：空串 / 0 / 缺省的字段**一律保留原值**，只有显式给了新值才算改。
+//
+// 为什么「0 必须当成保留原值」——这是一个真踩过的坑：`port` 的零值就是 0，早期实现把它
+// 归一成 22 之后才与现值比较身份，于是「改名时不带 port」被判成「端口从 2222 改成了 22」，
+// 已打开的会话直接回 409「请先关闭再修改地址 / 端口 / 登录名」；端口恰好是 22 的会话会蒙对。
+// 前端为此被迫每次都发全字段，但这对下一个调用方（脚本 / curl / 新界面）仍然是个陷阱，
+// 所以在后端修掉。
+//
+// host/user/authType 同理：更新时它们为空只能说明「调用方不想改这一项」，不能当成
+// 「把它改成空」——那会让用户丢掉一个本来能连的会话配置。
+func resolveSessionFields(cur *sessionConfig, in sessionInput) (host, user string, port int, authType string, apiErr *apiError) {
+	host = strings.TrimSpace(in.Host)
+	user = strings.TrimSpace(in.User)
+	port = in.Port
+	authType = strings.TrimSpace(in.AuthType)
+	if cur != nil {
+		if host == "" {
+			host = cur.Host
+		}
+		if user == "" {
+			user = cur.User
+		}
+		if port == 0 {
+			port = cur.Port
+		}
+		if authType == "" {
+			authType = cur.AuthType
+		}
+	}
+	host, user, port, apiErr = validateSessionFields(host, port, user, authType)
+	return host, user, port, authType, apiErr
+}
+
 // save 新增或更新会话配置（/api/sessions/save）。
 func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
-	host, user, port, apiErr := validateSessionFields(in.Host, in.Port, in.User, in.AuthType)
-	if apiErr != nil {
-		return nil, apiErr
-	}
 	if in.ID != "" && !validID(in.ID) {
 		return nil, errNotFound("会话不存在")
 	}
@@ -206,12 +257,23 @@ func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
 
 	now := time.Now().Format(time.RFC3339)
 	created := in.ID == ""
-	var sc *sessionConfig
-	if in.ID != "" {
-		cur, ok := m.configs[in.ID]
+	var cur *sessionConfig
+	if !created {
+		found, ok := m.configs[in.ID]
 		if !ok {
 			return nil, errNotFound("会话不存在：%s", in.ID)
 		}
+		cur = found
+	}
+	// 先按「部分更新」语义把请求字段合并到现有配置上再校验：这样「没发 port」不会被当成
+	// 「改成 22」，身份比较与写入用的都是合并后的真实值（见 resolveSessionFields）。
+	host, user, port, authType, apiErr := resolveSessionFields(cur, in)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	var sc *sessionConfig
+	if cur != nil {
 		// 复制一份再改：失败路径不污染内存态，成功路径换成一个新对象（见 configs 的注释）。
 		cp := *cur
 		sc = &cp
@@ -223,7 +285,7 @@ func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
 				return nil, errConflict("会话已打开，请先关闭再修改地址 / 端口 / 登录名")
 			}
 		}
-		sc.Host, sc.User, sc.Port, sc.AuthType = host, user, port, in.AuthType
+		sc.Host, sc.User, sc.Port, sc.AuthType = host, user, port, authType
 	} else {
 		sc = &sessionConfig{
 			Version:   1,
@@ -231,7 +293,7 @@ func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
 			Host:      host,
 			User:      user,
 			Port:      port,
-			AuthType:  in.AuthType,
+			AuthType:  authType,
 			CreatedAt: now,
 		}
 	}
@@ -257,55 +319,130 @@ func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
 	}
 
 	// 凭据：nil = 不修改，"" = 清除，其余 = 加密后覆盖。
-	if in.Password != nil {
-		sec, err := m.crypt.encrypt(fieldPassword, sc.ID, *in.Password)
-		if err != nil {
-			return nil, errInternal("加密密码失败：%v", err)
-		}
-		sc.Password = sec
+	//
+	// saveCred 决定这批凭据是**落盘**还是**只留在内存**（契约 11.1）：
+	//   - 新建时缺省 = true（与第一轮一致）；
+	//   - 更新时缺省 = 保持这个会话原来的设置（见 sessionInput.SaveCredential 的说明）；
+	//   - 关掉开关（false）时把三个字段连同私钥指纹一并清掉：私钥都丢了，留着由它算出来的
+	//     指纹只会让界面显示一把已经不存在的密钥。
+	saveCred := true
+	switch {
+	case in.SaveCredential != nil:
+		saveCred = *in.SaveCredential
+	case !created:
+		saveCred = sc.credentialsSaved()
 	}
-	if in.PrivateKey != nil {
-		pem := *in.PrivateKey
-		if strings.TrimSpace(pem) == "" {
-			sc.PrivateKey = nil
-			sc.KeyFingerprint = ""
-		} else {
-			// 本次提交带了新私钥 → 口令以本次提交为准（不带就是「没有口令」）。
-			// 沿用已存私钥的场景在 dialRequestForTest 里另外处理。
-			passphrase := derefString(in.Passphrase)
-			fp, fpErr := keyFingerprint(pem, passphrase)
-			if fpErr != nil {
-				// 存一个解析不了的私钥等于存一个「永远连不上」的会话，当场报错更省事：
-				// 前端的保存流程会把 err_key_parse 显示成「私钥解析失败（内容或口令不对）」。
-				return nil, errKeyParse("私钥解析失败：%v", fpErr)
+	// 记下改动前的状态：下面会把 CredentialSaved / AuthType 覆盖掉，而「内存缓存怎么清」
+	// 要用到「原来保存不保存凭据」「认证方式换没换」这两个旧值。
+	wasSaved := sc.credentialsSaved()
+	prevAuthType := sc.AuthType
+
+	// 从「不保存」切到「保存」时，本次请求必须带凭据（见下面 cache 同步之后的检查）。
+	planningToStore := saveCred && !created && !wasSaved
+
+	if !saveCred {
+		// 只做**校验**，不做任何持久化：带的私钥解析不了要当场报错，否则用户会得到一个
+		// 「配置存下了、打开时报 key_parse」的会话，而那次保存明明什么都没存。
+		if in.PrivateKey != nil && strings.TrimSpace(*in.PrivateKey) != "" {
+			if _, err := parsePrivateKey(*in.PrivateKey, derefRaw(in.Passphrase)); err != nil {
+				return nil, errKeyParse("私钥解析失败：%v", err)
 			}
-			sec, err := m.crypt.encrypt(fieldPrivateKey, sc.ID, pem)
+		}
+		sc.Password, sc.PrivateKey, sc.Passphrase, sc.KeyFingerprint = nil, nil, nil, ""
+		sc.CredentialSaved = boolPtr(false)
+	} else {
+		if in.Password != nil {
+			sec, err := m.crypt.encrypt(fieldPassword, sc.ID, *in.Password)
 			if err != nil {
-				return nil, errInternal("加密私钥失败：%v", err)
+				return nil, errInternal("加密密码失败：%v", err)
 			}
-			sc.PrivateKey = sec
-			sc.KeyFingerprint = fp
+			sc.Password = sec
 		}
-	}
-	if in.Passphrase != nil {
-		sec, err := m.crypt.encrypt(fieldPassphrase, sc.ID, *in.Passphrase)
-		if err != nil {
-			return nil, errInternal("加密私钥口令失败：%v", err)
+		if in.PrivateKey != nil {
+			pem := *in.PrivateKey
+			if strings.TrimSpace(pem) == "" {
+				sc.PrivateKey = nil
+				sc.KeyFingerprint = ""
+			} else {
+				// 本次提交带了新私钥 → 口令以本次提交为准（不带就是「没有口令」）。
+				// 沿用已存私钥的场景在 dialRequestForTest 里另外处理。
+				passphrase := derefString(in.Passphrase)
+				fp, fpErr := keyFingerprint(pem, passphrase)
+				if fpErr != nil {
+					// 存一个解析不了的私钥等于存一个「永远连不上」的会话，当场报错更省事：
+					// 前端的保存流程会把 err_key_parse 显示成「私钥解析失败（内容或口令不对）」。
+					return nil, errKeyParse("私钥解析失败：%v", fpErr)
+				}
+				sec, err := m.crypt.encrypt(fieldPrivateKey, sc.ID, pem)
+				if err != nil {
+					return nil, errInternal("加密私钥失败：%v", err)
+				}
+				sc.PrivateKey = sec
+				sc.KeyFingerprint = fp
+			}
 		}
-		sc.Passphrase = sec
+		if in.Passphrase != nil {
+			sec, err := m.crypt.encrypt(fieldPassphrase, sc.ID, *in.Passphrase)
+			if err != nil {
+				return nil, errInternal("加密私钥口令失败：%v", err)
+			}
+			sc.Passphrase = sec
+		}
+		sc.CredentialSaved = nil
 	}
 
 	// **新建**会话必须给凭据：否则用户会存下一个「打开就报无凭据」的卡片，
 	// 而卡片上完全看不出缺什么。
 	// 更新时允许把凭据清空（契约第 4.3 节：空串 = 清除该字段）：那是有意的操作，
 	// 缺凭据会在连接测试 / 打开会话时给出明确的 no_credential，而不是静默用一个空密码去连。
-	if created {
+	//
+	// 例外：**不保存凭据**的新会话不要求当场填凭据——它本来就不存，打开时会被
+	// credential_required 要求输入（这正是这个开关的用途）。表单里填了的那份只用于当场校验。
+	if created && saveCred {
 		if sc.AuthType == authTypePassword && sc.Password == nil {
 			return nil, errNoCredential("密码认证需要填写登录密码")
 		}
 		if sc.AuthType == authTypeKey && sc.PrivateKey == nil {
 			return nil, errNoCredential("密钥认证需要粘贴私钥内容")
 		}
+	}
+	// 从「不保存」切到「保存」：必须在这一刻给出凭据。否则会存下一个声称保存了凭据、
+	// 实际一个凭据都没有的会话——下次 open 报的是 no_credential（400）、而不是
+	// credential_required（409），前端的凭据弹窗根本不会弹，用户只看到「没有可用凭据」。
+	if planningToStore && sc.Password == nil && sc.PrivateKey == nil {
+		return nil, errNoCredential("这个会话当前不保存凭据，开启「保存凭据」时需要同时填写%s", credentialKindName(sc.AuthType))
+	}
+
+	// 内存凭据缓存与落盘状态保持同步（见 credentials.go 的纪律 3）。
+	//
+	// 关键取舍：**保存表单里填的凭据不进内存缓存**（除非该会话正开着）。凭据只由一次成功的
+	// open 留下（见 open 的注释），也只有它算「验证过、可以用」。否则用户刚建好一个
+	// 「不保存凭据」的会话、随手填了个密码保存，卡片看起来是「每次都要输入」的那种，
+	// 点开却直接连上了——与这个开关承诺的行为对不上。
+	openNow := false
+	if _, isOpen := m.runtimes[sc.ID]; isOpen {
+		openNow = true
+	}
+	switch {
+	case saveCred:
+		// 凭据已经（或改为）落盘：内存里那份多余，留着只会两份不一致。
+		m.dropCachedCredentialLocked(sc.ID)
+	case in.Password != nil || in.PrivateKey != nil:
+		if openNow {
+			// 会话正开着：它接下来还要开新终端 / 重连 SFTP，用的必须是用户刚给的这份
+			// （旧的那份可能已经过期或被改过）。
+			m.setCachedCredentialLocked(sc.ID, memoryCredential{
+				password:   derefRaw(in.Password),
+				privateKey: derefRaw(in.PrivateKey),
+				passphrase: derefRaw(in.Passphrase),
+			})
+		} else {
+			m.dropCachedCredentialLocked(sc.ID)
+		}
+	case created || prevAuthType != sc.AuthType:
+		// 认证方式变了 → 缓存的凭据类型已经不匹配（旧的是密码、新的是私钥），留着只会
+		// 让下一次拨号报出一个看不懂的 no_credential。
+		m.dropCachedCredentialLocked(sc.ID)
 	}
 
 	sc.UpdatedAt = now
@@ -316,6 +453,9 @@ func (m *sessionManager) save(in sessionInput) (*sessionView, *apiError) {
 	view := sc.view()
 	return &view, nil
 }
+
+// boolPtr 取一个 bool 的地址（CredentialSaved 用指针表达「缺省 = true」）。
+func boolPtr(v bool) *bool { return &v }
 
 // delete 删除会话：先关掉运行时（终端 + SFTP），再删配置、专属快捷指令与历史目录
 // （前端的确认文案就是这么承诺的：「登录数据、专属快捷指令与该会话的历史都会一并删除」）。
@@ -329,6 +469,7 @@ func (m *sessionManager) delete(id string) *apiError {
 		return errNotFound("会话不存在：%s", id)
 	}
 	delete(m.configs, id)
+	delete(m.memCreds, id)
 	rt := m.runtimes[id]
 	delete(m.runtimes, id)
 	m.mu.Unlock()
@@ -412,36 +553,38 @@ func (m *sessionManager) test(ctx context.Context, in sessionInput) (*testOutcom
 // dialRequestForTest 组装测试用的拨号输入：表单里没重填凭据时回落到已存凭据
 // （编辑已有会话时点「测试连接」不该要求用户重新输入密码）。
 func (m *sessionManager) dialRequestForTest(in sessionInput) (dialRequest, *apiError) {
-	host, user, port, apiErr := validateSessionFields(in.Host, in.Port, in.User, in.AuthType)
-	if apiErr != nil {
-		return dialRequest{}, apiErr
-	}
-	sc := &sessionConfig{ID: in.ID, Host: host, User: user, Port: port, AuthType: in.AuthType}
-	if !validID(in.ID) {
-		// 新建会话（还没有 id）：凭据只能来自请求体。
-		sc.ID = "pending"
-	}
-
 	var stored *sessionConfig
 	if in.ID != "" {
 		stored, _ = m.getConfig(in.ID)
+	}
+	// 与 save 用同一套「部分更新」语义：编辑已有会话时表单没发的字段（例如 port）按配置
+	// 里的原值测，而不是按零值归一后的 22——否则「测试连接」会去连一个根本不是这个会话的
+	// 端口，然后报一句让人摸不着头脑的 dial_refused。
+	host, user, port, authType, apiErr := resolveSessionFields(stored, in)
+	if apiErr != nil {
+		return dialRequest{}, apiErr
+	}
+	sc := &sessionConfig{ID: in.ID, Host: host, User: user, Port: port, AuthType: authType}
+	if !validID(in.ID) {
+		// 新建会话（还没有 id）：凭据只能来自请求体。
+		sc.ID = "pending"
 	}
 	password := derefString(in.Password)
 	privateKey := derefString(in.PrivateKey)
 	passphrase := derefString(in.Passphrase)
 	if stored != nil {
-		sp, sk, spp, apiErr := m.credentials(stored)
+		mc, apiErr := m.storedOrCachedCredential(stored)
 		if apiErr != nil {
 			return dialRequest{}, apiErr
 		}
 		if in.Password == nil {
-			password = sp
+			password = mc.password
 		}
 		if in.PrivateKey == nil {
-			privateKey = sk
+			privateKey = mc.privateKey
 			// 私钥沿用已存的那份时，口令也一起沿用（新私钥配旧口令几乎必然解析失败）。
 			if in.Passphrase == nil {
-				passphrase = spp
+				passphrase = mc.passphrase
 			}
 		}
 	}
@@ -468,7 +611,11 @@ func outcomeOf(cerr *connectError) *testOutcome {
 // 打开时拨一次号：这样「地址写错 / 密码错 / 指纹没信任」这些错误会在用户点「打开」时
 // 立刻以带错误码的响应返回（前端显示「打开失败：认证失败」），而不是等他开终端时
 // 只在 WebSocket 里收到一个 gone 控制帧。这条连接同时作为 SFTP 的载体。
-func (m *sessionManager) open(ctx context.Context, id string) (*sessionRuntime, *apiError) {
+//
+// 凭据（契约 11.1）：请求体里可以带明文凭据。对「不保存凭据」的会话，这是**唯一**的凭据
+// 来源——没带、内存里也没有时返回 credential_required（409），前端据此弹输入框。带凭据时
+// 先拨号，成功后把它留在内存里供后续终端 / SFTP / 远程命令复用；会话关闭或进程退出即失效。
+func (m *sessionManager) open(ctx context.Context, id string, req openCredentials) (*sessionRuntime, *apiError) {
 	if !validID(id) {
 		return nil, errNotFound("会话不存在")
 	}
@@ -484,14 +631,20 @@ func (m *sessionManager) open(ctx context.Context, id string) (*sessionRuntime, 
 	}
 	m.mu.Unlock()
 
-	req, apiErr := m.dialRequestOf(cfg)
+	cred, apiErr := m.resolveCredential(cfg, req)
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	dreq := dialRequest{cfg: cfg, password: cred.password, privateKey: cred.privateKey, passphrase: cred.passphrase}
 	rt := newSessionRuntime(m, cfg)
-	if apiErr := rt.connect(ctx, req); apiErr != nil {
+	if apiErr := rt.connect(ctx, dreq); apiErr != nil {
 		rt.close()
 		return nil, apiErr
+	}
+	// 拨号成功后才留下请求里的凭据（失败的凭据没有任何复用价值）：写进内存时**只**进
+	// memCreds，不碰任何落盘路径，也不进日志与响应（见 credentials.go 的纪律 1）。
+	if req.provided() {
+		m.setCachedCredential(id, cred)
 	}
 
 	m.mu.Lock()
@@ -539,6 +692,9 @@ func (m *sessionManager) closeRuntime(id string) *apiError {
 	}
 	rt := m.runtimes[id]
 	delete(m.runtimes, id)
+	// 会话关闭 = 内存凭据失效（契约 11.1）：下次 open 会重新要求输入凭据。
+	// 这里就在锁里删，避免与并发的 open 抢出一个「关掉之后还能用」的窗口。
+	m.dropCachedCredentialLocked(id)
 	m.mu.Unlock()
 	if rt != nil {
 		rt.close()
@@ -581,7 +737,7 @@ func (m *sessionManager) states() []sessionState {
 	return out
 }
 
-// closeAll 在进程退出时终止所有终端与 SFTP 连接。
+// closeAll 在进程退出时终止所有终端与 SFTP 连接，并丢掉全部内存凭据。
 func (m *sessionManager) closeAll() {
 	m.mu.Lock()
 	runtimes := make([]*sessionRuntime, 0, len(m.runtimes))
@@ -589,6 +745,7 @@ func (m *sessionManager) closeAll() {
 		runtimes = append(runtimes, rt)
 	}
 	m.runtimes = map[string]*sessionRuntime{}
+	m.memCreds = map[string]*memoryCredential{}
 	m.mu.Unlock()
 	for _, rt := range runtimes {
 		rt.close()
@@ -826,19 +983,20 @@ func (r *sessionRuntime) close() {
 
 func (sc *sessionConfig) view() sessionView {
 	return sessionView{
-		ID:             sc.ID,
-		Name:           sc.Name,
-		Host:           sc.Host,
-		Port:           sc.Port,
-		User:           sc.User,
-		AuthType:       sc.AuthType,
-		HasPassword:    sc.Password != nil,
-		HasPrivateKey:  sc.PrivateKey != nil,
-		KeyFingerprint: sc.KeyFingerprint,
-		Note:           sc.Note,
-		CreatedAt:      sc.CreatedAt,
-		UpdatedAt:      sc.UpdatedAt,
-		LastUsedAt:     sc.LastUsedAt,
+		ID:              sc.ID,
+		Name:            sc.Name,
+		Host:            sc.Host,
+		Port:            sc.Port,
+		User:            sc.User,
+		AuthType:        sc.AuthType,
+		HasPassword:     sc.Password != nil,
+		HasPrivateKey:   sc.PrivateKey != nil,
+		CredentialSaved: sc.credentialsSaved(),
+		KeyFingerprint:  sc.KeyFingerprint,
+		Note:            sc.Note,
+		CreatedAt:       sc.CreatedAt,
+		UpdatedAt:       sc.UpdatedAt,
+		LastUsedAt:      sc.LastUsedAt,
 	}
 }
 

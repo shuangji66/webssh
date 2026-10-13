@@ -53,6 +53,12 @@ type Options struct {
 	Root string
 	// Shell 是要启动的 shell，默认 /bin/bash。
 	Shell string
+	// Env 是额外的环境变量（"K=V"），追加在最后 —— 同名时后面的生效。
+	//
+	// 用途：模拟一台「缺工具」的远端主机（例如 PATH=/nonexistent，让 tar/unzip 找不到），
+	// 用来验证后端的 no_archive_tool 分支。真实 sshd 的 PATH 由 sshd 与登录脚本决定，
+	// 这里只能人为覆盖。
+	Env []string
 	// Logger 收到一条非致命失败时的回调（默认丢弃）。
 	Logger func(format string, args ...any)
 }
@@ -64,6 +70,7 @@ type Server struct {
 	hostKey ssh.Signer
 	root    string
 	shell   string
+	extraEn []string
 	logf    func(format string, args ...any)
 
 	mu     sync.Mutex
@@ -154,6 +161,7 @@ func Start(opts Options) (*Server, error) {
 		hostKey: signer,
 		root:    root,
 		shell:   shell,
+		extraEn: opts.Env,
 		logf:    logf,
 		conns:   map[net.Conn]struct{}{},
 	}

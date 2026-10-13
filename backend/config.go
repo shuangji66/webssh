@@ -3,12 +3,20 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 // trimDefaultSocket 是飞牛开放 API 网关（trim.file.*）的 socket，只在没有
 // WEBSSH_TRIM_SOCKET 时用。里面放的是系统常量而不是应用配置，所以写死在代码里。
 const trimDefaultSocket = "/var/run/trim_open_gateway_apiscope.socket"
+
+// defaultArchiveDir 是远程压缩包的输出目录（契约 11.4：固定 /tmp/webssh-archive）。
+//
+// 为什么写死在这个位置而不是放到数据目录里：压缩包属于**远程主机**上的产物（tar 在远端
+// 打包），数据目录是本机的；放在 /tmp 下是为了让用户能在远端文件管理器里立刻看到并下载它。
+// 飞牛的 /tmp 通常可写；实在不可写的环境下用 WEBSSH_ARCHIVE_DIR 换一个目录。
+const defaultArchiveDir = "/tmp/webssh-archive"
 
 // RuntimeEnv 是全部解析自环境变量的运行期配置（契约第 1 节）。
 //
@@ -24,6 +32,14 @@ type RuntimeEnv struct {
 	TrimApp      string        // WEBSSH_TRIM_APP       调开放 API 时带的 appName
 	MasterKeyEnv string        // WEBSSH_MASTER_KEY     外部提供的主密钥（32 字节 base64/hex）
 	Version      string        // -ldflags 注入的版本号
+	// ArchiveDir 是远端压缩包的输出目录（WEBSSH_ARCHIVE_DIR，默认 /tmp/webssh-archive）。
+	ArchiveDir string
+	// ExportRoot 是「导出至飞牛」的目标目录：TRIM_DATA_SHARE_PATHS 里第一个冒号**之前**的
+	// 那一段（等价 bash `${TRIM_DATA_SHARE_PATHS%%:*}`），没有该变量时为空串 = 该功能不可用。
+	//
+	// 为什么只取第一段：这个变量是飞牛给应用用的**共享目录列表**（冒号分隔），前端能选中的
+	// 就是第一个共享卷；多段时把整串当路径拼出来必然是个不存在的目录（契约 11.4/11.5）。
+	ExportRoot string
 }
 
 func envOr(key, def string) string {
@@ -52,7 +68,25 @@ func loadRuntimeEnv() *RuntimeEnv {
 		TrimApp:      envOr("WEBSSH_TRIM_APP", "WebSSH"),
 		MasterKeyEnv: os.Getenv("WEBSSH_MASTER_KEY"),
 		Version:      appVersion,
+		ArchiveDir:   envOr("WEBSSH_ARCHIVE_DIR", defaultArchiveDir),
+		ExportRoot:   trimDataShareRoot(os.Getenv("TRIM_DATA_SHARE_PATHS")),
 	}
+}
+
+// trimDataShareRoot 取 TRIM_DATA_SHARE_PATHS 里第一个冒号之前的那一段（${VAR%%:*}）。
+//
+// 顺带 trim 掉首尾空白：飞牛写这个变量时可能带空格（"a:b" 或 "a : b"），带尾空格的路径
+// 拿去 os.Stat 必然失败，而报错看起来会像「共享目录不存在」，排查方向全歪。
+// 未设置 / 全是空白 → 空串（上层据此判定「导出至飞牛不可用」，见 exportnas.go）。
+func trimDataShareRoot(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if i := strings.IndexByte(raw, ':'); i >= 0 {
+		raw = raw[:i]
+	}
+	return strings.TrimSpace(raw)
 }
 
 // dialTimeoutFromEnv 解析 WEBSSH_DIAL_TIMEOUT。

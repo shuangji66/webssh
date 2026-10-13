@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -63,6 +64,9 @@ type sessionServer struct {
 	cols uint32
 	rows uint32
 	env  []string
+	// ptyRequested 记录客户端有没有发过 pty-req。它决定 exec/shell 走真 PTY 还是普通管道
+	// ——真实 sshd 也是这样：没收到 pty-req 就不分配终端（见 start 的说明）。
+	ptyRequested bool
 
 	cmd       *exec.Cmd
 	ptyMaster *os.File
@@ -85,6 +89,7 @@ func (ss *sessionServer) run(reqs <-chan *ssh.Request) {
 				continue
 			}
 			ss.term = nonEmpty(m.Term, "xterm-256color")
+			ss.ptyRequested = true
 			if m.Columns > 0 {
 				ss.cols = m.Columns
 			}
@@ -168,14 +173,24 @@ func (ss *sessionServer) run(reqs <-chan *ssh.Request) {
 	}
 }
 
-// start 起一个真实 shell（或执行一条命令），把它的 stdio 接到 PTY 上。
+// start 起一个真实 shell（或执行一条命令）。
 //
-// 输入方向一个协程（客户端 → PTY），输出方向另一个协程；PTY 读尽（子进程退出，Linux 上
-// 表现为 EIO）后回收进程、回 exit-status 并关通道——真实 sshd 也是这个顺序，否则客户端
-// 会一直等一个永远不会来的退出状态。
+// 两条路径：
+//   - 客户端发过 pty-req → 走真 PTY（交互式终端要的语义：提示符、输入回显、window-change
+//     改尺寸后换行重排）。PTY 不可用时会失败，所以调用方用例要先用 PTYAvailable 守卫。
+//   - 没发过 pty-req（通常是 exec 跑一条命令，例如后端调远端 tar/unzip）→ 走普通管道。
+//     真实 sshd 也是这个行为（没有 pty-req 就不分配终端），而且它让「只是执行命令」的
+//     测试完全不依赖 /dev/ptmx——那些用例验的是压缩解压，不该因为环境没有 PTY 而翻红。
+//
+// 输入方向一个协程（客户端 → PTY/管道），输出方向另一个协程；输出读尽（子进程退出，
+// Linux 上 PTY 表现为 EIO）后回收进程、回 exit-status 并关通道——真实 sshd 也是这个顺序，
+// 否则客户端会一直等一个永远不会来的退出状态。
 func (ss *sessionServer) start(command string) error {
 	if ss.cmd != nil {
 		return errors.New("会话已经启动过了")
+	}
+	if !ss.ptyRequested {
+		return ss.startPipes(command)
 	}
 	shell := ss.srv.shell
 	cmd := exec.Command(shell, shellArgs(shell, command)...)
@@ -198,6 +213,54 @@ func (ss *sessionServer) start(command string) error {
 		_, _ = ss.ch.SendRequest("exit-status", false, ssh.Marshal(&exitStatusMsg{Status: status}))
 		_ = ss.ch.Close()
 		_ = master.Close()
+	}()
+	return nil
+}
+
+// startPipes 用普通管道执行一条命令（没有 PTY 的 exec）。
+//
+// 关于 stderr：x/crypto 的 Channel 接口**不提供**「写扩展数据（stderr）」的能力（服务端
+// 那套辅助 API 在 v0.58 已经被移除了），所以这里把 stdout 与 stderr 都写进同一条数据流。
+// 真实 sshd 是分两条流发的，因此**生产代码必须两条流都收**（backend/remote_exec.go 的
+// runRemote 正是这么做的，诊断信息优先看 stderr、空了再看 stdout）。
+func (ss *sessionServer) startPipes(command string) error {
+	shell := ss.srv.shell
+	cmd := exec.Command(shell, shellArgs(shell, command)...)
+	cmd.Dir = ss.srv.root
+	cmd.Env = ss.buildEnv()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	ss.cmd = cmd
+
+	go func() {
+		// 命令不读 stdin 时这次 Copy 会一直等着客户端关通道；关掉写端让子进程看到 EOF。
+		_, _ = io.Copy(stdin, ss.ch)
+		_ = stdin.Close()
+	}()
+	var copied sync.WaitGroup
+	copied.Add(2)
+	go func() { defer copied.Done(); _, _ = io.Copy(ss.ch, stdout) }()
+	go func() { defer copied.Done(); _, _ = io.Copy(ss.ch, stderr) }()
+	go func() {
+		// 先把两条流读干净再取退出状态：Wait 会关掉管道，提前调会丢掉最后一段输出。
+		copied.Wait()
+		status := ss.waitStatus(cmd.Wait())
+		_, _ = ss.ch.SendRequest("exit-status", false, ssh.Marshal(&exitStatusMsg{Status: status}))
+		_ = ss.ch.Close()
 	}()
 	return nil
 }
@@ -246,7 +309,9 @@ func (ss *sessionServer) buildEnv() []string {
 		env = append(env, "PATH="+path)
 	}
 	// 客户端用 env 请求带来的变量放最后：同名时后出现的生效，与 sshd 的行为一致。
-	return append(env, ss.env...)
+	env = append(env, ss.env...)
+	// 服务器自己的 Env 覆盖（测试模拟「远端缺工具」这类环境差异，必须能盖掉上面的 PATH）。
+	return append(env, ss.srv.extraEn...)
 }
 
 func (ss *sessionServer) cleanup() {

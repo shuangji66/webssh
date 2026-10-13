@@ -41,6 +41,11 @@ type testApp struct {
 
 	ssh     *testssh.Server
 	sshRoot string
+	// sshUser / sshPassword 是内嵌 SSH 服务器的登录凭据（默认 demo/demo）。
+	// 有一个用例需要一把**不会在别处出现**的密码（验证「不保存凭据时磁盘上没有明文」），
+	// 所以放在字段上而不是由各用例自己再拼一次请求。
+	sshUser     string
+	sshPassword string
 }
 
 type appOptions struct {
@@ -54,11 +59,26 @@ type appOptions struct {
 	noSSH bool
 	// sshOptions 覆盖 testssh 的启动参数。
 	sshOptions *testssh.Options
+	// archiveDir / exportRoot 覆盖 RuntimeEnv 的对应字段（空 = 用测试临时目录）。
+	// archiveDir 默认不用生产默认值 /tmp/webssh-archive：并行跑的测试会互相盖掉对方的产物，
+	// 而且不该往真实 /tmp 里扔垃圾。
+	archiveDir string
+	exportRoot string
+	// sshPassword 覆盖内嵌 SSH 服务器的密码（空 = demo）。
+	sshPassword string
 }
 
 func newTestApp(t *testing.T, opts appOptions) *testApp {
 	t.Helper()
 	dir := t.TempDir()
+	sshPassword := opts.sshPassword
+	if sshPassword == "" {
+		sshPassword = "demo"
+	}
+	archiveDir := opts.archiveDir
+	if archiveDir == "" {
+		archiveDir = filepath.Join(dir, "archive")
+	}
 	renv := &RuntimeEnv{
 		AdminSock:    filepath.Join(dir, "app.sock"),
 		AdminBaseURL: opts.baseURL,
@@ -68,6 +88,8 @@ func newTestApp(t *testing.T, opts appOptions) *testApp {
 		TrimApp:      "WebSSH",
 		MasterKeyEnv: opts.masterKeyEnv,
 		Version:      "test-version",
+		ArchiveDir:   archiveDir,
+		ExportRoot:   opts.exportRoot,
 	}
 	if renv.TrimSocket == "" {
 		renv.TrimSocket = filepath.Join(dir, "no-such-trim.sock")
@@ -85,7 +107,7 @@ func newTestApp(t *testing.T, opts appOptions) *testApp {
 	srv := &http.Server{Handler: mux.buildHandler()}
 	go func() { _ = srv.Serve(ln) }()
 
-	a := &testApp{t: t, renv: renv, mux: mux, srv: srv}
+	a := &testApp{t: t, renv: renv, mux: mux, srv: srv, sshUser: "demo", sshPassword: sshPassword}
 	a.client = newUnixClient(renv.AdminSock)
 	t.Cleanup(func() {
 		_ = srv.Close()
@@ -95,7 +117,7 @@ func newTestApp(t *testing.T, opts appOptions) *testApp {
 
 	if !opts.noSSH {
 		a.sshRoot = t.TempDir()
-		sshOpts := testssh.Options{User: "demo", Password: "demo", Root: a.sshRoot}
+		sshOpts := testssh.Options{User: a.sshUser, Password: sshPassword, Root: a.sshRoot}
 		if opts.sshOptions != nil {
 			sshOpts = *opts.sshOptions
 			if sshOpts.Root == "" {
@@ -271,9 +293,9 @@ func (a *testApp) newSSHSession(t *testing.T) string {
 		"name":     "local",
 		"host":     a.ssh.Host(),
 		"port":     a.ssh.Port(),
-		"user":     "demo",
+		"user":     a.sshUser,
 		"authType": "password",
-		"password": "demo",
+		"password": a.sshPassword,
 	})
 	sid := strOf(out["session"], "id")
 	if sid == "" {
@@ -288,7 +310,7 @@ func (a *testApp) newSSHSession(t *testing.T) string {
 func (a *testApp) trustHost(t *testing.T, srv *testssh.Server) {
 	t.Helper()
 	res, out := a.post(t, "/api/sessions/test", map[string]any{
-		"host": srv.Host(), "port": srv.Port(), "user": "demo", "authType": "password", "password": "demo",
+		"host": srv.Host(), "port": srv.Port(), "user": a.sshUser, "authType": "password", "password": a.sshPassword,
 	})
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("连接测试请求失败：%d %v", res.StatusCode, out)

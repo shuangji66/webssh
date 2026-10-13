@@ -82,6 +82,32 @@ func errSFTPUnavailable(format string, args ...any) *apiError {
 	return failErr(502, codeSFTPUnavailable, format, args...)
 }
 
+// errCredentialRequired 用于「该会话不保存凭据，且这次请求没带凭据」（契约 11.1）。
+//
+// 状态码取 409 而不是 400：请求本身没写错，缺的是一个**状态**（本进程内还没有人给这个
+// 会话输入过凭据）。前端拿到这个裸码就去弹凭据输入框，填完再调一次 open。
+func errCredentialRequired(format string, args ...any) *apiError {
+	return failErr(409, "credential_required", format, args...)
+}
+
+// errNoSharePath 用于「没有配置飞牛共享目录」（TRIM_DATA_SHARE_PATHS 为空）。
+// 503 而不是 400：参数没问题，是这个部署形态下确实没有可写的共享目录（依赖不可用）。
+func errNoSharePath(format string, args ...any) *apiError {
+	return failErr(503, "no_share_path", format, args...)
+}
+
+// errNoArchiveTool 用于「远端主机上没有这个归档工具」（命令退出码 127）。
+// 502：本服务正常，远端环境缺东西（与 shell_failed 同类）。
+func errNoArchiveTool(format string, args ...any) *apiError {
+	return failErr(502, "no_archive_tool", format, args...)
+}
+
+// errArchiveUnsupported 用于「扩展名不认识，不知道拿什么工具解」。
+// 400：这是请求本身的问题（用户选错了文件），改一下就能过。
+func errArchiveUnsupported(format string, args ...any) *apiError {
+	return failErr(400, "archive_unsupported", format, args...)
+}
+
 // errAborted 用于「客户端取消」：前端有 err_aborted 文案（「已取消」）。
 // 状态码 408：请求超时 / 中断，中间件据此不会再重试。
 func errAborted(format string, args ...any) *apiError {
@@ -237,8 +263,12 @@ func (m *AdminMux) handleInfo(w http.ResponseWriter, r *http.Request) *apiError 
 			"adminSock":    m.renv.AdminSock,
 			"adminBaseURL": m.renv.AdminBaseURL,
 			"hostname":     hostname,
-			"trim":         m.trim.probe(r.Context()),
-			"gateway":      gatewayUserOf(r),
+			// archiveDir 是**远端**压缩包的落点（契约 11.4：前端压缩成功后要跳到这个目录）；
+			// exportRoot 是「导出至飞牛」的本机目标目录，空串 = 该功能不可用（前端据此禁用菜单项）。
+			"archiveDir": m.renv.ArchiveDir,
+			"exportRoot": m.renv.ExportRoot,
+			"trim":       m.trim.probe(r.Context()),
+			"gateway":    gatewayUserOf(r),
 		},
 	})
 }
@@ -307,14 +337,20 @@ func (m *AdminMux) handleSessionsTrust(w http.ResponseWriter, r *http.Request) *
 	return respond(w, map[string]any{"ok": true})
 }
 
+// handleSessionsOpen 打开会话。请求体里的明文凭据是「不保存凭据」的会话唯一的凭据来源
+// （契约 11.1 / 11.5）；**响应里不回任何凭据**，只回实时状态。
 func (m *AdminMux) handleSessionsOpen(w http.ResponseWriter, r *http.Request) *apiError {
 	var req struct {
-		ID string `json:"id"`
+		ID         string  `json:"id"`
+		Password   *string `json:"password"`
+		PrivateKey *string `json:"privateKey"`
+		Passphrase *string `json:"passphrase"`
 	}
 	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
 		return apiErr
 	}
-	rt, apiErr := m.sessions.open(r.Context(), req.ID)
+	creds := openCredentials{Password: req.Password, PrivateKey: req.PrivateKey, Passphrase: req.Passphrase}
+	rt, apiErr := m.sessions.open(r.Context(), req.ID, creds)
 	if apiErr != nil {
 		return apiErr
 	}
@@ -529,6 +565,16 @@ func (m *AdminMux) buildHandler() http.Handler {
 			m.route(m.handleFsRename)(w, r)
 		case p == "/api/fs/remove":
 			m.route(m.handleFsRemove)(w, r)
+		case p == "/api/fs/copy":
+			m.route(m.handleFsCopy)(w, r)
+		case p == "/api/fs/move":
+			m.route(m.handleFsMove)(w, r)
+		case p == "/api/fs/compress":
+			m.route(m.handleFsCompress)(w, r)
+		case p == "/api/fs/extract":
+			m.route(m.handleFsExtract)(w, r)
+		case p == "/api/fs/export-to-nas":
+			m.route(m.handleFsExportToNas)(w, r)
 		case p == "/api/fs/upload":
 			m.route(m.handleFsUpload)(w, r)
 		case p == "/api/fs/upload-from-nas":

@@ -263,6 +263,98 @@ func TestSessionInputSemantics(t *testing.T) {
 	}
 }
 
+// TestSessionPartialUpdateWhileOpen 是「部分字段更新已打开会话」的回归测试。
+//
+// 修复前的症状（端口不是 22 的会话必现）：`POST /api/sessions/save` 只发
+// `{id, name, host, user, authType}`（不带 port）时，缺省的 port=0 被归一成 22 再与现值
+// 比较，被判成「改了身份」→ 已打开的会话直接回 409 conflict「请先关闭再修改地址 / 端口 /
+// 登录名」。端口恰好是 22 的会话会蒙对，所以这个坑藏得很深。
+//
+// 现在更新语义是：空串 / 0 / 缺省 = 保留原值（见 resolveSessionFields）。
+func TestSessionPartialUpdateWhileOpen(t *testing.T) {
+	a := newTestApp(t, appOptions{})
+	sid := a.newSSHSession(t)
+	port := a.ssh.Port()
+	if port == 22 {
+		t.Fatalf("内嵌 SSH 服务器不该占用 22 端口（本用例要验非 22 端口）：%d", port)
+	}
+
+	// 1) 只发 id + name：必须成功，且身份字段一字不差
+	out := a.ok(t, "/api/sessions/save", map[string]any{"id": sid, "name": "改名后的会话"})
+	view, _ := out["session"].(map[string]any)
+	if strOf(view, "name") != "改名后的会话" {
+		t.Fatalf("改名没生效：%v", view)
+	}
+	checkIdentity := func(where string, view map[string]any) {
+		t.Helper()
+		if strOf(view, "host") != a.ssh.Host() || numOf(view, "port") != float64(port) ||
+			strOf(view, "user") != a.sshUser || strOf(view, "authType") != "password" {
+			t.Fatalf("%s：身份字段被部分更新改掉了：%v", where, view)
+		}
+		if view["hasPassword"] != true || view["credentialSaved"] != true {
+			t.Fatalf("%s：凭据状态不该变：%v", where, view)
+		}
+	}
+	checkIdentity("改名后", view)
+
+	// 2) 会话必须还是开着的（身份没变，不该把运行时丢掉）
+	_, sessions := a.get(t, "/api/sessions")
+	open := false
+	for _, item := range listOf(sessions, "open") {
+		m, _ := item.(map[string]any)
+		if strOf(m, "id") == sid && m["open"] == true {
+			open = true
+		}
+	}
+	if !open {
+		t.Fatalf("只改名字不该影响已打开的会话：%v", sessions["open"])
+	}
+
+	// 3) 落盘的配置也必须是原身份（并入内存态是同一份值）
+	sc, err := a.mux.st.loadSession(sid)
+	if err != nil {
+		t.Fatalf("读取会话失败：%v", err)
+	}
+	if sc.Host != a.ssh.Host() || sc.Port != port || sc.User != a.sshUser {
+		t.Fatalf("落盘的身份不对：%s@%s:%d", sc.User, sc.Host, sc.Port)
+	}
+
+	// 4) 老调用方发空串（host/user 空、port 0）同样按「保留」处理
+	view, _ = a.ok(t, "/api/sessions/save", map[string]any{
+		"id": sid, "name": "再改一次", "host": "", "user": "", "port": 0, "authType": "",
+	})["session"].(map[string]any)
+	checkIdentity("空字段更新后", view)
+
+	// 5) 显式改了端口 → 仍然是 409（会话开着时不许换连接目标）
+	a.fail(t, "/api/sessions/save", map[string]any{
+		"id": sid, "name": "x", "host": a.ssh.Host(), "port": port + 1,
+		"user": a.sshUser, "authType": "password",
+	}, "conflict", http.StatusConflict)
+	// 显式改了地址 / 登录名同理
+	a.fail(t, "/api/sessions/save", map[string]any{
+		"id": sid, "name": "x", "host": "192.0.2.1", "port": port, "user": a.sshUser, "authType": "password",
+	}, "conflict", http.StatusConflict)
+	a.fail(t, "/api/sessions/save", map[string]any{
+		"id": sid, "name": "x", "host": a.ssh.Host(), "port": port, "user": "other", "authType": "password",
+	}, "conflict", http.StatusConflict)
+
+	// 6) 关闭之后显式改端口就能改（顺序：先关再改，改完还是同一个会话）
+	a.ok(t, "/api/sessions/close", map[string]any{"id": sid})
+	view, _ = a.ok(t, "/api/sessions/save", map[string]any{
+		"id": sid, "name": "x", "host": a.ssh.Host(), "port": port + 1, "user": a.sshUser, "authType": "password",
+	})["session"].(map[string]any)
+	if numOf(view, "port") != float64(port+1) {
+		t.Fatalf("关闭后改端口没生效：%v", view)
+	}
+	// 新建会话时 port 缺省仍然是 22
+	out = a.ok(t, "/api/sessions/save", map[string]any{
+		"host": "example.invalid", "user": "u", "authType": "password", "password": "p",
+	})
+	if numOf(out["session"], "port") != 22 {
+		t.Fatalf("新建会话的缺省端口应当是 22：%v", out["session"])
+	}
+}
+
 // TestOpenCloseLifecycle 校验打开/关闭的幂等性与语义。
 func TestOpenCloseLifecycle(t *testing.T) {
 	requirePTY(t)

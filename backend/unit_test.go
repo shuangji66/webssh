@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -453,5 +454,218 @@ func TestStaleHistoryPurgedOnStartup(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Errorf("重启后留着的历史目录再也没有挂载者，应当被清理：%v", err)
+	}
+}
+
+// TestShellQuote 校验单引号引用：它拦的是「远端文件名/路径把命令拆开或注入」这一类问题。
+//
+// 除了逐个比对字面结果，还真的交给 /bin/sh 执行一遍：这些字符串里任何一个字符被 shell
+// 解释过，输出就会与原文不同（字面比对只能证明「我们以为对」，跑一遍才能证明「shell 也
+// 这么认为」）。
+func TestShellQuote(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "''"},
+		{"plain/path", "'plain/path'"},
+		{"with space", "'with space'"},
+		{"it's", `'it'\''s'`},
+		{"$(rm -rf /)", "'$(rm -rf /)'"},
+		{"`id`", "'`id`'"},
+		{"a;b|c&d", "'a;b|c&d'"},
+		{`back\slash`, `'back\slash'`},
+		{"tab\there", "'tab\there'"},
+		{`"double"`, `'"double"'`},
+	}
+	for _, c := range cases {
+		if got := shellQuote(c.in); got != c.want {
+			t.Errorf("shellQuote(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("本机没有 sh，跳过实际执行校验")
+	}
+	for _, c := range cases[:len(cases)-1] {
+		out, err := exec.Command(sh, "-c", "printf %s "+shellQuote(c.in)).Output()
+		if err != nil {
+			t.Fatalf("执行 %q 失败：%v", c.in, err)
+		}
+		if string(out) != c.in {
+			t.Errorf("经 sh 往返后 %q 变成了 %q", c.in, string(out))
+		}
+	}
+}
+
+// TestArchiveKindOf 校验按扩展名识别归档格式。
+func TestArchiveKindOf(t *testing.T) {
+	tars := []string{"a.tar", "a.tar.gz", "a.TGZ", "a.tar.bz2", "a.tbz2", "a.tar.xz", "a.txz", "备份.tar.gz"}
+	for _, name := range tars {
+		if got := archiveKindOf(name); got != archiveTar {
+			t.Errorf("archiveKindOf(%q) = %q，期望 tar", name, got)
+		}
+	}
+	if got := archiveKindOf("a.zip"); got != archiveZip {
+		t.Errorf("archiveKindOf(a.zip) = %q", got)
+	}
+	// 认不出来的一律返回空（调用方回 archive_unsupported）
+	for _, name := range []string{"a.txt", "a.gz", "a", "a.zipx", "a.targz", ""} {
+		if got := archiveKindOf(name); got != "" {
+			t.Errorf("archiveKindOf(%q) = %q，期望空", name, got)
+		}
+	}
+}
+
+// TestArchiveName 校验压缩包名字的规整与拒绝规则。
+func TestArchiveName(t *testing.T) {
+	got, apiErr := archiveName("")
+	if apiErr != nil {
+		t.Fatalf("缺省名字不该报错：%v", apiErr)
+	}
+	if !strings.HasPrefix(got, "webssh-") || !strings.HasSuffix(got, ".tar.gz") {
+		t.Errorf("缺省名字 = %q，期望 webssh-<时间戳>.tar.gz", got)
+	}
+	if got, apiErr = archiveName(" docs "); apiErr != nil || got != "docs.tar.gz" {
+		t.Errorf("archiveName(docs) = %q %v", got, apiErr)
+	}
+	if got, apiErr = archiveName("x.tar.gz"); apiErr != nil || got != "x.tar.gz" {
+		t.Errorf("已经有后缀时不该再加一遍：%q %v", got, apiErr)
+	}
+	for _, bad := range []string{"../escape", "a/b", `a\b`, ".", "..", "a\nb", strings.Repeat("x", 200)} {
+		if _, apiErr := archiveName(bad); apiErr == nil || apiErr.Code != "invalid" {
+			t.Errorf("archiveName(%q) 应当报 invalid，实际 %v", bad, apiErr)
+		}
+	}
+}
+
+// TestTrimDataShareRoot 校验 TRIM_DATA_SHARE_PATHS 的取段规则（等价 ${VAR%%:*}）。
+func TestTrimDataShareRoot(t *testing.T) {
+	cases := map[string]string{
+		"":                                 "",
+		"   ":                              "",
+		"/vol1/1000/share":                 "/vol1/1000/share",
+		"/vol1/1000/share:/vol2/other":     "/vol1/1000/share",
+		"  /vol1/1000/share : /vol2/other": "/vol1/1000/share",
+		":/vol2/other":                     "",
+	}
+	for in, want := range cases {
+		if got := trimDataShareRoot(in); got != want {
+			t.Errorf("trimDataShareRoot(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+// TestRuntimeEnvArchiveAndExport 校验两个新环境变量的解析与默认值。
+func TestRuntimeEnvArchiveAndExport(t *testing.T) {
+	t.Setenv("WEBSSH_ARCHIVE_DIR", "")
+	t.Setenv("TRIM_DATA_SHARE_PATHS", "")
+	renv := loadRuntimeEnv()
+	if renv.ArchiveDir != defaultArchiveDir {
+		t.Errorf("缺省 ArchiveDir = %q，期望 %q", renv.ArchiveDir, defaultArchiveDir)
+	}
+	if defaultArchiveDir != "/tmp/webssh-archive" {
+		t.Errorf("缺省压缩包目录必须是 /tmp/webssh-archive（契约 11.4/11.5）：%q", defaultArchiveDir)
+	}
+	if renv.ExportRoot != "" {
+		t.Errorf("没有 TRIM_DATA_SHARE_PATHS 时 ExportRoot 应当为空：%q", renv.ExportRoot)
+	}
+
+	t.Setenv("WEBSSH_ARCHIVE_DIR", "/data/archives")
+	t.Setenv("TRIM_DATA_SHARE_PATHS", "/vol1/1000/MyShare:/vol2/backup")
+	renv = loadRuntimeEnv()
+	if renv.ArchiveDir != "/data/archives" {
+		t.Errorf("WEBSSH_ARCHIVE_DIR 没生效：%q", renv.ArchiveDir)
+	}
+	if renv.ExportRoot != "/vol1/1000/MyShare" {
+		t.Errorf("ExportRoot 应当只取第一个冒号之前的部分：%q", renv.ExportRoot)
+	}
+}
+
+// TestCompressCommand 校验 tar 命令的拼装：单父目录用 -C <父目录>，多父目录退回 -C / +
+// 绝对路径，并且每个插值路径都被单引号引用。
+func TestCompressCommand(t *testing.T) {
+	// 单目录：成员名就是选中的那个名字
+	got := compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/docs"})
+	if got != `tar -czf '/tmp/out/a.tar.gz' -C '/home/u' 'docs'` {
+		t.Errorf("单父目录命令 = %q", got)
+	}
+	// 同一个父目录下的多项：只写一次 -C
+	got = compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/a.txt", "/home/u/b.txt"})
+	if got != `tar -czf '/tmp/out/a.tar.gz' -C '/home/u' 'a.txt' 'b.txt'` {
+		t.Errorf("同父目录多项命令 = %q", got)
+	}
+	// 多个父目录：-C / + 去掉前导斜杠的绝对路径（GNU tar 自己会剥掉 `/` 并打警告）
+	got = compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/a.txt", "/srv/b.txt"})
+	if got != `tar -czf '/tmp/out/a.tar.gz' -C / 'home/u/a.txt' 'srv/b.txt'` {
+		t.Errorf("多父目录命令 = %q", got)
+	}
+	// 带空格与单引号的路径必须被引用住
+	got = compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/it's here/docs"})
+	if got != `tar -czf '/tmp/out/a.tar.gz' -C '/home/u/it'\''s here' 'docs'` {
+		t.Errorf("含引号的路径没被正确引用：%q", got)
+	}
+}
+
+// TestKeyLines 校验错误文案里的关键行提取（空行丢掉、最多三行、超长截断）。
+func TestKeyLines(t *testing.T) {
+	if got := keyLines("\n\n  first  \r\nsecond\nthird\nfourth\n"); got != "first / second / third" {
+		t.Errorf("keyLines = %q", got)
+	}
+	if got := keyLines(""); got != "" {
+		t.Errorf("空输出的 keyLines = %q", got)
+	}
+	long := strings.Repeat("字", 400)
+	if got := keyLines(long); len([]rune(got)) != maxErrLinesRunes {
+		t.Errorf("超长输出应当按字符截断到 %d：%d", maxErrLinesRunes, len([]rune(got)))
+	}
+}
+
+// TestArchiveCommandError 校验远程命令失败的翻译：缺工具 / 权限 / 其余。
+func TestArchiveCommandError(t *testing.T) {
+	// 退出码 127 是 shell 的「命令不存在」
+	e := archiveCommandError("压缩失败", remoteResult{Code: 127, Stderr: "sh: 1: tar: not found"})
+	if e.Code != "no_archive_tool" || e.Status != 502 {
+		t.Errorf("缺工具的错误 = %+v", e)
+	}
+	// 措辞兜底（有的 shell 回 1 而不是 127）
+	e = archiveCommandError("解压失败", remoteResult{Code: 1, Stderr: "unzip: command not found"})
+	if e.Code != "no_archive_tool" {
+		t.Errorf("命令不存在应当翻成 no_archive_tool：%+v", e)
+	}
+	e = archiveCommandError("解压失败", remoteResult{Code: 2, Stderr: "tar: dir: Cannot open: Permission denied"})
+	if e.Code != "permission" || e.Status != 403 {
+		t.Errorf("权限错误 = %+v", e)
+	}
+	e = archiveCommandError("解压失败", remoteResult{Code: 2, Stderr: "gzip: stdin: not in gzip format"})
+	if e.Code != "internal" || !strings.Contains(e.Message, "not in gzip format") {
+		t.Errorf("其余失败要带上命令输出：%+v", e)
+	}
+	// 「No such file or directory」说的是文件不在，**不能**当成缺工具
+	e = archiveCommandError("压缩失败", remoteResult{Code: 2, Stderr: "tar: /x/y: Cannot stat: No such file or directory"})
+	if e.Code != "internal" {
+		t.Errorf("源文件不存在不该被当成缺工具：%+v", e)
+	}
+	// 没有任何输出时也要给出可读的原因（含退出码）
+	e = archiveCommandError("压缩失败", remoteResult{Code: 3})
+	if e.Code != "internal" || !strings.Contains(e.Message, "3") {
+		t.Errorf("无输出的失败 = %+v", e)
+	}
+}
+
+// TestLocalExportPath 校验导出目标路径逃逸校验。
+func TestLocalExportPath(t *testing.T) {
+	root := "/vol1/1000/share"
+	if got, err := localExportPath(root, "docs"); err != nil || got != "/vol1/1000/share/docs" {
+		t.Errorf("localExportPath = %q %v", got, err)
+	}
+	// 名字里带 .. 或者干脆是空 / "." 时必须拒绝：它们会把目标算到共享目录外面去。
+	// （"/abs" 这类带前导斜杠的名字不必拒绝：filepath.Join 会把它并进 root 里，仍然在
+	//  共享目录内；handler 传进来的名字来自 path.Base，本来就不会带斜杠。）
+	for _, name := range []string{"..", ".", "", "../x", "a/../../b"} {
+		if got, err := localExportPath(root, name); err == nil {
+			t.Errorf("名字 %q 应当被拒绝，实际算出 %q", name, got)
+		}
 	}
 }

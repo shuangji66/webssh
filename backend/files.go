@@ -55,6 +55,20 @@ const (
 	maxNasFileBytes = 1 << 30
 )
 
+// maxTransferBytes 是一次「服务端自己搬运数据」的操作（远端复制、导出至飞牛）的总字节上限。
+//
+// 这类接口同样没有请求体可卡（数据在远端/本机之间流动），没有上限时一次「复制一个 200GB
+// 的目录」会把这条会话的 SFTP 通道占住几十分钟：用户看不到任何进度（HTTP 请求上没有进度
+// 语义），也取消不掉（前端只能关页面，而那会连带丢掉整个界面状态）。超限即中止，并且把
+// 写了一半的东西清掉。
+//
+// var 而不是 const：测试要把它临时调小来验证上限逻辑（真搬 4 GiB 太慢）。
+var maxTransferBytes int64 = 4 << 30
+
+// errTransferBudget 是「搬运总量超过 maxTransferBytes」的哨兵错误，由 budgetReader 返回。
+// 单独定义而不是复用 errTooLarge：它要能被 errors.Is 认出来，才能翻成 too_large 的 413。
+var errTransferBudget = errors.New("传输内容超过大小上限")
+
 // 下面两个哨兵错误都是「参数问题」（400），不是服务端故障：
 //   - errTargetIsDir：界面上点错了入口（比如对着目录点「预览」）；
 //   - errKindMismatch：目录删除的 dir 参数与真实类型不一致（此时报错比删掉更安全）。
@@ -288,8 +302,11 @@ func validateRemotePath(p string) error {
 // 前端的 path 一律来自 FsEntry.path / home（都是绝对路径），相对路径这条兜底是为了
 // curl 手工调试，以及用户手工输入的路径也能用。
 func resolveRemotePath(sess *sftpSession, p string) (string, error) {
-	p = strings.TrimSpace(p)
-	if p == "" {
+	// ⚠️ **不要**对 p 本身做 TrimSpace：那会把「名字以空格结尾的目录」静默改成另一个
+	// 不存在的路径（e2e 实测：`evil $(touch ` 这种名字在 fs/list 里能列出、后续所有操作
+	// 都报 file does not exist，因为查询时被裁成了 `evil $(touch`）。TrimSpace 只用于
+	// 判断「整串都是空白」这一种情况，其余一律原样交给 SFTP。
+	if strings.TrimSpace(p) == "" {
 		return sess.homeDir()
 	}
 	if err := validateRemotePath(p); err != nil {
@@ -361,13 +378,18 @@ func fsError(action string, err error) *apiError {
 	}
 	msg := err.Error()
 	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// 客户端关页面 / 点取消时，阻塞中的操作会以 ctx 错误返回。那不是服务端故障，
+		// 报成 internal 会让日志里全是「内部错误」，而真正的原因（人走了）反而看不见。
+		return errAborted("%s：请求已取消", action)
 	case errors.Is(err, os.ErrNotExist):
 		return errNotFound("%s：%s", action, msg)
 	case errors.Is(err, os.ErrPermission):
 		return errPermission("%s：%s", action, msg)
 	case errors.Is(err, os.ErrExist):
 		return errDuplicate("%s：%s", action, msg)
-	case errors.Is(err, errTargetIsDir), errors.Is(err, errKindMismatch), errors.Is(err, errRefuseRoot):
+	case errors.Is(err, errTargetIsDir), errors.Is(err, errKindMismatch), errors.Is(err, errRefuseRoot),
+		errors.Is(err, errNesting), errors.Is(err, errRootOp), errors.Is(err, errInvalidLocalName):
 		return errInvalid("%s：%s", action, msg)
 	case strings.Contains(msg, "不允许包含 .."), strings.Contains(msg, "缺少 path"),
 		strings.Contains(msg, "上传路径"), strings.Contains(msg, "上传项"):
@@ -838,6 +860,43 @@ func (c ctxReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return c.r.Read(p)
+}
+
+// budgetReader 同时负责「客户端取消」与「总量上限」两件事（见 maxTransferBytes）。
+//
+// 挂到 io.Copy 的读端而不是写完再统计：这样超限当场停在原地，不会先把几个 GB 搬到目标
+// 再回头说「太大了」，半成品也就只有那一小块。
+type budgetReader struct {
+	ctx    context.Context
+	r      io.Reader
+	budget *int64
+}
+
+func (b budgetReader) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if *b.budget <= 0 {
+		return 0, errTransferBudget
+	}
+	if int64(len(p)) > *b.budget {
+		p = p[:*b.budget]
+	}
+	n, err := b.r.Read(p)
+	*b.budget -= int64(n)
+	return n, err
+}
+
+// mapTransferError 把搬运过程中的错误翻成错误码（too_large 要单独认出来，否则会变成
+// 一句「内部错误」，用户完全看不出是自己选的目录太大）。
+func mapTransferError(action string, err error) *apiError {
+	if errors.Is(err, errTransferBudget) {
+		return errTooLarge("%s：内容超过单次上限 %s", action, humanSize(maxTransferBytes))
+	}
+	if errors.Is(err, errInvalidLocalName) {
+		return errInvalid("%s：文件名不合法（%v）", action, err)
+	}
+	return fsError(action, err)
 }
 
 // handleFsUploadFromNas 把飞牛（本机）上已授权的文件推送到远程主机。

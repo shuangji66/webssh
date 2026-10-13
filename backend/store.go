@@ -154,23 +154,36 @@ func (s *store) writeJSONLocked(path string, v any, mode os.FileMode) error {
 // 会话配置
 // ---------------------------------------------------------------------------
 
-// sessionConfig 是 sessions/<sid>.json 的形态（契约第 3 节）。
+// sessionConfig 是 sessions/<sid>.json 的形态（契约第 3 节 + 11.1）。
 type sessionConfig struct {
-	Version        int     `json:"version"`
-	ID             string  `json:"id"`
-	Name           string  `json:"name"`
-	Host           string  `json:"host"`
-	Port           int     `json:"port"`
-	User           string  `json:"user"`
-	AuthType       string  `json:"authType"`
-	Password       *secret `json:"password"`
-	PrivateKey     *secret `json:"privateKey"`
-	Passphrase     *secret `json:"passphrase"`
-	KeyFingerprint string  `json:"keyFingerprint"`
-	Note           string  `json:"note"`
-	CreatedAt      string  `json:"createdAt"`
-	UpdatedAt      string  `json:"updatedAt"`
-	LastUsedAt     string  `json:"lastUsedAt,omitempty"`
+	Version    int     `json:"version"`
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	Host       string  `json:"host"`
+	Port       int     `json:"port"`
+	User       string  `json:"user"`
+	AuthType   string  `json:"authType"`
+	Password   *secret `json:"password"`
+	PrivateKey *secret `json:"privateKey"`
+	Passphrase *secret `json:"passphrase"`
+	// CredentialSaved 为 false 时上面三个字段**一律为 null**：凭据不落盘，只在该会话
+	// 打开期间留在内存里（见 credentials.go）。
+	//
+	// 用指针而不是 bool：第一轮存下的配置里根本没有这个字段，它们都是「保存凭据」的。
+	// 把缺省当成 false 会让所有老会话在升级后突然要求重新输入密码——那是最糟的一种
+	// 「升级即故障」。nil 一律按 true 解释；omitempty 让 true 时不写这个字段，保持
+	// 磁盘上的文件形态与老版本一致。
+	CredentialSaved *bool  `json:"credentialSaved,omitempty"`
+	KeyFingerprint  string `json:"keyFingerprint"`
+	Note            string `json:"note"`
+	CreatedAt       string `json:"createdAt"`
+	UpdatedAt       string `json:"updatedAt"`
+	LastUsedAt      string `json:"lastUsedAt,omitempty"`
+}
+
+// credentialsSaved 报告这个会话是否把凭据加密落盘（缺省 = 是）。
+func (sc *sessionConfig) credentialsSaved() bool {
+	return sc.CredentialSaved == nil || *sc.CredentialSaved
 }
 
 // identity 是会话身份：`user@host:port`（端口默认 22 参与比较）。
