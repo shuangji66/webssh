@@ -357,7 +357,8 @@ useTerminalsStore(): {
   activeOf(sid: string): TermTab | null
   countOf(sid: string): number
   ensure(sid: string, state: SessionState): void   // 从后端实时状态恢复（幂等）
-  add(sid: string): TermTab
+  add(sid: string, opts?: { initialCommand?: string }): TermTab   // 见 11.1-5
+  openTerminalAt(sid: string, dir: string): TermTab              // 「在此目录新建终端」（cd + shellQuote）
   adoptTid(sid: string, uid: string, tid: string, createdAt?: string): void
   setStatus(sid: string, uid: string, status: TermStatus): void
   setTitle(sid: string, uid: string, title: string): void
@@ -605,6 +606,11 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
    弹窗里的**会话名称**与会话标签名**双向同步**：弹窗改名 → `/api/sessions/save` 更新配置 +
    应用标签标题；应用标签双击改名 → 同样调用 `/api/sessions/save` 更新配置。
    为此前端新增 `home.renameSession(id, name)`；`appTabs.setTitle` 只作为展示层缓存。
+   - 改名载荷：`{id, name, host, port, user, authType}`（**必须带上 `port` 原值**：更新一个已打开的
+     会话时，后端早期版本会把缺省的 `port=0` 归一成 22 并判成「改了身份」→ 409 conflict，
+     非 22 端口必现。后端已按「更新语义」修成 `port==0` 视为保留原值，但调用方仍应发全字段）。
+   - 统一的**部分更新语义**：更新已有会话时，`host`/`user`/`authType`/`port` 为空串或 0 表示
+     「保留原值」；`name` 空串同样保留。凭据字段缺省 = 不修改。
 5. `terminals` 新增：`add(sid, opts?: { initialCommand?: string })` 与
    `openTerminalAt(sid, dir)`（= 新开一个终端并在其中 `cd` 到该目录）。
    `TermTab` 新增 `initialCommand?: string`；`TerminalPane` 在 WS `onopen` 后**只发一次**
@@ -621,6 +627,9 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   打开会话默认落在**终端**；面包屑/目录树**不渲染**。
 - `sessionUi` 变更：新增 `mainModeOf/setMainMode/toggleMainMode`；**删除** `leftVisible`
   （用户要求去掉折叠按钮）。
+- **面板一律保持挂载**：所有 `TerminalPane` / `FileManager` 都用「常挂载 + 非激活加 `.invisible`
+  （`visibility: hidden`）」，**不要**用 `v-if`（销毁 xterm 与 WS）也**不要**用 `v-show`
+  （`display:none` 下容器尺寸为 0，FitAddon 量不到尺寸、WebGL 会反复 0 尺寸重排）。
 
 ### 11.3 左栏（面包屑区）
 
@@ -646,7 +655,9 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   `复制 / 剪切 / 粘贴 / 压缩为 tar.gz / 解压 / 导出至飞牛 / 在此目录新建终端`。
   菜单顺序：粘贴（有剪贴板时）/ 重命名 / 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 /
   压缩为 tar.gz / 解压（可解压时）/ 复制完整路径 / 在此目录新建终端。
-- **剪贴板**：`sftp` 状态里 `clipboard: { sid, op: 'copy'|'cut', paths: string[] } | null`。
+- **剪贴板**：`sftp` store 里**全局一份** `clipboard: { sid, op: 'copy'|'cut', paths: string[] } | null`
+  （刻意不放进按 sid 分片的 `SftpState`：跨会话判定需要知道「这份剪贴板属于哪个会话」，
+  放进分片里这件事在数据结构上就不存在了）。
   - **粘贴一次后清空**（无论成功与否：失败时保留剪贴板并提示原因更友好——本实现取「成功后清空、
     失败保留」并在文档里写明）。
   - **不能跨会话粘贴**：`clipboard.sid !== 当前 sid` 时菜单里「粘贴」禁用并提示
@@ -671,8 +682,8 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 | 方法 | 路径 | 请求体 | 响应 |
 | --- | --- | --- | --- |
 | POST | `/api/sessions/open` | `{id, password?, privateKey?, passphrase?}` | `{ok, state}`（无凭据时 `credential_required`） |
-| POST | `/api/fs/copy` | `{sid, paths:[], toDir}` | `{ok, files:[{path,size}]}`（同名 `duplicate`） |
-| POST | `/api/fs/move` | `{sid, paths:[], toDir}` | `{ok, files:[{path,size}]}` |
+| POST | `/api/fs/copy` | `{sid, paths:[], toDir}` | `{ok, files:[{path,size}], skipped}`（同名**跳过**，不覆盖） |
+| POST | `/api/fs/move` | `{sid, paths:[], toDir}` | 同上（跨设备无法 rename → `conflict` + 说明，绝不静默降级成复制+删除） |
 | POST | `/api/fs/compress` | `{sid, paths:[], name?}` | `{ok, archive:{path,size,dir}}` |
 | POST | `/api/fs/extract` | `{sid, path}` | `{ok, dir}` |
 | POST | `/api/fs/export-to-nas` | `{sid, path, overwrite?}` | `{ok, export:{path,size,files}}` |
@@ -699,3 +710,79 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 - 打开会话默认进入终端（桌面与窄屏一致）。
 - 移动端的输入控件字号统一 **16px**（防 iOS 聚焦自动放大）；xterm 自己的
   `.xterm-helper-textarea` 不在此列（它的字号由终端字号决定，xterm 用内联样式设置）。
+
+---
+
+## 12. 第二轮实施记录与验证（并入本节即可，第 11 节保持为「需求/接口定义」）
+
+### 12.1 后端实现细节（与 11.5 表格的差异都在这）
+
+1. **copy/move 同名不返回 `duplicate`**，而是 `skipped` 计数（与 11.4 正文、前端 `FsOpResult` 一致；
+   11.5 表格已同步修正）。copy 是 SFTP 读+写（目录递归），move 优先 `Rename`。
+2. **跨设备 move** → `conflict`(409) + 一段说明「可能不在同一文件系统，请改用复制」。
+   SFTP 协议层拿不到 errno（sshd 对 EXDEV 只回 SSH_FX_FAILURE），i18n 也没有更合适的码，
+   故不自造错误码；**绝不**静默降级成「复制 + 删除」。
+3. **压缩**：`mkdir -p <archiveDir> && tar -czf <archiveDir>/<name>.tar.gz …`（`&&` 保证建目录失败
+   不会被 tar 的「输出目录不存在」盖掉）；退出码 127 → `no_archive_tool`。自定上限：
+   条目数 ≤ 2000（超出 `invalid`，建议改压父目录）、产物 > 4 GiB → 删掉产物并报 `too_large`
+   （远端 `/tmp` 通常很小）。同名压缩包按 tar 语义覆盖（默认名带时间戳，实际撞不上）。
+4. **解压**：按扩展名识别 tar 家族 / zip，**原位**解压；不支持 → `archive_unsupported`；
+   失败信息带上命令 stderr 的关键行。
+5. **导出至飞牛**：`TRIM_DATA_SHARE_PATHS` 取第一个冒号之前的部分并 **TrimSpace**（飞牛写这个
+   变量可能带空格，带空格路径 stat 必失败且报错像「目录不存在」）；同一会话内的软链接按
+   「跳过 + 记日志」处理（链接指向远端路径，落到 NAS 上是死链）。同名且未开 `overwrite` → `duplicate`。
+6. **`saveCredential=false` 时私钥指纹（`keyFingerprint`）一并清掉**：指纹由被丢弃的私钥算出，
+   留着会让界面显示一把并不存在的密钥。
+7. **内存凭据只由「一次成功的 open」写入**：表单里填的凭据不会进内存缓存，否则刚建好
+   「不保存凭据」的会话点开就直接连上，与开关的承诺矛盾。`dialRequestForTest` 例外：表单没重填
+   凭据时复用内存那份（否则已打开的会话在编辑弹窗里点「测试连接」会报「没有可用凭据」）。
+8. **失败善后用 `context.WithoutCancel` + 30s**：最常见的失败恰恰是「客户端断开」，
+   用 `r.Context()` 会永远清不掉半成品文件。
+9. **部分更新语义统一**：更新已有会话时 `host`/`user`/`authType` 空串、`port==0`、字段缺省
+   一律保留原值（`resolveSessionFields`）。这是修一个真 bug 时统一出来的：`port` 缺省会被
+   归一成 22 → 身份判定变化 → 已打开的**非 22 端口**会话改名必回 409 conflict。
+10. `internal/testssh` 同时支持「没发 `pty-req` 的 exec 走普通管道」与 `Options.Env`，
+    使压缩/解压/「远端缺 tar」这几类用例不依赖 `/dev/ptmx`。
+11. 未做：远端磁盘空间预检。
+
+### 12.2 集成阶段发现并修掉的真 bug（第 12.3 节的 e2e 抓到的）
+
+**路径首尾空格被静默裁掉**：`files.go` 的 `resolveRemotePath` 原本对入参 `TrimSpace`。
+症状——名字以空格结尾的目录（例如 `evil $(touch x) ' name `）能在 `fs/list` 里正常列出来
+（它来自 SFTP 的真实条目），但拿同一个路径去做 list / compress / export / remove **全部**
+回 `not_found`：因为查询入口把路径裁成了另一个不存在的名字。裁空格看着「更健壮」，实际是把
+合法路径改坏了。现在只把 TrimSpace 用于「整串都是空白」的判断，其余原样交给 SFTP，
+并加了回归测试 `TestRemotePathKeepsSurroundingSpaces`（list / export / remove 三个动作）。
+
+### 12.3 端到端验证（`internal/testssh` + 真二进制 + 真 unix socket，52 项断言全过）
+
+夹具特意含病态名字：`dir with space`、`it's a dir`、`evil $(touch x) ' name `（尾空格 + `$()` + 单引号），
+用来验证「远程命令里所有插值路径都用单引号引用」这条不是纸面约定。
+
+| 组 | 断言 |
+| --- | --- |
+| `/api/info` | `archiveDir=/tmp/webssh-archive`、`exportRoot=TRIM_DATA_SHARE_PATHS` |
+| 不保存凭据 | `credentialSaved=false` / `hasPassword=false`；**配置文件里没有 password 密文、没有 privateKey/passphrase** |
+| 打开 | 无凭据 → 409 `credential_required`；带凭据 → 200 且 `sftpOpen=true`；**内存凭据可复用**（新建终端拿到 tid + `ready`）；**close 后再 open 又要求凭据** |
+| 保存凭据 | 缺省 `credentialSaved=true` 且无需凭据即可打开 |
+| 部分更新 | 只发 `{id,name}` 改名 200（端口保留）；显式改端口 → 409 conflict；发全字段 → 200 |
+| 文件 | list 家目录、mkdir、copy（带空格目录）、同名 copy `skipped=1`、move（带单引号目录）后源消失目标存在 |
+| 压缩/解压 | 压缩产物真实存在且 `tar -tzf` 能列出；**压缩病态名字成功且 `$(...)` 没被执行**（`PWNED` 未生成）；tar.gz 与 zip 都原位解压出内容；用普通文件当归档 → `archive_unsupported` |
+| 导出至飞牛 | 成功且落在 `exportRoot` 下、文件数与内容正确；同名 → `duplicate`；`overwrite=true` 覆盖成功；单文件导出；病态名字导出成功 |
+| 路径校验 | `../` 逃逸被拒；压缩不存在的路径报错 |
+
+`make test`：**84 个用例全过 0 失败**（含 PTY 用例）；`go test -race ./...` 干净；`gofmt -l` / `go vet` 干净。
+
+### 12.4 前端未做「点击级」验证的部分（如实记录）
+
+本轮验证期间浏览器的交互动作被审批策略拒绝，因此以下**只有静态审查 + 类型检查/构建 + 队友的真机冒烟**
+（队友在临时实例里跑过 testsshd 并核对了首页/会话视图的渲染与 API 载荷），没有我自己的点击验证：
+
+- 桌面「完整文件管理 ↔ 终端」双向切换；终端列表弹窗 / 凭据输入弹窗 / 快捷指令三页的交互；
+- 移动端窄屏形态（浏览器工具无法模拟窄视口与触屏）。
+
+我用**只读**方式确认了渲染结构：首页（顶栏标签「会话」、无搜索框与副标题、卡片含
+「不保存凭据」徽标）、会话视图（子标签栏只有终端标签 + `+`、左栏为无路径按钮条 +
+以 `/` 为根的完整目录树、工具条只剩 折叠/搜索/粘贴/清屏/重连、文件管理面板的控件
+（排序表头 `名称/大小/修改时间`、`权限显示：数字（0644）`、`返回终端`、`全选`、`网格视图`）都在 DOM 里）。
+点击级的行为请按第 12.3 节的手测清单人工过一遍。

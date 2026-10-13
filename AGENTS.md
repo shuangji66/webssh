@@ -107,6 +107,21 @@
 - `upload-from-nas` 的 `source` 是本机路径，来自前端用 `@trimjs/web-app` 选中的**已授权**文件；
   读之前尽量用 `trim.file.checkUserACL` 判读权限（飞牛不可用时跳过并记日志）。
 
+**凭据与远程命令（`credentials.go` / `remote_exec.go` / `fileops.go` / `archive.go` / `exportnas.go`）**
+
+- `saveCredential=false` 的会话**不落盘任何凭据**，只在内存里保留（且只由一次成功的 `open` 写入——
+  表单里填的凭据不进内存，否则「不保存凭据」的会话点开就直接连上，与开关承诺矛盾）；
+  close/退出即失效，下次 `open` 回 `credential_required`。
+- 远程命令一律走 `remote_exec.go` 的 helper：`ssh.Session` 的 exec 通道 + `sh -c` +
+  **所有插值路径用单引号引用**（`shellQuote`）+ 采集 stdout/stderr + 超时 + ctx 取消。
+  绝不把用户给的路径裸拼进命令。
+- **失败善后用 `context.WithoutCancel`**：最常见的失败是「客户端断开」，用 `r.Context()`
+  会永远清不掉写了一半的产物。
+- `resolveRemotePath` **不要**对路径 `TrimSpace`：名字以空格结尾的目录会被静默改坏
+  （症状：`fs/list` 能列出它，但 list/export/remove 全回 `not_found`）。见第 12.2 节。
+- 压缩/解压/导出的上限与取舍（条目数 2000、产物 4 GiB、软链接跳过、跨设备 move 报 conflict）
+  都写在 `docs/CONTRACT.md` 第 12.1 节，改之前先读。
+
 **数据与凭据（`store.go` / `crypto.go` / `hostkeys.go`）**
 
 - 所有落盘写操作：互斥锁串行 + tmp 文件 + `rename` 原子替换。
@@ -153,6 +168,13 @@
   `focusTermSoon()` 与 `runAction()`。
 - 弹窗里的 `<label>` 必须用 `id`/`for` 与输入框关联（否则输入框没有可访问名，屏幕阅读器与
   自动化只能猜 placeholder）。
+- **移动端输入控件字号固定 16px**（`style.css` 的 `@media (max-width: 767px)`）：iOS 在
+  `font-size < 16px` 的输入框上聚焦会自动放大整页且不缩回。xterm 自己的
+  `.xterm-helper-textarea` 显式排除（它的字号由终端字号决定，内联样式设置）。
+- 桌面会话视图的**两种主区域模式**在 `sessionUi.mainMode`：终端 ↔ 完整文件管理；
+  移动端不用 mainMode，用固定子标签 `FILES_TAB`。改之前先看 `docs/CONTRACT.md` 11.2。
+- 会话改名必须走 `home.renameSession`（同时更新配置与顶栏标签，双向同步）；
+  **不要**只改标签标题——那样配置里的名字与界面会长期不一致。
 - 上传弹窗三种来源（本地文件 / 本地目录 / 飞牛文件）都要有进度与取消；
   飞牛宿主不可用时给明确提示，而不是让用户点了报错。
 - 文案全部走 `t()`；缺 key 时 `t()` 会回退中文再回退 key 本身——**看到 key 就是漏了文案**。
@@ -190,6 +212,9 @@
 - 修 bug 时优先补一条能复现该 bug 的测试/说明；没有测试的修复要在提交信息里写清验证方式。
 - `internal/testssh` 用真实 pty（`github.com/creack/pty`，**仅测试依赖**）；生产代码不得 import 它。
   `make test` 首次跑要能访问模块代理，之后走本地 `.gomodcache/`。
+- 端到端校验脚本（第二轮的功能都在里面，含病态路径名与「命令注入未执行」的断言）：
+  `.tmp/e2e2/verify.py`（`python3 verify.py <base_url> <sftp_root> <share_root>`，52 项断言）；
+  它需要 `TRIM_DATA_SHARE_PATHS` 指向一个可写目录（否则导出一条会按预期报 `no_share_path`）。
 - 端到端手测：`go run ./internal/testssh/cmd/testsshd -addr 127.0.0.1:2222 -user demo -password demo -root <可写目录>`
   + `socat TCP-LISTEN:18080,fork UNIX-CONNECT:<WEBSSH_ADMIN_SOCK>`（浏览器访问
   `http://127.0.0.1:18080<WEBSSH_ADMIN_BASEURL>`）。验证清单见 `docs/CONTRACT.md` 第 10.3 节。
