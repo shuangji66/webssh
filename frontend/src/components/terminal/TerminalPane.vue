@@ -368,6 +368,33 @@ function disconnect() {
   }
 }
 
+// 新终端的一次性命令（`tab.initialCommand`，目前只有「在此目录新建终端」的 `cd '<目录>'`）。
+//
+// 只在**本条连接**的 onopen 里发一次，并立刻把字段从标签上清掉：
+// - 清掉是为了重连/刷新恢复时不重复执行。重挂载时后端会先回放历史，用户已经能看到上一轮
+//   `cd` 的结果；再发一遍会让终端里凭空多出一行命令，若那条命令不是纯 `cd`（将来可能的
+//   扩展）还会把效果叠加两次。
+// - 为什么是 onopen 而不是等 `\x1b]tid;<id>\x07` 回填帧：后端（terminal.go 的 serve）**先**回
+//   101 Switching Protocols，**再** newTerminal + attach，所以 onopen 之后到挂载完成之间
+//   我们发的帧只是先躺在 socket 缓冲里；后端挂载完才起读循环，届时按顺序读出并写进 PTY，
+//   一个字节都不会丢。等回填帧则要在「新终端（有帧）」与「已有 tid 的终端（永远没有帧）」
+//   之间分两条路，反而更脆——回填帧还可能随连接一起丢掉，把命令永久留在标签上。
+// - 为什么不等 ready 帧：ready 只在**已有 tid 的老终端**回放结束时才有，而本字段只出现在刚
+//   新建的标签上，永远等不到它。
+// - 放在 onopen 的**最后**：send 若因为连接刚好断掉而抛异常，不能连累前面的
+//   setConnected / fitAndResize / 心跳启动（那些才是连接可用性的判定与保活）。
+function flushInitialCommand() {
+  const cmd = props.tab.initialCommand
+  if (!cmd) return
+  // 此刻 ws 一定处于 OPEN（本函数只由 onopen 调用），readyState 判断只是防御性写法
+  if (!sock || sock.readyState !== WebSocket.OPEN) return
+  // 补 `\r` = 回车执行（PTY 认 CR，不认 LF）
+  sock.send(cmd + '\r')
+  // 发出去之后再清：send 抛异常时字段留着，下次真正连上还会执行一次（比「命令静默丢失」诚实）
+  delete props.tab.initialCommand
+  pinToBottom()
+}
+
 function openSocket() {
   if (disposed) return
   disconnect()
@@ -384,6 +411,7 @@ function openSocket() {
     terminals.setStatus(props.sid, props.tab.uid, 'open')
     fitAndResize()
     startHeartbeat()
+    flushInitialCommand()
   }
   sock.onmessage = (ev) => {
     const data = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data)

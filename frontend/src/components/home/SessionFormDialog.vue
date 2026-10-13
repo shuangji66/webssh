@@ -46,6 +46,14 @@ const password = ref('')
 const privateKey = ref('')
 const passphrase = ref('')
 const note = ref('')
+/**
+ * 是否把凭据加密落盘（契约 11.1.3）。新增会话默认「保存」——多数人期望的是「下次点开就能连」；
+ * 编辑已有会话时按配置里的 `credentialSaved` 初始化（用户上次的选择要能看见，而不是被重置）。
+ *
+ * 关掉它不等于这次不用凭据：本次拨号仍然用表单里填的密码/私钥（后端把它们留在内存里），
+ * 只是不写进数据目录，所以会话关闭/后端重启后需要重新输入。
+ */
+const saveCredential = ref(true)
 
 /** 认证方式选项：模板里用常量而不是内联断言，避免依赖模板对 TS 表达式的支持。 */
 const authOptions: AuthType[] = ['password', 'key']
@@ -69,7 +77,8 @@ function fields() {
     password: password.value,
     privateKey: privateKey.value,
     passphrase: passphrase.value,
-    note: note.value
+    note: note.value,
+    saveCredential: saveCredential.value
   }
 }
 
@@ -84,6 +93,7 @@ function reset() {
   privateKey.value = ''
   passphrase.value = ''
   note.value = ''
+  saveCredential.value = s ? s.credentialSaved : true
   formError.value = ''
   testResult.value = null
   testHost.value = ''
@@ -129,16 +139,21 @@ function buildInput(): SessionInput | null {
 
   const editing = isEdit.value
   const switching = editing && props.session?.authType !== authType.value
+  // 「保存凭据」是打开的，但这份配置里现在没有任何可保留的凭据（新增会话，或上次就是「不保存」）：
+  // 此时留空提交，后端只能按「留空 = 不修改」处理（配置里的 credentialSaved 仍是 false），
+  // 而用户看到的是开关自己弹回去了——说不清的中间态。当场要他把凭据填上，别留静默失败。
+  const needCredential = saveCredential.value && (!editing || !props.session?.credentialSaved)
   const input: SessionInput = { host: h, port: p, user: u, authType: authType.value }
   if (props.session) input.id = props.session.id
   // 名称与备注不是密钥：总是整份提交，这样「清空名称」也能生效（留空 = 界面回退成 user@host）
   input.name = name.value.trim()
   input.note = note.value.trim()
+  input.saveCredential = saveCredential.value
 
   if (authType.value === 'password') {
     if (password.value) input.password = password.value
     // 新增会话（或从密钥切回密码）必须给密码：否则后端没有可用凭据，报 no_credential
-    else if (!editing || switching) {
+    else if (!editing || switching || needCredential) {
       formError.value = t('form_required_password')
       return null
     }
@@ -148,7 +163,7 @@ function buildInput(): SessionInput | null {
       // 给了私钥就一起给口令（空串 = 这个私钥没有口令）。不能「口令留空就不发」：
       // 那样会保留上一把私钥的口令，解析新私钥时就会失败。
       input.passphrase = passphrase.value
-    } else if (!editing || switching) {
+    } else if (!editing || switching || needCredential) {
       formError.value = t('form_required_key')
       return null
     }
@@ -159,6 +174,20 @@ function buildInput(): SessionInput | null {
 const authChangedHint = computed(
   () => isEdit.value && props.session?.authType !== authType.value && authType.value === 'password'
 )
+
+/**
+ * 「留空表示不修改已保存的密码/私钥」这句提示只在**确实有东西可保留**时才显示（契约 11.1.3）：
+ *  - 配置里 credentialSaved 为假（这张会话从来不存凭据）→ 那三个字段本来就是空的，
+ *    显示这句话会让用户以为自己存过密码、现在留空就能沿用；
+ *  - 表单里切换过认证方式 → 当前显示的字段与已保存的凭据不是同一个（那种情况由
+ *    authChangedHint 说明「保存后会使用新的凭据」）。
+ */
+const keepHint = computed(() => {
+  const s = props.session
+  if (!s || !s.credentialSaved) return false
+  if (s.authType !== authType.value) return false
+  return s.authType === 'password' ? s.hasPassword : s.hasPrivateKey
+})
 
 // ---------- 测试连接 ----------
 
@@ -355,7 +384,7 @@ function onDiscardVisible(v: boolean) {
                   autocomplete="new-password"
                   :placeholder="t('form_password_placeholder')"
                 />
-                <p v-if="isEdit" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
+                <p v-if="keepHint" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
                   {{ t('form_password_keep') }}
                 </p>
               </div>
@@ -372,7 +401,7 @@ function onDiscardVisible(v: boolean) {
                     spellcheck="false"
                     :placeholder="t('form_private_key_placeholder')"
                   ></textarea>
-                  <p v-if="isEdit" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
+                  <p v-if="keepHint" class="mt-1 text-xs text-ink-faint dark:text-ink-faint-dark">
                     {{ t('form_private_key_keep') }}
                   </p>
                 </div>
@@ -389,6 +418,26 @@ function onDiscardVisible(v: boolean) {
                   />
                 </div>
               </template>
+
+              <!-- 凭据保存开关（契约 11.1.3）：关掉 = 不写入数据目录，凭据只活在后端内存里，
+                   该会话关闭或后端重启后要重新输入。文案按认证方式分（保存密码 / 保存私钥）。 -->
+              <div class="rounded-md border border-line px-3 py-2.5 dark:border-line-dark">
+                <label class="flex cursor-pointer items-start gap-2.5" :title="t('form_save_credential')">
+                  <input v-model="saveCredential" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-brand" />
+                  <span class="min-w-0">
+                    <span class="block text-sm font-medium text-ink dark:text-ink-dark">
+                      {{
+                        authType === 'password'
+                          ? t('form_save_credential_password')
+                          : t('form_save_credential_key')
+                      }}
+                    </span>
+                    <span class="mt-0.5 block text-xs text-ink-faint dark:text-ink-faint-dark">
+                      {{ t('form_save_credential_hint') }}
+                    </span>
+                  </span>
+                </label>
+              </div>
 
               <div>
                 <label for="field-sessionformdialog-9" class="mb-1 block text-xs font-medium text-ink-soft dark:text-ink-soft-dark">

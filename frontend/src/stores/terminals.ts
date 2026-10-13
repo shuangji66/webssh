@@ -13,6 +13,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api, describeError, type SessionState } from '@/serverapi'
 import { t } from '@/i18n'
+import { shellQuote } from '@/utils/format'
 import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
 import { useToastStore } from '@/stores/toast'
 
@@ -29,6 +30,14 @@ export interface TermTab {
   /** 是否正在等后端回放历史（`\x1b]ready\x07` 到达后清除；见 TerminalPane） */
   restoring: boolean
   createdAt: string
+  /**
+   * 新终端建立后要**执行一次**的命令（目前只有 openTerminalAt 用：`cd '<目录>'`）。
+   *
+   * 它由 TerminalPane 在自己的 WS 握手成功（onopen）后取出、发送、随即清空。清空是这条
+   * 约定的一半：带着它重挂载（用户点重连、或刷新页面后端重新回放历史）时字段已经为空，
+   * 同一条 `cd` 不会被执行第二遍——用户不会在终端里看到一行自己没敲过的命令。
+   */
+  initialCommand?: string
 }
 
 // uid 只在浏览器里用：时间戳 + 自增序号即可（同一毫秒内连开两个也不会撞）。
@@ -110,8 +119,24 @@ export const useTerminalsStore = defineStore('terminals', () => {
     if (!activeUid.value[sid] && list[0]) setActive(sid, list[0].uid)
   }
 
-  /** 新建一个终端标签（tid 为 null，等后端回填）。新建即激活：用户点 + 就是想用它。 */
-  function add(sid: string): TermTab {
+  /**
+   * 新建一个终端标签（tid 为 null，等后端回填）。新建即激活：用户点 + 就是想用它。
+   *
+   * `opts.initialCommand` = 这个新终端建立后要执行一次的命令（见 TermTab.initialCommand）。
+   *
+   * 为什么命令要**挂在标签上**、由 TerminalPane 在握手成功后自己取，而不是「先 add()，
+   * 再由调用方等连接好了 send」：
+   * 1) 调用方（左栏 / 文件管理器）手里没有 socket。持有 WS 的 TerminalPane 是 Vue 在**下一次
+   *    渲染**才创建的，此刻它连 xterm 都还没建；调用方只能走 paneControls.get(sid, uid).send()，
+   *    而 send 在未连接时只返回 false（不排队、不重试）——命令静默丢失。想不丢就得自己轮询
+   *    「连上没有」，而握手的耗时取决于网络与后端建 PTY，轮询次数纯属猜。
+   * 2) 标签的 status 也不是个可靠的「可以发」事件：它是**面板自己**在 onopen/onclose 里写的
+   *    状态（open → 掉线 → connecting → 重连后再 open），盯它发命令会在重连时再发一遍，
+   *    而且 watch 与 onopen 回调的先后顺序没有约定。
+   * 挂在标签上则与这批时序无关：命令跟着标签走，面板在**自己这条连接**的 onopen 取一次、
+   * 发一次、清一次，天然是「一次挂载最多一次」。
+   */
+  function add(sid: string, opts?: { initialCommand?: string }): TermTab {
     const tab: TermTab = {
       uid: newUid(),
       tid: null,
@@ -121,10 +146,25 @@ export const useTerminalsStore = defineStore('terminals', () => {
       restoring: false,
       createdAt: new Date().toISOString()
     }
+    // 只在真的有命令时挂字段：留一个空串会让「非空才发」的判断多一层无意义的分支
+    if (opts?.initialCommand) tab.initialCommand = opts.initialCommand
     const list = tabs.value[sid] ?? (tabs.value[sid] = [])
     list.push(tab)
     setActive(sid, tab.uid)
     return tab
+  }
+
+  /**
+   * 在指定远程目录里新开一个终端（左栏 / 文件管理器的「在此目录新建终端」）。
+   *
+   * 路径**必须**过 shellQuote：这里的目录名来自远程文件系统，含空格（`My Files`）、单引号
+   * （`it's`）、`$` / 反引号（`$(rm -rf ~)`）、中文都很常见。直接拼成 `cd <dir>` 会被 shell
+   * 按空白拆词、按 `$`/反引号做命令替换——轻则 cd 到别的目录，重则执行了目录名里藏的命令。
+   * shellQuote 用单引号把整串包住、把内部单引号转义成 `'\''`，是 POSIX shell 下唯一安全的写法。
+   * （dir 是 /api/fs/list 给的绝对路径，不以 `-` 开头，所以无需 `cd --`。）
+   */
+  function openTerminalAt(sid: string, dir: string): TermTab {
+    return add(sid, { initialCommand: 'cd ' + shellQuote(dir) })
   }
 
   /** 后端回填终端 id（WS 控制帧）。 */
@@ -234,6 +274,7 @@ export const useTerminalsStore = defineStore('terminals', () => {
     countOf,
     ensure,
     add,
+    openTerminalAt,
     adoptTid,
     setStatus,
     setTitle,

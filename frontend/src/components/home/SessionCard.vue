@@ -25,6 +25,8 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'edit'): void
   (e: 'remove'): void
+  /** 「N 个终端」按钮：打开终端列表弹窗（改名 / 关闭单个终端 / 新建）。 */
+  (e: 'terminals'): void
 }>()
 
 const label = computed(() => sessionLabel(props.session))
@@ -44,6 +46,23 @@ const isOpen = computed(() => props.state?.open === true)
           {{ target }}
         </p>
       </div>
+      <!-- 凭据徽标：这张卡片的会话不保存凭据，每次连接都要重新输入（鼠标悬停给完整说明） -->
+      <span v-if="!session.credentialSaved" class="g-chip shrink-0" :title="t('home_cred_unsaved_hint')">
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          class="h-3.5 w-3.5 text-warning"
+        >
+          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+          <path d="M12 9v4" />
+          <path d="M12 17h.01" />
+        </svg>
+        {{ t('home_cred_unsaved') }}
+      </span>
       <!-- 认证方式徽标：密码 / 密钥 -->
       <span class="g-chip shrink-0">
         <svg
@@ -82,7 +101,38 @@ const isOpen = computed(() => props.state?.open === true)
         ></span>
         {{ isOpen ? t('home_opened') : t('home_closed') }}
       </span>
-      <span v-if="isOpen" class="g-chip">{{ t('home_terminal_count', { n: terminalCount }) }}</span>
+      <!-- 终端数量是个按钮：点开弹窗可以看到每个终端并改名/关闭/新建（契约 11.1.4） -->
+      <button
+        v-if="isOpen"
+        class="g-chip transition-colors hover:bg-black/10 dark:hover:bg-white/20"
+        :title="t('home_view_terminals')"
+        @click="emit('terminals')"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          class="h-3.5 w-3.5"
+        >
+          <polyline points="4 17 10 11 4 5" />
+          <line x1="12" y1="19" x2="20" y2="19" />
+        </svg>
+        {{ t('home_terminal_count', { n: terminalCount }) }}
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          class="h-3 w-3"
+        >
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+      </button>
       <span v-if="isOpen && openedAt" class="text-ink-faint dark:text-ink-faint-dark">
         {{ t('home_opened_at', { time: relativeTime(openedAt, now) }) }}
       </span>

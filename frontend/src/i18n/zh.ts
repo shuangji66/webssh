@@ -14,12 +14,9 @@ export const zh: Record<string, string> = {
   common_retry: '重试',
   common_loading: '加载中…',
   common_copied: '已复制到剪贴板',
-  common_copy: '复制',
   common_none: '无',
-  common_optional: '可选',
   common_name: '名称',
   common_tip: '提示',
-  common_back: '返回',
 
   // ===== 相对时间 =====
   time_just_now: '刚刚',
@@ -168,8 +165,6 @@ export const zh: Record<string, string> = {
   session_terminal_n: '终端 {n}',
   session_terminal_titled: '终端 {n}：{title}',
   session_full_files: '完整文件管理',
-  session_crumb_root: '根目录',
-  session_crumb_home: '家目录',
   session_rename_title: '重命名终端标签',
   session_rename_prompt: '新名称',
   cred_title_password: '输入登录密码',
@@ -189,13 +184,10 @@ export const zh: Record<string, string> = {
   termlist_close_confirm_title: '关闭终端',
   termlist_close_confirm_msg: '关闭「{title}」？该终端在远程主机上的 shell 会被终止。',
   session_left_title: '文件',
-  session_show_files: '完整文件管理',
   session_hide_files: '返回终端',
   session_new_terminal_here: '在此目录新建终端',
-  session_left_expand_home: '展开到登录用户家目录',
   session_close_confirm_title: '关闭终端标签',
   session_close_confirm_msg: '关闭「{title}」？该终端会话及其在远程主机上的 shell 会被终止。',
-  session_terminal_exited: '远程 shell 已退出',
 
   // ===== 终端面板 =====
   term_restoring: '正在恢复终端历史…',
@@ -210,8 +202,6 @@ export const zh: Record<string, string> = {
   term_act_paste: '粘贴',
   term_act_clear: '清屏',
   term_act_reconnect: '重连',
-  term_act_quick_cmds: '快捷指令',
-  term_act_settings: '设置',
   term_labels_collapse: '折叠功能名',
   term_labels_expand: '展开功能名',
   term_search_prev: '上一个',
@@ -233,7 +223,6 @@ export const zh: Record<string, string> = {
   files_download: '下载',
   files_view_list: '列表视图',
   files_view_grid: '网格视图',
-  files_switch_to_tree: '切换到左栏文件树',
   files_name: '名称',
   files_size: '大小',
   files_modified: '修改时间',
@@ -279,7 +268,6 @@ export const zh: Record<string, string> = {
   files_export_nas_done: '已导出到 {path}',
   files_export_nas_unavailable: '未配置飞牛共享目录（TRIM_DATA_SHARE_PATHS），无法导出',
   files_export_overwrite: '覆盖同名项',
-  files_nothing_selected: '请先选择文件或目录',
   files_op_failed_short: '操作失败',
   files_path_copied: '已复制路径',
   files_copy_path: '复制完整路径',
@@ -294,7 +282,6 @@ export const zh: Record<string, string> = {
   files_dir: '目录',
   files_file: '文件',
   files_upload_here: '上传到当前目录',
-  files_open: '打开',
   files_select_all: '全选',
   files_selected: '已选 {n} 项',
   files_clear_selection: '取消选择',
@@ -334,8 +321,6 @@ export const zh: Record<string, string> = {
 
   // ===== 快捷指令 =====
   qc_title: '快捷指令',
-  qc_scope_global: '全局',
-  qc_scope_session: '专属',
   qc_tab_global: '全局快捷指令',
   qc_tab_session: '专属快捷指令',
   qc_tab_preset: '常用指令',
@@ -396,7 +381,6 @@ export const zh: Record<string, string> = {
   about_github: 'GitHub',
 
   // ===== 确认框默认文案 =====
-  confirm_title: '确认',
   confirm_cancel: '取消',
 
   // ===== 内置「常用指令」清单（与 src/data/presetCommands.ts 的 id 一一对应）=====

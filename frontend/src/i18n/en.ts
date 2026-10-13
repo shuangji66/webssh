@@ -13,12 +13,9 @@ export const en: Record<string, string> = {
   common_retry: 'Retry',
   common_loading: 'Loading…',
   common_copied: 'Copied to clipboard',
-  common_copy: 'Copy',
   common_none: 'None',
-  common_optional: 'optional',
   common_name: 'Name',
   common_tip: 'Notice',
-  common_back: 'Back',
 
   // ===== relative time =====
   time_just_now: 'just now',
@@ -167,8 +164,6 @@ export const en: Record<string, string> = {
   session_terminal_n: 'Terminal {n}',
   session_terminal_titled: 'Terminal {n}: {title}',
   session_full_files: 'Full file manager',
-  session_crumb_root: 'Root',
-  session_crumb_home: 'Home',
   session_rename_title: 'Rename terminal tab',
   session_rename_prompt: 'New name',
   cred_title_password: 'Enter the password',
@@ -188,13 +183,10 @@ export const en: Record<string, string> = {
   termlist_close_confirm_title: 'Close terminal',
   termlist_close_confirm_msg: 'Close “{title}”? The remote shell of this terminal will be terminated.',
   session_left_title: 'Files',
-  session_show_files: 'Full file manager',
   session_hide_files: 'Back to terminals',
   session_new_terminal_here: 'New terminal here',
-  session_left_expand_home: 'Expand to the login user’s home',
   session_close_confirm_title: 'Close terminal tab',
   session_close_confirm_msg: 'Close “{title}”? The terminal session and its remote shell will be terminated.',
-  session_terminal_exited: 'Remote shell exited',
 
   // ===== terminal pane =====
   term_restoring: 'Restoring terminal history…',
@@ -209,8 +201,6 @@ export const en: Record<string, string> = {
   term_act_paste: 'Paste',
   term_act_clear: 'Clear',
   term_act_reconnect: 'Reconnect',
-  term_act_quick_cmds: 'Commands',
-  term_act_settings: 'Settings',
   term_labels_collapse: 'Collapse labels',
   term_labels_expand: 'Expand labels',
   term_search_prev: 'Previous',
@@ -232,7 +222,6 @@ export const en: Record<string, string> = {
   files_download: 'Download',
   files_view_list: 'List view',
   files_view_grid: 'Grid view',
-  files_switch_to_tree: 'Switch to the left file tree',
   files_name: 'Name',
   files_size: 'Size',
   files_modified: 'Modified',
@@ -278,7 +267,6 @@ export const en: Record<string, string> = {
   files_export_nas_done: 'Exported to {path}',
   files_export_nas_unavailable: 'No fnOS share directory configured (TRIM_DATA_SHARE_PATHS) — cannot export',
   files_export_overwrite: 'Overwrite existing items',
-  files_nothing_selected: 'Select a file or directory first',
   files_op_failed_short: 'Operation failed',
   files_path_copied: 'Path copied',
   files_copy_path: 'Copy full path',
@@ -293,7 +281,6 @@ export const en: Record<string, string> = {
   files_dir: 'Directory',
   files_file: 'File',
   files_upload_here: 'Upload to this directory',
-  files_open: 'Open',
   files_select_all: 'Select all',
   files_selected: '{n} selected',
   files_clear_selection: 'Clear selection',
@@ -333,8 +320,6 @@ export const en: Record<string, string> = {
 
   // ===== quick commands =====
   qc_title: 'Quick commands',
-  qc_scope_global: 'Global',
-  qc_scope_session: 'Session',
   qc_tab_global: 'Global commands',
   qc_tab_session: 'Session commands',
   qc_tab_preset: 'Presets',
@@ -395,7 +380,6 @@ export const en: Record<string, string> = {
   about_github: 'GitHub',
 
   // ===== confirm dialog defaults =====
-  confirm_title: 'Confirm',
   confirm_cancel: 'Cancel',
 
   // ===== 内置「常用指令」清单（与 src/data/presetCommands.ts 的 id 一一对应）=====

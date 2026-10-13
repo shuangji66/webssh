@@ -86,7 +86,8 @@ onMounted(async () => {
     </header>
 
     <main class="relative min-h-0 flex-1">
-      <!-- 首页与每个会话视图都保持挂载：切标签不重建终端与文件浏览状态 -->
+      <!-- 首页与每个会话视图都保持挂载：切标签不重建终端与文件浏览状态。
+           会话视图不再有「快捷指令 / 设置」入口（契约 11.6），所以这里不接它的事件。 -->
       <HomeView v-show="tabs.activeId === HOME_TAB_ID" class="absolute inset-0" />
       <SessionView
         v-for="tab in tabs.sessionTabs"
@@ -94,8 +95,6 @@ onMounted(async () => {
         :key="tab.id"
         :sid="tab.id"
         class="absolute inset-0"
-        @settings="settingsVisible = true"
-        @quick-cmds="openQuickCmds(tab.id)"
       />
 
       <div

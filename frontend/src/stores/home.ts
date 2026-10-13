@@ -12,6 +12,7 @@ import {
   ApiError,
   api,
   describeError,
+  type OpenSessionInput,
   type RuntimeInfo,
   type SessionInput,
   type SessionState,
@@ -38,6 +39,13 @@ const GONE_CODES = ['not_found', 'conflict', 'not_open', 'session_gone']
 function isGoneError(e: unknown): boolean {
   return e instanceof ApiError && GONE_CODES.includes(e.code)
 }
+
+/**
+ * 打开会话时可携带的凭据（`credentialSaved === false` 的会话必须带，否则后端回
+ * `credential_required`）。id 由调用方传，所以这里把 id 摘掉——避免出现「credential 里的 id
+ * 与参数里的 id 不一致」这种能编译通过、但只有运行时才看得出的错。
+ */
+export type SessionCredential = Omit<OpenSessionInput, 'id'>
 
 export const useHomeStore = defineStore('home', () => {
   const sessions = ref<SessionView[]>([])
@@ -120,14 +128,56 @@ export const useHomeStore = defineStore('home', () => {
     await api.trustHostKey(host, port, fingerprint)
   }
 
-  /** 打开会话（后端 /open 幂等：已打开就返回现有状态，不会重建终端）。 */
-  async function openSession(id: string): Promise<SessionState> {
-    const res = await api.openSession(id)
+  /**
+   * 打开会话（后端 /open 幂等：已打开就返回现有状态，不会重建终端）。
+   *
+   * `credential` 只对「不保存凭据」的会话有意义：后端内存里没有凭据时，不带凭据的 open 会回
+   * `credential_required`（409），调用方（首页）据此弹输入框，填完再带凭据调一次。
+   * 带上凭据且拨号成功时，后端会把凭据留在**内存**里供该会话后续的终端与 SFTP 复用。
+   */
+  async function openSession(id: string, credential?: SessionCredential): Promise<SessionState> {
+    const res = await api.openSession({ id, ...credential })
     openStates.value[id] = res.state
     // 后端会顺手更新 lastUsedAt；本地也跟一下，否则卡片上的「最近使用」要等下次刷新才变
     const s = sessions.value.find((item) => item.id === id)
     if (s) s.lastUsedAt = new Date().toISOString()
     return res.state
+  }
+
+  /**
+   * 会话改名（弹窗里的名称输入框与顶栏标签双击共用这一条路径）。
+   *
+   * 为什么必须走 `/api/sessions/save` 而不是只改本地展示：名字是**会话配置的一部分**，
+   * 只改本地的话刷新换台设备就没了。而 save 是整份提交，缺了 host/user/authType 后端会当成
+   * 新增或改错对象，所以这里用本地配置里的原值补齐；**绝不**带 password/privateKey/passphrase
+   * ——这既没必要（名字与凭据无关），也会把「留空 = 不修改」的语义搅浑。
+   *
+   * ⚠️ **port 必须一起发**（契约 11.1.4 的示例载荷里没有它，但漏了它改名在已打开的会话上会
+   * 直接失败）：后端的 port 是非指针 int，缺省被 `validateSessionFields` 归一成 22，于是
+   * 「当前 2222 ≠ 收到 22」被判成改了身份 —— 会话开着时后端会回 `conflict`（
+   * 「会话已打开，请先关闭再修改地址 / 端口 / 登录名」）。实测：带 port 后改名成功，且配置里的
+   * 凭据与打开状态都不受影响。
+   *
+   * 名字为空串时后端保留原名（契约 11.1.4），所以这里回填的是后端返回的 session 而不是入参。
+   */
+  async function renameSession(id: string, name: string): Promise<SessionView> {
+    const current = sessions.value.find((item) => item.id === id)
+    if (!current) {
+      // 本地没有这份配置就没法补齐 host/user/port/authType。抛给调用方 toast，不做静默失败。
+      throw new Error(t('err_not_found'))
+    }
+    const saved = await save({
+      id,
+      name,
+      host: current.host,
+      port: current.port,
+      user: current.user,
+      authType: current.authType
+    })
+    // 标签标题跟着配置走（openSession 之外的入口不能把用户拽到那个会话上）。
+    // syncTitle 不覆盖用户手动起过的名字，这里也不需要改激活项。
+    useAppTabsStore().syncTitle(id, sessionLabel(saved))
+    return saved
   }
 
   /** 关闭会话：后端终止它下面所有终端与 SFTP（配置保留）。 */
@@ -248,6 +298,7 @@ export const useHomeStore = defineStore('home', () => {
     test,
     trust,
     openSession,
+    renameSession,
     closeSession,
     forgetSession,
     restore,

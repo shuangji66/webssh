@@ -1,18 +1,23 @@
 <script setup lang="ts">
-// SessionView — 一个已打开会话的视图：左栏（面包屑 + 文件树）+ 子标签栏 + 面板区。
+// SessionView — 一个已打开会话的视图：左栏（面包屑按钮条 + 文件树）+ 子标签栏 + 面板区。
 //
-// 三条不能改的规则：
+// 四条不能改的规则：
 //  1. **激活子标签只有 sessionUi 一个来源**（契约 6.1）：终端标签激活写自己的 uid，
-//     文件管理写 FILES_TAB。终端 store 的 ensure/add/closeTab 也会同步它，这里不再自己改。
-//  2. 面板**全部保持挂载**，只切显隐，而且必须用 `visibility: hidden`（Tailwind 的
+//     移动端的文件管理页写 FILES_TAB。终端 store 的 ensure/add/closeTab 也会同步它，这里不再自己改。
+//  2. **桌面端主区域由 sessionUi.mainMode 决定**（契约 11.2）：子标签栏里只有终端标签 + `+`，
+//     没有常驻的「文件管理」标签；切到完整文件管理靠左栏按钮条里的图标（BreadcrumbBar 自己
+//     调 store，见 11.3）。移动端没有左栏可用，才保留固定的「文件管理」子标签，此时主区域由
+//     activeSub 决定。
+//  3. 面板**全部保持挂载**，只切显隐，而且必须用 `visibility: hidden`（Tailwind 的
 //     `invisible`）而**不能**用 v-show / display:none：display:none 下容器尺寸为 0，
 //     xterm 的 FitAddon 量不到尺寸（fit 出的行列数是错的），WebGL 渲染器还会被 0 尺寸反复
 //     触发重排；visibility 保留元素尺寸，xterm 根本不知道自己被隐藏过，重新可见时尺寸本来就是
 //     对的、不需要重新 fit（style.css 里 xterm 滚动条那段写 `visibility: inherit` 就是这个前提）。
 //     `invisible` 只挂在面板自己身上：FileManager 的弹窗（UploadDialog/PreviewDialog）都
 //     Teleport 到 body，不受这里影响（已在两个组件里确认）。
-//  3. 激活项指向一个**已经不存在的终端 uid** 时也要显示文件管理面板：否则两块面板都隐藏，
-//     用户看到一片空白（面板区是 absolute 叠放的，谁也盖不住谁）。
+//  4. 主区域绝不允许落在「两块面板都隐藏」的中间态（面板是 absolute 叠放的，谁也盖不住谁，
+//     用户看到的就是一片空白）：桌面端 mainMode 停在「终端」却一个终端标签都没有时交给文件管理；
+//     sessionUi 指向一个已经不存在的终端 uid 时退到本会话最后激活的终端。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { useMobileLayout } from '@/composables/useMobileLayout'
@@ -29,11 +34,6 @@ import PromptDialog from '@/components/PromptDialog.vue'
 
 const props = defineProps<{ sid: string }>()
 
-const emit = defineEmits<{
-  (e: 'settings'): void
-  (e: 'quick-cmds'): void
-}>()
-
 const sessionUi = useSessionUiStore()
 const terminals = useTerminalsStore()
 const paneControls = usePaneControlsStore()
@@ -41,25 +41,48 @@ const isMobile = useMobileLayout()
 
 const termTabs = computed(() => terminals.tabsOf(props.sid))
 const activeSub = computed(() => sessionUi.activeSubOf(props.sid))
-/** 面板区当前该显示文件管理吗（激活项是 files，或指向一个已不存在的终端 uid）。 */
-const filesActive = computed(
-  () =>
-    activeSub.value === FILES_TAB || !termTabs.value.some((tab) => tab.uid === activeSub.value)
-)
+
+/**
+ * 主区域该显示文件管理吗。
+ *
+ * 桌面：由 mainMode 决定（左栏按钮条的「完整文件管理」切换）；一个终端标签都没有时也退回
+ * 文件管理——终端模式下没有任何面板可显示，硬留着就是一片空白（规则 4）。
+ * 移动：没有左栏，主区域只能由固定子标签 FILES_TAB 决定；同样兜住「一个终端都没有」。
+ */
+const filesActive = computed(() => {
+  if (isMobile.value) return activeSub.value === FILES_TAB || termTabs.value.length === 0
+  return sessionUi.mainModeOf(props.sid) === 'files' || termTabs.value.length === 0
+})
+
+/**
+ * 工具条 / 快捷指令的作用对象：sessionUi 指的那个终端；它指向文件管理（移动端固定子标签）
+ * 或一个已经不存在的 uid 时，退到「本会话最后激活的终端」，再没有就用最后一个标签。
+ */
+const activeTermUid = computed(() => {
+  const list = termTabs.value
+  const sub = activeSub.value
+  if (list.some((tab) => tab.uid === sub)) return sub
+  return terminals.activeOf(props.sid)?.uid ?? list.at(-1)?.uid ?? null
+})
+
+/**
+ * 当前实际显示出来的那个终端（文件管理在前台时为 null）。
+ *
+ * 与 activeTermUid 分开：工具条在文件管理模式下仍要能打到「最后用的那个终端」，而面板区
+ * 此时只显示文件管理。桌面端 sessionUi 停在 FILES_TAB（比如刚从移动端视口切过来）时也要
+ * 退到那个终端，否则面板区会空着（规则 4）。
+ */
+const visibleTermUid = computed(() => {
+  if (filesActive.value) return null
+  const sub = activeSub.value
+  if (termTabs.value.some((tab) => tab.uid === sub)) return sub
+  return activeTermUid.value
+})
 
 // ---------- 工具条的作用对象 ----------
 
-/**
- * 工具条按钮 / 快捷指令发到哪个终端：先用 sessionUi 指的那个终端；它指向文件管理
- * （或一个已经不存在的 uid）时退到「本会话最后激活的终端」，一个终端都没有才算没有目标。
- */
 function controlsFor() {
-  const list = termTabs.value
-  const sub = activeSub.value
-  const uid = list.some((tab) => tab.uid === sub)
-    ? sub
-    : (terminals.activeOf(props.sid)?.uid ?? list.at(-1)?.uid ?? null)
-  return paneControls.get(props.sid, uid)
+  return paneControls.get(props.sid, activeTermUid.value)
 }
 
 const hasTarget = computed(() => !!controlsFor())
@@ -84,12 +107,16 @@ function runAction(action: 'search' | 'paste' | 'clear' | 'reconnect', event?: M
 
 // ---------- 子标签切换 ----------
 
+/** 移动端固定的「文件管理」子标签：只切子标签，不动 mainMode（桌面端没有这个入口）。 */
 function activateFiles() {
   sessionUi.setActiveSub(props.sid, FILES_TAB)
 }
 
 function activateTerm(uid: string) {
   sessionUi.setActiveSub(props.sid, uid)
+  // 桌面端停在文件管理模式时，点子标签栏里的终端标签必须能切回终端（否则「点了没反应」）；
+  // 移动端 mainMode 不参与渲染，写它也无害。
+  sessionUi.setMainMode(props.sid, 'terminal')
   focusTermSoon(uid)
 }
 
@@ -111,6 +138,9 @@ function focusTermSoon(uid: string) {
 function addTerminal() {
   // terminals.add 会同时把新标签设为激活项（写入 sessionUi），这里不用再管激活
   const tab = terminals.add(props.sid)
+  // 从文件管理模式点 + 也要回到终端：新建的终端就在面板区里，不能建在看不见的地方
+  // （新面板此时还没可见，focus() 会挂起聚焦意图，等它可见/连上后补发）。
+  sessionUi.setMainMode(props.sid, 'terminal')
   // 新面板刚 push 进模板，要等它挂载完（并完成 paneControls 注册）才能聚焦
   focusTermSoon(tab.uid)
 }
@@ -169,7 +199,7 @@ onMounted(() => {
 
 watch(labelsOn, () => nextTick(updateLabelState))
 
-// ---------- 左栏：显隐 + 拖拽调宽 ----------
+// ---------- 左栏：常驻 + 拖拽调宽 ----------
 
 const LEFT_MIN = 180
 const LEFT_WIDTH_KEY = 'webssh-left-width'
@@ -180,8 +210,8 @@ function leftMax() {
 }
 
 const leftWidth = ref(Math.min(Number(localStorage.getItem(LEFT_WIDTH_KEY)) || 300, leftMax()))
-const leftVisible = computed(() => sessionUi.leftIsVisible(props.sid))
-const showLeft = computed(() => !isMobile.value && leftVisible.value)
+// 左栏常驻（用户明确要求去掉折叠按钮，sessionUi 里的 leftVisible 也已删除）：只有移动端不渲染。
+const showLeft = computed(() => !isMobile.value)
 
 function startResize(event: PointerEvent) {
   // 手柄按下会顺手选中文本 / 触发一次点击，先挡掉
@@ -259,15 +289,17 @@ function onRenamed(value: string) {
 
 <template>
   <div class="flex h-full min-h-0 bg-bg dark:bg-bg-dark">
-    <!-- 左栏（桌面端；移动端不渲染，文件管理直接当子页面） -->
+    <!-- 左栏（桌面端常驻；移动端不渲染 —— 文件管理在窄屏是子页面）。
+         两个子组件都不再向外抛事件：「完整文件管理」由 BreadcrumbBar 自己调 sessionUi，
+         点目录只更新共享的当前目录（契约 11.3），所以这里只传 sid。 -->
     <aside
       v-if="showLeft"
       class="flex shrink-0 flex-col border-r border-line dark:border-line-dark"
       :style="{ width: `${leftWidth}px` }"
-      :title="t('session_left_hint')"
+      :title="t('session_left_title')"
     >
-      <BreadcrumbBar :sid="sid" @show-full="activateFiles" />
-      <FileTree :sid="sid" class="min-h-0 flex-1" @open-files="activateFiles" />
+      <BreadcrumbBar :sid="sid" />
+      <FileTree :sid="sid" class="min-h-0 flex-1" />
     </aside>
     <div
       v-if="showLeft"
@@ -276,9 +308,11 @@ function onRenamed(value: string) {
     ></div>
 
     <section class="flex min-w-0 flex-1 flex-col">
-      <!-- 子标签栏：固定段（文件管理，不参与横向滚动）+ 滚动段（终端标签 + 新建） -->
+      <!-- 子标签栏：滚动段 = 终端标签 + 新建。
+           桌面端**没有**常驻的「文件管理」标签（切换靠左栏按钮条），固定段只有移动端的
+           「文件管理」——它不参与横向滚动，否则终端一多就被挤出屏幕、再也点不回来。 -->
       <div class="flex shrink-0 items-center gap-1 border-b border-line px-2 py-1 dark:border-line-dark">
-        <div class="flex shrink-0 items-center gap-1">
+        <div v-if="isMobile" class="flex shrink-0 items-center gap-1">
           <button
             class="subtab"
             :class="filesActive ? 'subtab-active' : 'subtab-idle'"
@@ -297,28 +331,6 @@ function onRenamed(value: string) {
               <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
             </svg>
             <span class="truncate">{{ t('session_files_tab') }}</span>
-          </button>
-
-          <!-- 左栏开关（桌面端才有左栏） -->
-          <button
-            v-if="!isMobile"
-            class="tree-tool"
-            :class="leftVisible ? '!text-brand' : ''"
-            :title="t('session_left_toggle')"
-            @click="sessionUi.toggleLeft(sid)"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-4 w-4"
-            >
-              <rect x="3" y="4" width="18" height="16" rx="2" />
-              <line x1="9" y1="4" x2="9" y2="20" />
-            </svg>
           </button>
 
           <span class="mx-0.5 h-4 w-px shrink-0 bg-line dark:bg-line-dark"></span>
@@ -503,67 +515,14 @@ function onRenamed(value: string) {
             </svg>
             <span :class="labelsOn ? '' : 'hidden'">{{ t('term_act_reconnect') }}</span>
           </button>
-
-          <button
-            class="g-btn-ghost !h-8 !px-2 text-xs"
-            :title="t('term_act_quick_cmds')"
-            @click="emit('quick-cmds')"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-4 w-4"
-            >
-              <polyline points="4 17 10 11 4 5" />
-              <line x1="12" y1="19" x2="20" y2="19" />
-            </svg>
-            <span :class="labelsOn ? '' : 'hidden'">{{ t('term_act_quick_cmds') }}</span>
-          </button>
-
-          <button class="g-btn-ghost !h-8 !px-2 text-xs" :title="t('term_act_settings')" @click="emit('settings')">
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-4 w-4"
-            >
-              <path
-                d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"
-              />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-            <span :class="labelsOn ? '' : 'hidden'">{{ t('term_act_settings') }}</span>
-          </button>
         </div>
       </div>
 
-      <!-- 移动端第二行工具条：图标常显（触屏没有 hover，也没有「功能名」这个概念） -->
+      <!-- 移动端工具行：图标常显（触屏没有 hover，也没有「功能名」这个概念）。
+           与桌面行一样只留 搜索/粘贴/清屏/重连 —— 快捷指令与设置已挪到顶栏全局入口。 -->
       <div
-        class="flex min-h-10 shrink-0 items-center justify-between gap-0.5 border-b border-line/70 bg-black/[0.03] px-2 py-1.5 md:hidden dark:border-line-dark/70 dark:bg-white/[0.04]"
+        class="flex min-h-10 shrink-0 items-center justify-end gap-0.5 border-b border-line/70 bg-black/[0.03] px-2 py-1.5 md:hidden dark:border-line-dark/70 dark:bg-white/[0.04]"
       >
-        <button class="g-btn-ghost !h-7 !px-2" :title="t('term_act_settings')" @click="emit('settings')">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="h-4 w-4"
-          >
-            <path
-              d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"
-            />
-            <circle cx="12" cy="12" r="3" />
-          </svg>
-        </button>
         <div class="flex items-center gap-0.5">
           <button
             class="g-btn-ghost !h-7 !px-2"
@@ -643,28 +602,10 @@ function onRenamed(value: string) {
               <path d="M3 21v-5h5" />
             </svg>
           </button>
-          <button
-            class="g-btn-ghost !h-7 !px-2"
-            :title="t('term_act_quick_cmds')"
-            @click="emit('quick-cmds')"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-4 w-4"
-            >
-              <polyline points="4 17 10 11 4 5" />
-              <line x1="12" y1="19" x2="20" y2="19" />
-            </svg>
-          </button>
         </div>
       </div>
 
-      <!-- 面板区：全部保持挂载、absolute 叠放，非激活的加 invisible（理由见文件头第 2 条）。
+      <!-- 面板区：全部保持挂载、absolute 叠放，非激活的加 invisible（理由见文件头第 3 条）。
            hidden 的元素不接收指针事件，所以叠着的隐藏面板不会挡住当前面板的操作。 -->
       <div class="relative min-h-0 flex-1">
         <div class="absolute inset-0" :class="filesActive ? '' : 'invisible'">
@@ -675,9 +616,9 @@ function onRenamed(value: string) {
           :key="tab.uid"
           :sid="sid"
           :tab="tab"
-          :active="activeSub === tab.uid"
+          :active="visibleTermUid === tab.uid"
           class="absolute inset-0"
-          :class="activeSub === tab.uid ? '' : 'invisible'"
+          :class="visibleTermUid === tab.uid ? '' : 'invisible'"
         />
       </div>
     </section>

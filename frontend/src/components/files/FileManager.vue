@@ -4,14 +4,39 @@
 // 目录内容全部来自 sftp store（见 stores/sftp.ts 的说明）：这个面板与左栏文件树共用同一份
 // 数据，组件只管「怎么显示」与「把用户动作翻成 store 调用」，不自己缓存目录列表。
 //
-// 弹窗（重命名 / 新建 用 PromptDialog，删除用 ConfirmDialog）由 shell 模块提供，见契约 6.2。
+// 第二轮在这里落的四件事：
+//   1) 列表表头可点排序（升序 → 降序 → 取消），状态与持久化都在 store，这里只画箭头；
+//   2) 权限列在符号（-rw-r--r--）与八进制（0644）之间切换，八进制由 modeToOctal 换算；
+//   3) 「更多」菜单补齐 复制 / 剪切 / 粘贴 / 压缩为 tar.gz / 解压 / 导出至飞牛 /
+//      在此目录新建终端（去掉了「打开」——点行本身就是打开）；
+//   4) 桌面端工具栏加「返回终端」：主区域双模式下，文件管理器占满主区域，用户需要一个
+//      就地回到终端的入口（另一个入口是左栏顶部那个「完整文件管理」图标按钮）。
+//
+// 弹窗（重命名 / 新建 用 PromptDialog，删除与覆盖确认用 ConfirmDialog）由 shell 模块提供，见契约 6.2。
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { t } from '@/i18n'
-import { describeError, type FsEntry, type UploadEntry, type UploadResult } from '@/serverapi'
-import { useSftpStore } from '@/stores/sftp'
+import {
+  ApiError,
+  describeError,
+  type FsEntry,
+  type UploadEntry,
+  type UploadResult
+} from '@/serverapi'
+import { usePaneControlsStore } from '@/stores/paneControls'
 import { useSessionUiStore } from '@/stores/sessionUi'
+import { useSftpStore } from '@/stores/sftp'
+import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
-import { baseName, formatTime, humanSize, joinPath, parentPath, permText } from '@/utils/format'
+import {
+  baseName,
+  formatTime,
+  humanSize,
+  joinPath,
+  modeToOctal,
+  parentPath,
+  permText,
+  type SortKey
+} from '@/utils/format'
 import { revealActive, wheelToHorizontal } from '@/utils/scroll'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import PromptDialog from '@/components/PromptDialog.vue'
@@ -23,6 +48,8 @@ const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
 
 const sftp = useSftpStore()
 const sessionUi = useSessionUiStore()
+const terminals = useTerminalsStore()
+const panes = usePaneControlsStore()
 const toastStore = useToastStore()
 
 /** 统一的提示出口：文案一律走 i18n，失败必须说清原因（不能「点了没反应」）。 */
@@ -31,6 +58,8 @@ function toast(msg: string, type: 'success' | 'error' | 'info' = 'error') {
 }
 
 const state = computed(() => sftp.stateOf(sid))
+/** 展示用条目：排序（若启用）在 store 里算，这里拿到的已经是最终顺序。 */
+const entries = computed(() => sftp.sorted(sid))
 const selected = computed(() => state.value.selected)
 const selecting = computed(() => selected.value.length > 0)
 
@@ -38,6 +67,12 @@ const selecting = computed(() => selected.value.length > 0)
 
 // ensure 幂等（左栏文件树也会调它），失败时内部会允许重试，因此这里不需要额外判重。
 watch(() => sid, (id) => void sftp.ensure(id), { immediate: true })
+
+/**
+ * 运行信息（导出目标目录 / 压缩包输出目录）也要尽早拿：它对「导出至飞牛」这个菜单项是
+ * 禁用还是可点说了算，等到用户点开菜单才去请求，会先闪一下「不可用」。
+ */
+watch(() => sid, () => void sftp.ensureRuntime(), { immediate: true })
 
 // 换目录就清掉选择：选择项是按「当前目录下的完整路径」记的，跟着跑到别的目录去，
 // 「删除所选」会在用户看不见的地方删东西。
@@ -80,18 +115,90 @@ function retry() {
   void (state.value.dir ? sftp.refresh(sid) : sftp.ensure(sid))
 }
 
-function toTree() {
-  // 左栏被关掉过就一直关着（见 sessionUi 的约定），这里负责把它叫回来
-  sessionUi.setLeftVisible(sid, true)
-}
-
 function toggleView() {
   sftp.setView(sid, state.value.view === 'list' ? 'grid' : 'list')
 }
 
 function selectAll() {
-  sftp.select(sid, state.value.entries.map((entry) => entry.path))
+  sftp.select(
+    sid,
+    entries.value.map((entry) => entry.path)
+  )
 }
+
+/**
+ * 回到终端。
+ *
+ * 主区域双模式（桌面）下，文件管理器占满主区域，这个按钮就是回程；切换之后还要把焦点
+ * 还给 xterm——只切模式不聚焦的话，用户接着敲的字符没有落点（要点一下终端才生效），
+ * 这正是「点了按钮就没反应」的经典来源。
+ */
+function backToTerminal() {
+  sessionUi.setMainMode(sid, 'terminal')
+  focusTerminal()
+}
+
+/** 聚焦当前激活的终端；activeOf 为 null（激活项在文件管理上）时退回第一个终端。 */
+function focusTerminal() {
+  void nextTick(() => {
+    const uid = terminals.activeOf(sid)?.uid ?? terminals.tabsOf(sid)[0]?.uid
+    if (uid) panes.get(sid, uid)?.focus()
+  })
+}
+
+/** 在当前（或菜单指向的）目录里新开一个终端。 */
+function openTerminalHere(dir: string) {
+  const target = dir || state.value.dir
+  if (!target) return
+  hideMenu()
+  terminals.openTerminalAt(sid, target)
+  // 「在此目录新建终端」的结果是终端，不把主区域切过去就等于没有反馈（桌面）
+  sessionUi.setMainMode(sid, 'terminal')
+  focusTerminal()
+}
+
+// ---- 排序 / 权限显示 ----
+
+/** 表头：key 用来排序，宽度类必须与列表行一致，否则表头与内容会错位。 */
+const headers = computed<{ key: SortKey; label: string; cls: string }[]>(() => [
+  { key: 'name', label: t('files_name'), cls: 'min-w-0 flex-1 justify-start' },
+  { key: 'size', label: t('files_size'), cls: 'w-16 shrink-0 justify-end' },
+  { key: 'mtime', label: t('files_modified'), cls: 'w-24 shrink-0 justify-end' }
+])
+
+/** 该列当前的排序方向；null = 这一列没在排序。 */
+function sortDirOf(key: SortKey): 'asc' | 'desc' | null {
+  return state.value.sort.key === key ? state.value.sort.dir : null
+}
+
+/**
+ * 表头的提示与无障碍名：说明**点下去会发生什么**（循环 升序 → 降序 → 取消），
+ * 而不是当前状态——用户看到箭头就知道现在是什么状态了。
+ */
+function sortTitle(key: SortKey, label: string): string {
+  const dir = sortDirOf(key)
+  const next =
+    dir === null ? t('files_sort_asc') : dir === 'asc' ? t('files_sort_desc') : t('files_sort_none')
+  return `${label} ${next}`
+}
+
+/** 权限列的文本：符号串原样显示，八进制由 modeToOctal 从符号串换算（认不出来就留空）。 */
+function modeText(entry: FsEntry): string {
+  return state.value.mode === 'octal' ? modeToOctal(entry.mode) : permText(entry.mode)
+}
+
+/** 权限显示模式按钮的提示 = **目标**形态（点下去会切成什么）。 */
+const modeTitle = computed(() =>
+  state.value.mode === 'symbolic' ? t('files_mode_octal') : t('files_mode_symbolic')
+)
+
+/**
+ * 压缩包输出目录的说明条。
+ *
+ * 压缩完成后 store 会把当前目录切到 archiveDir（产物在那儿），用户会突然站在 /tmp 下——
+ * 这一行就是回答「我为什么在这儿」，否则看起来像是自己跳错了目录。
+ */
+const inArchiveDir = computed(() => !!sftp.archiveDir() && state.value.dir === sftp.archiveDir())
 
 // ---- 行内菜单（右键 / 「···」都走它） ----
 
@@ -105,6 +212,8 @@ function openMenu(entry: FsEntry, event: MouseEvent) {
   menu.x = event.clientX
   menu.y = event.clientY
   menu.path = entry.path
+  // 菜单里「导出至飞牛」是否可点取决于运行信息：万一 home store 那次请求失败了，这里再试一次
+  void sftp.ensureRuntime()
   // 先按指针位置摆好，渲染出来量到真实尺寸后再夹回窗口内（同一帧内完成，看不出来）
   void nextTick(clampMenu)
   window.setTimeout(() => window.addEventListener('click', hideMenu, { once: true }), 0)
@@ -317,20 +426,42 @@ async function doRename(path: string, name: string) {
   }
 }
 
+/**
+ * 菜单动作作用在哪些路径上。
+ *
+ * 「右键点在选中项上」就作用于整个选择：用户已经勾了三项，再对着其中一项点删除，意图显然是
+ * 删这三项（资源管理器都是这个行为）。右键点在没勾的项上则只作用于它自己，避免「顺手点开
+ * 另一项、结果删掉了刚才勾的一批」。压缩用得上多项，复制 / 剪切 / 删除同理。
+ */
+function targetPaths(entry: FsEntry): string[] {
+  if (selected.value.length > 1 && selected.value.includes(entry.path)) return [...selected.value]
+  return [entry.path]
+}
+
 function askDelete(entry: FsEntry) {
   hideMenu()
-  askConfirm(
-    t('common_tip'),
-    t('files_delete_confirm', { name: entry.name }),
-    () => void removePaths([entry])
+  const targets = targetPaths(entry)
+  if (targets.length > 1) {
+    askConfirm(
+      t('common_tip'),
+      t('files_delete_selected_confirm', { n: targets.length }),
+      () => void removePaths(targets)
+    )
+    return
+  }
+  askConfirm(t('common_tip'), t('files_delete_confirm', { name: entry.name }), () =>
+    void removePaths(targets)
   )
 }
 
-async function removePaths(entries: FsEntry[]) {
+/** 按路径逐个删（后端一次只收一个路径）。dir 取当下列表里的真实类型。 */
+async function removePaths(paths: string[]) {
   // 单个删除给一条「已删除 xxx」；批量删只报失败——一次删十项弹十条提示反而盖住了报错
-  const single = entries.length === 1 ? entries[0] : null
+  const single = paths.length === 1 ? state.value.entries.find((e) => e.path === paths[0]) : null
   let failed = false
-  for (const entry of entries) {
+  for (const path of paths) {
+    const entry = state.value.entries.find((e) => e.path === path)
+    if (!entry) continue
     try {
       await sftp.remove(sid, entry.path, entry.dir)
     } catch (e) {
@@ -343,16 +474,112 @@ async function removePaths(entries: FsEntry[]) {
 }
 
 function askDeleteSelected() {
-  const entries = state.value.entries.filter((entry) => selected.value.includes(entry.path))
-  if (!entries.length) {
+  const paths = selected.value.filter((path) => state.value.entries.some((e) => e.path === path))
+  if (!paths.length) {
     sftp.clearSelection(sid)
     return
   }
-  askConfirm(
-    t('common_tip'),
-    t('files_delete_selected_confirm', { n: entries.length }),
-    () => void removePaths(entries)
+  askConfirm(t('common_tip'), t('files_delete_selected_confirm', { n: paths.length }), () =>
+    void removePaths(paths)
   )
+}
+
+// ---- 剪贴板：复制 / 剪切 / 粘贴 ----
+
+function copyEntries(paths: string[]) {
+  hideMenu()
+  sftp.copyToClipboard(sid, paths)
+  toast(t('files_copied_items', { n: paths.length }), 'success')
+}
+
+function cutEntries(paths: string[]) {
+  hideMenu()
+  sftp.cutToClipboard(sid, paths)
+  toast(t('files_cut_items', { n: paths.length }), 'success')
+}
+
+/**
+ * 粘贴到某个目录。
+ *
+ * 失败**不清空**剪贴板（由 store 保证），用户可以重试或换个目录粘；成功后清空，避免
+ * 「同一批再粘一遍」这种误操作真的多出一份文件。失败原因原样报出来（同名 / 权限 / 目标没了）。
+ */
+async function pasteInto(toDir: string) {
+  hideMenu()
+  if (!toDir) return
+  // 剪贴板里第一项的名字：后端把「同名」报成 duplicate 错误码时（11.5 的表格两种都提了，
+  // 实现按 skipped 回，这里把两种都兜住）用它说明是哪一个撞了名字。
+  const first = sftp.clipboardFor(sid)?.paths[0]
+  try {
+    const res = await sftp.paste(sid, toDir)
+    if (res.count) toast(t('files_paste_done', { n: res.count }), 'success')
+    // 后端只回「跳过了几项」，名字是 store 按「源里的名字没出现在结果里」对出来的
+    const conflict = res.conflicts[0]
+    if (res.skipped && conflict) toast(t('files_paste_exists', { name: conflict }))
+  } catch (e) {
+    if (e instanceof ApiError && e.code === 'duplicate') {
+      toast(first ? t('files_paste_exists', { name: baseName(first) }) : t('files_op_failed_short'))
+      return
+    }
+    toast(t('files_op_failed', { error: describeError(e) }))
+  }
+}
+
+// ---- 压缩 / 解压 / 导出至飞牛 ----
+
+/** 可解压判据：tar 家族 + zip。后缀表与后端 archive.go 的 tarExts 逐字对应。 */
+const ARCHIVE_RE = /\.(tar|tar\.gz|tgz|tar\.bz2|tbz|tbz2|tar\.xz|txz|tar\.zst|tzst|zip)$/i
+
+function isArchive(name: string): boolean {
+  return ARCHIVE_RE.test(name)
+}
+
+/**
+ * 压缩为 tar.gz。
+ *
+ * 归档名（按被压缩项推导）与「跳到产物目录」都在 store 里做：产物落在服务端固定的
+ * archiveDir 下，用户点压缩的目的就是拿到那个包，停在原目录只看到一条 toast 等于没完成。
+ */
+async function compressEntries(paths: string[]) {
+  hideMenu()
+  if (!paths.length) return
+  try {
+    const archive = await sftp.compress(sid, paths)
+    toast(t('files_compress_done', { path: archive.path }), 'success')
+  } catch (e) {
+    toast(t('files_op_failed', { error: describeError(e) }))
+  }
+}
+
+async function extractEntry(entry: FsEntry) {
+  hideMenu()
+  try {
+    const dir = await sftp.extract(sid, entry.path)
+    toast(t('files_extract_done', { dir }), 'success')
+  } catch (e) {
+    toast(t('files_op_failed', { error: describeError(e) }))
+  }
+}
+
+/**
+ * 导出至飞牛（NAS 共享目录）。
+ *
+ * 目标已有同名项时后端回 `duplicate`，这里**不静默覆盖**：问一次再带着 overwrite 重试。
+ * 别的失败原样报出（未配置共享目录后端也会直接回 no_share_path）。
+ */
+async function exportEntry(entry: FsEntry, overwrite: boolean) {
+  hideMenu()
+  try {
+    const out = await sftp.exportToNas(sid, entry.path, overwrite)
+    toast(t('files_export_nas_done', { path: out.path }), 'success')
+  } catch (e) {
+    if (e instanceof ApiError && e.code === 'duplicate') {
+      // 拿被导出的那个路径当确认信息：用户要能看出「覆盖的是哪一个」
+      askConfirm(t('files_export_overwrite'), entry.path, () => void exportEntry(entry, true))
+      return
+    }
+    toast(t('files_op_failed', { error: describeError(e) }))
+  }
 }
 
 // ---- 上传：弹窗（三来源） + 拖拽（带进度与取消） ----
@@ -424,18 +651,70 @@ function onUploaded(_result: UploadResult) {
 
 // ---- 菜单项 ----
 
-type MenuItem = { label: string; run: () => void; danger?: boolean }
+/**
+ * `dim` = 看起来不可点，但点下去会给一句原因。
+ *
+ * 为什么不用真的 disabled：真 disabled 的按钮连事件都没有，「导出至飞牛」在没配共享目录时
+ * 就会变成用户不知道为什么不响的按钮；给一句「未配置飞牛共享目录」才知道该怎么办。
+ */
+type MenuItem = { label: string; run: () => void; danger?: boolean; dim?: boolean }
+
+/** 粘贴项：没有剪贴板就整项不出现；剪贴板来自别的会话时禁用并说明原因（11.4）。 */
+function pasteItem(toDir: string): MenuItem | null {
+  if (sftp.clipboardIsForeign(sid)) {
+    return {
+      label: t('files_paste'),
+      dim: true,
+      run: () => toast(t('files_paste_cross_session'), 'info')
+    }
+  }
+  if (!sftp.clipboardFor(sid)) return null
+  return { label: t('files_paste'), run: () => void pasteInto(toDir) }
+}
+
+/** 导出项：exportRoot 为空 = 服务端没配共享目录，禁用并说明。 */
+function exportItem(entry: FsEntry): MenuItem {
+  if (!sftp.exportRoot()) {
+    return {
+      label: t('files_export_nas'),
+      dim: true,
+      run: () => toast(t('files_export_nas_unavailable'), 'info')
+    }
+  }
+  return { label: t('files_export_nas'), run: () => void exportEntry(entry, false) }
+}
 
 const menuItems = computed<MenuItem[]>(() => {
-  const entry = state.value.entries.find((item) => item.path === menu.path)
+  const entry = entries.value.find((item) => item.path === menu.path)
   if (!entry) return []
-  return [
-    { label: t('files_open'), run: () => openEntry(entry) },
-    { label: t('files_download'), run: () => void downloadEntry(entry) },
-    { label: t('files_rename'), run: () => renameEntry() },
-    { label: t('files_copy_path'), run: () => void copyPath(entry.path) },
-    { label: t('common_delete'), danger: true, run: () => askDelete(entry) }
-  ]
+  const targets = targetPaths(entry)
+  const items: MenuItem[] = []
+  // 顺序按契约 11.4：粘贴（有剪贴板时）/ 重命名 / 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 /
+  // 压缩为 tar.gz / 解压（可解压时）/ 复制完整路径 / 在此目录新建终端
+  const paste = pasteItem(entry.dir ? entry.path : state.value.dir)
+  if (paste) items.push(paste)
+  items.push({ label: t('files_rename'), run: renameEntry })
+  items.push({ label: t('files_copy'), run: () => copyEntries(targets) })
+  items.push({ label: t('files_cut'), run: () => cutEntries(targets) })
+  items.push({ label: t('common_delete'), danger: true, run: () => askDelete(entry) })
+  items.push({ label: t('files_download'), run: () => void downloadEntry(entry) })
+  items.push(exportItem(entry))
+  items.push({
+    label:
+      targets.length > 1
+        ? t('files_compress_selected', { n: targets.length })
+        : t('files_compress'),
+    run: () => void compressEntries(targets)
+  })
+  if (!entry.dir && isArchive(entry.name)) {
+    items.push({ label: t('files_extract'), run: () => void extractEntry(entry) })
+  }
+  items.push({ label: t('files_copy_path'), run: () => void copyPath(entry.path) })
+  items.push({
+    label: t('files_open_terminal_here'),
+    run: () => openTerminalHere(entry.dir ? entry.path : state.value.dir)
+  })
+  return items
 })
 
 onBeforeUnmount(hideMenu)
@@ -650,14 +929,30 @@ onBeforeUnmount(hideMenu)
           <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
         </svg>
       </button>
-      <!-- 移动端没有左栏，也就没有东西可切 -->
+      <!--
+        权限显示模式开关：只在桌面端出现——权限列本身在移动端不渲染（列宽不够），
+        留着这个按钮就会是「点了什么也没变」。
+        图标区显示的是**当前**形态的文字（-rw / 0644）：两种状态用图形区分不出来，
+        直接显示它把权限画成什么样最直观，也和权限列的等宽字体对得上。
+      -->
       <button
         v-if="!mobile"
         type="button"
         class="tree-tool"
-        :title="t('files_switch_to_tree')"
-        :aria-label="t('files_switch_to_tree')"
-        @click="toTree"
+        :title="modeTitle"
+        :aria-label="modeTitle"
+        @click="sftp.toggleMode(sid)"
+      >
+        <span class="font-mono text-[11px]">{{ state.mode === 'octal' ? '0644' : '-rw-' }}</span>
+      </button>
+      <!-- 桌面端的「返回终端」：文件管理器占满主区域时，这是就地切回终端的入口 -->
+      <button
+        v-if="!mobile"
+        type="button"
+        class="tree-tool"
+        :title="t('session_hide_files')"
+        :aria-label="t('session_hide_files')"
+        @click="backToTerminal"
       >
         <svg
           class="h-4 w-4"
@@ -668,8 +963,9 @@ onBeforeUnmount(hideMenu)
           stroke-linecap="round"
           stroke-linejoin="round"
         >
-          <path d="M4 4h16v16H4z" />
-          <path d="M9 4v16" />
+          <path d="M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3" />
+          <path d="m16 8-4 4 4 4" />
+          <path d="M20 12h-8" />
         </svg>
       </button>
     </div>
@@ -713,6 +1009,14 @@ onBeforeUnmount(hideMenu)
       </template>
     </div>
 
+    <!-- 站在压缩包输出目录时说明一句：用户是被「压缩完成后跳转」带过来的 -->
+    <div
+      v-if="inArchiveDir"
+      class="shrink-0 truncate border-b border-line px-2 py-1 text-[11px] text-ink-faint dark:border-line-dark"
+    >
+      {{ t('files_archive_dir', { dir: sftp.archiveDir() }) }}
+    </div>
+
     <!-- 拖拽上传的进度与取消（工具栏「上传」走弹窗自带的进度） -->
     <div
       v-if="dropUploading"
@@ -732,14 +1036,39 @@ onBeforeUnmount(hideMenu)
       </button>
     </div>
 
-    <!-- 列表的表头：目录不显示大小，所以那一格留空；权限列在移动端省掉（列宽不够） -->
+    <!--
+      列表的表头：名称 / 大小 / 修改时间三列可点排序（循环 升序 → 降序 → 取消）。
+      目录恒在文件前面由 compareEntries 保证，与点哪一列无关。
+      权限列在移动端省掉（列宽不够），与工具栏那个显示模式开关的显隐一致。
+    -->
     <div
       v-if="state.view === 'list'"
       class="flex shrink-0 items-center gap-2 border-b border-line px-2 py-1 text-xs font-medium text-ink-soft dark:border-line-dark dark:text-ink-soft-dark"
     >
-      <span class="min-w-0 flex-1">{{ t('files_name') }}</span>
-      <span class="w-16 shrink-0 text-right">{{ t('files_size') }}</span>
-      <span class="w-24 shrink-0 text-right">{{ t('files_modified') }}</span>
+      <button
+        v-for="head in headers"
+        :key="head.key"
+        type="button"
+        class="flex items-center gap-0.5 rounded px-0.5 hover:text-ink dark:hover:text-white"
+        :class="head.cls"
+        :title="sortTitle(head.key, head.label)"
+        :aria-label="sortTitle(head.key, head.label)"
+        @click="sftp.cycleSort(sid, head.key)"
+      >
+        <span class="truncate">{{ head.label }}</span>
+        <svg
+          v-if="sortDirOf(head.key)"
+          class="h-3 w-3 shrink-0"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path :d="sortDirOf(head.key) === 'asc' ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'" />
+        </svg>
+      </button>
       <span v-if="!mobile" class="w-20 shrink-0 text-right">{{ t('files_mode') }}</span>
       <span class="w-6 shrink-0" />
     </div>
@@ -764,13 +1093,13 @@ onBeforeUnmount(hideMenu)
         </button>
       </div>
 
-      <div v-else-if="!state.entries.length" class="px-3 py-6 text-center text-sm text-ink-faint">
+      <div v-else-if="!entries.length" class="px-3 py-6 text-center text-sm text-ink-faint">
         {{ t('files_empty') }}
       </div>
 
       <template v-else-if="state.view === 'list'">
         <div
-          v-for="entry in state.entries"
+          v-for="entry in entries"
           :key="entry.path"
           class="group flex cursor-pointer items-center gap-2 border-b border-line/60 px-2 py-1.5 text-sm hover:bg-black/5 dark:border-line-dark/60 dark:hover:bg-white/5"
           :class="selected.includes(entry.path) ? 'bg-brand-soft' : ''"
@@ -814,8 +1143,11 @@ onBeforeUnmount(hideMenu)
           <span class="w-24 shrink-0 text-right text-xs text-ink-faint">
             {{ formatTime(entry.mtime) }}
           </span>
-          <span v-if="!mobile" class="w-20 shrink-0 truncate text-right font-mono text-[11px] text-ink-faint">
-            {{ permText(entry.mode) }}
+          <span
+            v-if="!mobile"
+            class="w-20 shrink-0 truncate text-right font-mono text-[11px] text-ink-faint"
+          >
+            {{ modeText(entry) }}
           </span>
           <button
             type="button"
@@ -847,7 +1179,7 @@ onBeforeUnmount(hideMenu)
         style="grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr))"
       >
         <div
-          v-for="entry in state.entries"
+          v-for="entry in entries"
           :key="entry.path"
           class="group relative flex cursor-pointer flex-col items-center gap-1 rounded-md border border-transparent px-2 py-2 text-center hover:border-line hover:bg-black/5 dark:hover:border-line-dark dark:hover:bg-white/5"
           :class="selected.includes(entry.path) ? 'bg-brand-soft' : ''"
@@ -920,7 +1252,11 @@ onBeforeUnmount(hideMenu)
         :key="item.label"
         type="button"
         class="block w-full whitespace-nowrap px-3 py-1.5 text-left hover:bg-black/5 dark:hover:bg-white/5"
-        :class="item.danger ? 'text-danger' : 'text-ink dark:text-ink-dark'"
+        :class="[
+          item.danger ? 'text-danger' : 'text-ink dark:text-ink-dark',
+          item.dim ? 'opacity-50' : ''
+        ]"
+        :aria-disabled="item.dim ? 'true' : 'false'"
         @click="item.run()"
       >
         {{ item.label }}

@@ -113,12 +113,24 @@ function startRename(tab: AppTab) {
   renameVisible.value = true
 }
 
-function onRenamed(value: string) {
+async function onRenamed(value: string) {
   const target = renameTarget.value
   renameTarget.value = null
-  if (!target) return
-  // 清空 = 放弃改名（保持原样）；store 里也会拒绝空值
-  tabs.setTitle(target.id, value)
+  const next = value.trim()
+  // 清空 = 放弃改名（保持原样；store 里也会拒绝空值）
+  if (!target || !next) return
+  // 先改展示层：改名必须立刻可见，等一个网络往返再变的话用户会以为没生效
+  const before = target.title
+  tabs.setTitle(target.id, next)
+  try {
+    // 从这一轮起标签名就是会话名（契约 11.1.4）：改名要跟着落进会话配置，否则刷新页面
+    // （或换个设备打开）名字又变回去。home.renameSession 成功后会把配置与标签一起同步。
+    await home.renameSession(target.id, next)
+  } catch (e) {
+    // 配置没存住就把展示层回滚，否则会出现「顶栏显示新名、刷新后变回旧名」的前后不一致
+    tabs.setTitle(target.id, before)
+    toast.show(t('home_rename_failed', { error: describeError(e) }), 'error')
+  }
 }
 
 function cancelRename() {

@@ -1,15 +1,28 @@
 <script setup lang="ts">
-// QuickCmdsDialog — 快捷指令列表（全局 / 会话专属两个分组），从顶栏或会话工具条打开。
+// QuickCmdsDialog — 快捷指令弹窗，三页：常用指令 / 全局 / 专属（契约 11.6）。
 //
-// 点击一条命令 = 发到「当前激活的终端」：
+// 点击一条命令（内置清单里的或用户自己建的）= 发到「当前激活的终端」：
 //   1. 优先 sessionUi 指的那个终端（唯一来源，见冻结的 stores/sessionUi.ts）；
 //   2. 它指向文件管理子标签（或已经不存在的 uid）时，退到本会话最后激活的终端 ——
 //      否则用户在看文件管理时点指令只会得到「终端未连接」，而终端其实好好开着；
 //   3. 一个终端都没有（首页打开弹窗、或移动端还没建终端）才算真的没有目标，toast。
-// 「专属」分组只在会话里可选：首页没有会话上下文，把它藏掉比让它指向某个会话更诚实。
+//
+// 「常用指令」是**内置清单**（`data/presetCommands.ts`，前端纯展示数据）：只读、不能增删改，
+// 所以那一页不显示「+」，也不走后端的整体保存；名字与分组名都走 i18n（`qc_p_*` / `qc_g_*`），
+// 中英文都能显示。危险分组的命令一律 auto: false —— 点一下只填进终端，回车由用户自己按。
+//
+// 「专属」页只在会话里出现：首页没有会话上下文，藏掉比让它指向某个会话更诚实。
 import { computed, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { describeError, type QuickCmd } from '@/serverapi'
+import {
+  DANGER_GROUPS,
+  presetByGroup,
+  presetGroupKey,
+  presetNameKey,
+  type PresetCmd,
+  type PresetGroup
+} from '@/data/presetCommands'
 import { useSessionUiStore } from '@/stores/sessionUi'
 import { useHomeStore } from '@/stores/home'
 import { usePaneControlsStore } from '@/stores/paneControls'
@@ -22,7 +35,7 @@ import QuickCmdEditDialog from './QuickCmdEditDialog.vue'
 
 const props = defineProps<{
   visible: boolean
-  /** 会话 id；首页打开时为空（只显示全局分组）。 */
+  /** 会话 id；首页打开时为空（没有「专属」页，命令也发不到任何终端）。 */
   sid?: string | null
 }>()
 
@@ -37,22 +50,59 @@ const paneControls = usePaneControlsStore()
 const sessionUi = useSessionUiStore()
 const toast = useToastStore()
 
+/**
+ * 面板高度**固定**为内容区的 90%（契约 11.6）。
+ *
+ * 为什么用固定高度而不是 max-h：max-h 只是「不超过」，内容少的面板会缩水 —— 三个页签的内容
+ * 长短差很多（内置清单很长、自建列表可能为空），来回切就会看到面板忽高忽低。固定高度下切换
+ * 页签时窗口边框不动，只有列表在滚。
+ *
+ * 算式与 `.region-center` 定位带完全一致（style.css）：内容区 = 壳层高（--vvh，已被虚拟键盘
+ * 修正）− 顶栏（--header-h）− 移动端键条（--keypad-h）。所以它正好是定位带高度的 90%，
+ * 在带内垂直居中，也不会被键盘盖住。不用 100vh：iOS 上键盘弹起时 vh 会算错。
+ */
+const PANEL_HEIGHT = 'calc((var(--vvh, 100dvh) - var(--header-h, 0px) - var(--keypad-h, 0px)) * 0.9)'
+
 const open = ref(props.visible)
 const sessionId = computed(() => props.sid ?? null)
-const scope = ref<'global' | 'session'>('global')
 
-/** 当前分组对应的「作用域 sid」：null = 全局（与后端 `sid=""` 的约定一致）。 */
-const scopeSid = computed(() => (scope.value === 'session' ? sessionId.value : null))
+/** 三个页签。常用指令排第一：它是这一轮新增的主入口。 */
+type Page = 'preset' | 'global' | 'session'
+const page = ref<Page>('global')
+
+const pages = computed<{ id: Page; label: string }[]>(() => {
+  const out: { id: Page; label: string }[] = [
+    { id: 'preset', label: t('qc_tab_preset') },
+    { id: 'global', label: t('qc_tab_global') }
+  ]
+  // 「专属」只有会话里才有（首页打开时没有会话上下文），少一个页签比让它指向某个会话诚实
+  if (sessionId.value) out.push({ id: 'session', label: t('qc_tab_session') })
+  return out
+})
+
+/** 当前页对应的「作用域 sid」：null = 全局（与后端 `sid=""` 的约定一致）。 */
+const scopeSid = computed<string | null>(() => (page.value === 'session' ? sessionId.value : null))
 
 const list = computed<QuickCmd[]>(() => {
-  if (scope.value === 'session' && sessionId.value) return qc.session[sessionId.value] ?? []
+  if (page.value === 'session' && sessionId.value) return qc.session[sessionId.value] ?? []
   return qc.global
 })
 
-/** 只有「已成功加载」的分组才允许增删改：保存是整体覆盖，未加载就改会把服务端那份覆盖掉。 */
-const loading = computed(() => qc.isLoading(scopeSid.value))
-const failed = computed(() => qc.isFailed(scopeSid.value))
-const ready = computed(() => !loading.value && !failed.value)
+/** 内置清单：按用途分好组，顺序由 PRESET_GROUPS 决定（危险组永远排最后）。 */
+const presetGroups = computed(() => presetByGroup())
+
+/** 危险分组（会改变系统状态）用警示色渲染，且里面的命令一律不自动回车。 */
+function isDanger(group: PresetGroup): boolean {
+  return DANGER_GROUPS.includes(group)
+}
+
+/**
+ * 只有「已成功加载」的分组才允许增删改：保存是整体覆盖，未加载就改会把服务端那份覆盖掉。
+ * 常用指令页的数据是内置常量（没有加载过程），所以它的 loading/failed 恒为假。
+ */
+const loading = computed(() => page.value !== 'preset' && qc.isLoading(scopeSid.value))
+const failed = computed(() => page.value !== 'preset' && qc.isFailed(scopeSid.value))
+const ready = computed(() => page.value !== 'preset' && !loading.value && !failed.value)
 
 /** 上次加载失败的原因（弹窗里要显示出来，不能只说「加载失败」）。 */
 const loadError = ref('')
@@ -63,8 +113,10 @@ const sessionName = computed(() => {
 })
 
 async function loadCurrent() {
+  // 内置清单不需要加载，也不必因为它去打扰后端
+  if (page.value === 'preset') return
   try {
-    if (scope.value === 'session' && sessionId.value) await qc.ensureSession(sessionId.value)
+    if (page.value === 'session' && sessionId.value) await qc.ensureSession(sessionId.value)
     else await qc.ensureGlobal()
     loadError.value = ''
   } catch (e) {
@@ -89,14 +141,20 @@ watch(
     open.value = v
     if (!v) return
     // 每次打开都回到「全局」：会话组是新用户最容易误建的地方（以为建的是全局指令）
-    scope.value = 'global'
+    page.value = 'global'
     void loadCurrent()
   },
   { immediate: true }
 )
 
-watch(scope, (s) => {
-  if (props.visible && s) void loadCurrent()
+watch(page, (p) => {
+  if (props.visible && p) void loadCurrent()
+})
+
+// 会话在弹窗打开期间被关掉 / 关标签：专属页签随之消失，页签必须退回全局 ——
+// 否则会停在一个「当前页签没有按钮」的状态上，而列表还在按错的 scope 读取（显示全局那份）。
+watch(sessionId, (sid) => {
+  if (!sid && page.value === 'session') page.value = 'global'
 })
 
 // ---------- 发送到当前激活终端 ----------
@@ -112,17 +170,28 @@ function currentControls() {
   return paneControls.get(sid, uid)
 }
 
-function run(cmd: QuickCmd) {
+/**
+ * 发给当前激活终端；返回是否真的发出去了（false = 没有可用终端）。
+ * 内置清单与用户自建指令共用这一条出口：`auto` 决定要不要替用户按回车。
+ */
+function sendToActive(content: string, auto: boolean): boolean {
   const ctl = currentControls()
-  const sid = sessionId.value
-  if (!ctl?.connected || !sid) {
+  if (!ctl?.connected) {
     toast.show(t('qc_not_connected'), 'error')
-    return
+    return false
   }
   // 多行命令要按回车逐行执行：直接把 \n 灌进 PTY 只会得到一行乱掉的输入
-  ctl.send(cmd.content.replace(/\r?\n/g, '\r') + (cmd.auto ? '\r' : ''))
+  ctl.send(content.replace(/\r?\n/g, '\r') + (auto ? '\r' : ''))
   ctl.focus()
-  close()
+  return true
+}
+
+function runPreset(cmd: PresetCmd) {
+  if (sendToActive(cmd.content, cmd.auto)) close()
+}
+
+function run(cmd: QuickCmd) {
+  if (sendToActive(cmd.content, cmd.auto)) close()
 }
 
 // ---------- 增删改 ----------
@@ -200,17 +269,19 @@ function close() {
     <Transition name="modal-fade">
       <div v-if="open" class="fixed inset-0 z-50">
         <div class="absolute inset-0 bg-black/50" @click="close"></div>
-        <div class="region-center absolute left-0 right-0 flex items-center justify-center px-4">
+        <div class="region-center absolute left-0 right-0 flex items-center justify-center md:px-4">
           <div
-            class="pointer-events-auto relative flex max-h-[90%] w-full max-w-lg flex-col rounded-xl border border-line bg-surface shadow-pop dark:border-line-dark dark:bg-surface-dark"
+            class="pointer-events-auto relative flex w-[95%] flex-col rounded-xl border border-line bg-surface shadow-pop md:w-full md:max-w-lg dark:border-line-dark dark:bg-surface-dark"
+            :style="{ height: PANEL_HEIGHT }"
           >
-            <!-- 标题 + 新增 / 关闭 -->
+            <!-- 标题 + 新增 / 关闭。常用指令是内置清单，不能增删改，所以那一页没有「+」 -->
             <div class="flex shrink-0 items-center justify-between border-b border-line px-5 py-3 dark:border-line-dark">
               <h3 class="font-display text-base font-semibold text-ink dark:text-ink-dark">
                 {{ t('qc_title') }}
               </h3>
               <div class="flex items-center gap-2">
                 <button
+                  v-if="page !== 'preset'"
                   class="g-btn-primary !h-8 !px-2.5 text-lg leading-none"
                   :disabled="!ready"
                   :title="t('qc_add_title')"
@@ -222,47 +293,108 @@ function close() {
               </div>
             </div>
 
-            <!-- 分组切换：专属分组只在会话里出现 -->
+            <!-- 页签：常用指令 / 全局 / 专属（专属只在会话里出现） -->
             <div class="shrink-0 px-5 pt-3">
               <div
                 class="flex items-center gap-1 rounded-md bg-black/5 p-1 dark:bg-white/5"
                 :title="t('qc_scope_switch')"
               >
                 <button
-                  class="flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors"
+                  v-for="item in pages"
+                  :key="item.id"
+                  class="min-w-0 flex-1 truncate rounded px-2 py-1.5 text-xs font-medium transition-colors"
                   :class="
-                    scope === 'global'
+                    page === item.id
                       ? 'bg-surface text-brand shadow-sm dark:bg-surface-dark'
                       : 'text-ink-soft dark:text-ink-soft-dark'
                   "
-                  @click="scope = 'global'"
+                  @click="page = item.id"
                 >
-                  {{ t('qc_scope_global') }}
-                </button>
-                <button
-                  v-if="sessionId"
-                  class="flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors"
-                  :class="
-                    scope === 'session'
-                      ? 'bg-surface text-brand shadow-sm dark:bg-surface-dark'
-                      : 'text-ink-soft dark:text-ink-soft-dark'
-                  "
-                  @click="scope = 'session'"
-                >
-                  {{ t('qc_scope_session') }}
+                  {{ item.label }}
                 </button>
               </div>
               <p class="mt-2 text-xs text-ink-faint dark:text-ink-faint-dark">
                 {{
-                  scope === 'session'
-                    ? t('qc_session_hint', { name: sessionName })
-                    : t('qc_global_hint')
+                  page === 'preset'
+                    ? t('qc_preset_hint')
+                    : page === 'session'
+                      ? t('qc_session_hint', { name: sessionName })
+                      : t('qc_global_hint')
                 }}
               </p>
             </div>
 
             <!-- 列表 -->
             <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              <!-- 常用指令页：内置清单按用途分组，危险组用警示色 -->
+              <template v-if="page === 'preset'">
+                <div
+                  v-for="group in presetGroups"
+                  :key="group.group"
+                  class="mb-4 last:mb-0"
+                >
+                  <p
+                    class="mb-2 flex items-center gap-1.5 text-xs font-semibold"
+                    :class="
+                      isDanger(group.group)
+                        ? 'text-danger'
+                        : 'text-ink-soft dark:text-ink-soft-dark'
+                    "
+                  >
+                    <svg
+                      v-if="isDanger(group.group)"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-3.5 w-3.5"
+                    >
+                      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                      <path d="M12 9v4" />
+                      <path d="M12 17h.01" />
+                    </svg>
+                    {{ t(presetGroupKey(group.group)) }}
+                  </p>
+
+                  <div class="space-y-2">
+                    <button
+                      v-for="cmd in group.items"
+                      :key="cmd.id"
+                      type="button"
+                      class="block w-full rounded-lg border px-3.5 py-2.5 text-left transition-colors"
+                      :class="
+                        isDanger(group.group)
+                          ? 'border-danger/40 hover:border-danger hover:bg-danger/5'
+                          : 'border-line hover:border-brand/50 dark:border-line-dark'
+                      "
+                      :title="cmd.content"
+                      @click="runPreset(cmd)"
+                    >
+                      <div class="flex min-w-0 items-center gap-2">
+                        <span
+                          class="min-w-0 truncate text-sm font-semibold"
+                          :class="isDanger(group.group) ? 'text-danger' : 'text-ink dark:text-ink-dark'"
+                        >
+                          {{ t(presetNameKey(cmd.id)) }}
+                        </span>
+                        <span
+                          v-if="cmd.auto"
+                          class="inline-flex shrink-0 items-center rounded-full bg-brand-soft px-1.5 py-0.5 text-[10px] font-medium text-brand"
+                        >
+                          {{ t('qc_auto_tag') }}
+                        </span>
+                      </div>
+                      <p class="mt-1 truncate font-mono text-xs text-ink-soft dark:text-ink-soft-dark">
+                        {{ cmd.content }}
+                      </p>
+                    </button>
+                  </div>
+                </div>
+              </template>
+
+              <template v-else>
               <p v-if="loading" class="py-8 text-center text-sm text-ink-soft dark:text-ink-soft-dark">
                 {{ t('common_loading') }}
               </p>
@@ -382,10 +514,17 @@ function close() {
                   </div>
                 </div>
               </div>
+              </template>
             </div>
 
             <div class="shrink-0 border-t border-line px-5 py-2 dark:border-line-dark">
-              <p class="text-[11px] text-ink-faint dark:text-ink-faint-dark">{{ t('qc_send') }}</p>
+              <!-- 常用指令页提示「哪些不会自动执行」；其余两页说明点一下会发生什么 -->
+              <p
+                class="text-[11px]"
+                :class="page === 'preset' ? 'text-warning' : 'text-ink-faint dark:text-ink-faint-dark'"
+              >
+                {{ page === 'preset' ? t('qc_preset_danger') : t('qc_send') }}
+              </p>
             </div>
           </div>
         </div>

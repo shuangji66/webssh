@@ -1,110 +1,165 @@
 <script setup lang="ts">
-// BreadcrumbBar — 左栏顶部的路径条（面包屑 + 家目录快捷入口 + 「完整文件管理」）。
+// BreadcrumbBar — 左栏顶部的**按钮条**（第二轮起不再显示路径，见契约 11.2 / 11.3）。
 //
-// 为什么和 FileManager 里那条面包屑分开写：两者在不同的位置上、承担的事也不一样。左栏很窄
-// （可能只有 11rem），这里必须把分段收成一行横向滚动，并提供「切回完整文件管理」的入口
-// （左栏被关掉之后，用户得有路回到文件管理子标签）；文件管理面板里那条是主视图的导航，
-// 分段要逐个可见、还要和「已选 n 项」共用同一行位置。
-import { computed, nextTick, ref, watch } from 'vue'
+// 为什么去掉路径：左栏宽度只有 11~20rem，一串「根目录 / vol1 / 1000 / docker / …」在这里
+// 只能靠横向滚动看，而它想回答的「我在哪」在文件管理器的面包屑里已经回答过了（那里有整行
+// 宽度）。左栏这一行的价值在于**动作**：
+//   [家目录] [完整文件管理（切换主区域）] [在此目录新建终端] [刷新]
+//
+// 与文件管理器的分工：这里不 emit 任何事件，主区域的切换直接写 sessionUi.mainMode——
+// 唯一的真相在 store 里，组件之间不需要再传一层事件（事件接错一处就会出现「点了没反应」）。
+import { computed, nextTick } from 'vue'
 import { t } from '@/i18n'
+import { usePaneControlsStore } from '@/stores/paneControls'
+import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
-import { revealActive, wheelToHorizontal } from '@/utils/scroll'
+import { useTerminalsStore } from '@/stores/terminals'
 
 const { sid } = defineProps<{ sid: string }>()
-const emit = defineEmits<{ 'show-full': [] }>()
 
 const sftp = useSftpStore()
+const sessionUi = useSessionUiStore()
+const terminals = useTerminalsStore()
+const panes = usePaneControlsStore()
+
 const state = computed(() => sftp.stateOf(sid))
+const filesActive = computed(() => sessionUi.mainModeOf(sid) === 'files')
 
-const rowEl = ref<HTMLElement | null>(null)
+/**
+ * 家目录按钮。
+ *
+ * 做两件事，缺一个都不完整：
+ *   1) 把当前目录切回家目录（这是按钮的本来意思）；
+ *   2) 让树**全部折叠、只展开家目录那一条链路**（11.3）：树可能正开在 /var/log 上，
+ *      光导航过去的话那一行还在屏幕外，用户看不到自己到了哪里。
+ */
+function goHome() {
+  const home = state.value.home
+  if (!home) return
+  void sftp.navigate(sid, home)
+  void sftp.expandPath(sid, home)
+}
 
-/** 分段：第一段固定是根目录，随后每进一层加一段（末段就是当前目录）。 */
-const crumbs = computed(() => {
-  const dir = state.value.dir || state.value.home || ''
-  const out = [{ label: t('session_crumb_root'), path: '/' }]
-  let acc = ''
-  for (const part of dir.split('/').filter(Boolean)) {
-    acc += `/${part}`
-    out.push({ label: part, path: acc })
-  }
-  return out
-})
+/** 切换主区域：终端 ↔ 完整文件管理。切回终端时还要把焦点还给 xterm。 */
+function toggleMain() {
+  const mode = sessionUi.toggleMainMode(sid)
+  if (mode !== 'terminal') return
+  void nextTick(() => {
+    const uid = terminals.activeOf(sid)?.uid ?? terminals.tabsOf(sid)[0]?.uid
+    if (uid) panes.get(sid, uid)?.focus()
+  })
+}
 
-// 进入深层目录后末段会滚出可视区：切片一变就把它滚回来，否则用户看到的永远是开头那段
-watch(
-  () => state.value.dir,
-  () => void nextTick(() => revealActive(rowEl.value, '.crumb-current'))
-)
+/** 在当前目录里新开一个终端（目录还没有（ensure 未完成）时不给点）。 */
+function openTerminalHere() {
+  const dir = state.value.dir || state.value.home
+  if (!dir) return
+  terminals.openTerminalAt(sid, dir)
+  sessionUi.setMainMode(sid, 'terminal')
+  void nextTick(() => {
+    const uid = terminals.activeOf(sid)?.uid ?? terminals.tabsOf(sid)[0]?.uid
+    if (uid) panes.get(sid, uid)?.focus()
+  })
+}
 
-function go(path: string) {
-  if (!path) return
-  void sftp.navigate(sid, path)
+function refresh() {
+  void (state.value.dir ? sftp.refresh(sid) : sftp.ensure(sid))
 }
 </script>
 
 <template>
-  <div class="shrink-0 border-b border-line dark:border-line-dark">
-    <div
-      ref="rowEl"
-      class="thin-scroll flex items-center overflow-x-auto px-2 py-1 text-xs"
-      @wheel="wheelToHorizontal"
+  <div
+    class="flex shrink-0 items-center gap-0.5 border-b border-line px-1 py-1 dark:border-line-dark"
+  >
+    <!-- 家目录：带文字，因为它是这一行里唯一的「去哪」而不是「做什么」 -->
+    <button
+      type="button"
+      class="tree-tool !w-auto gap-1 px-1.5 text-xs"
+      :disabled="!state.home"
+      :title="t('files_home')"
+      :aria-label="t('files_home')"
+      @click="goHome"
     >
-      <template v-for="(seg, i) in crumbs" :key="seg.path">
-        <span v-if="i" class="shrink-0 px-0.5 text-ink-faint">/</span>
-        <button
-          type="button"
-          class="max-w-[9rem] shrink-0 truncate rounded px-1 py-0.5 text-ink-soft hover:bg-black/5 hover:text-ink dark:text-ink-soft-dark dark:hover:bg-white/5 dark:hover:text-white"
-          :class="i === crumbs.length - 1 ? 'crumb-current font-medium text-ink dark:text-ink-dark' : ''"
-          :title="seg.path"
-          @click="go(seg.path)"
-        >
-          {{ seg.label }}
-        </button>
-      </template>
-    </div>
+      <svg
+        class="h-4 w-4 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="m3 10 9-7 9 7v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+        <path d="M9 22V12h6v10" />
+      </svg>
+      <span class="truncate">{{ t('files_home') }}</span>
+    </button>
 
-    <div class="flex items-center gap-1 px-2 pb-1">
-      <button
-        type="button"
-        class="g-btn-ghost h-7 gap-1 px-1.5 text-xs"
-        :disabled="!state.home || state.dir === state.home"
-        :title="t('files_home')"
-        @click="go(state.home)"
+    <!-- 完整文件管理：主区域双模式的开关，当前已经在文件管理时高亮 -->
+    <button
+      type="button"
+      class="tree-tool"
+      :class="filesActive ? '!text-brand' : ''"
+      :title="filesActive ? t('session_hide_files') : t('session_full_files')"
+      :aria-label="filesActive ? t('session_hide_files') : t('session_full_files')"
+      :aria-pressed="filesActive ? 'true' : 'false'"
+      @click="toggleMain"
+    >
+      <svg
+        class="h-4 w-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
       >
-        <svg
-          class="h-3.5 w-3.5"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <path d="m3 10 9-7 9 7v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-          <path d="M9 22V12h6v10" />
-        </svg>
-        <span class="truncate">{{ t('files_home') }}</span>
-      </button>
-      <button
-        type="button"
-        class="g-btn-ghost ml-auto h-7 gap-1 px-1.5 text-xs"
-        :title="t('session_full_files')"
-        @click="emit('show-full')"
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+        <path d="m9 13 2 2 4-4" />
+      </svg>
+    </button>
+
+    <button
+      type="button"
+      class="tree-tool"
+      :disabled="!state.dir && !state.home"
+      :title="t('session_new_terminal_here')"
+      :aria-label="t('session_new_terminal_here')"
+      @click="openTerminalHere"
+    >
+      <svg
+        class="h-4 w-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
       >
-        <svg
-          class="h-3.5 w-3.5"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2z" />
-          <path d="m10 13 2 2 4-4" />
-        </svg>
-        <span class="truncate">{{ t('session_full_files') }}</span>
-      </button>
-    </div>
+        <path d="M4 17l6-5-6-5" />
+        <path d="M12 19h8" />
+      </svg>
+    </button>
+
+    <button
+      type="button"
+      class="tree-tool"
+      :title="t('files_refresh')"
+      :aria-label="t('files_refresh')"
+      @click="refresh"
+    >
+      <svg
+        class="h-4 w-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M21 12a9 9 0 1 1-3-6.7" />
+        <path d="M21 4v5h-5" />
+      </svg>
+    </button>
   </div>
 </template>

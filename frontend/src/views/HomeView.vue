@@ -4,17 +4,22 @@
 // 打开会话的完整接线（契约 6.3）都在这里：home.openSession → appTabs.openSession →
 // terminals.ensure → 桌面端没有终端标签就自动建一个。顺序不能乱：标签要先建好，
 // SessionView 才会挂载，终端面板才有地方登记 paneControls。
+//
+// 「不保存凭据」的会话会在这里收到 `credential_required`（契约 11.1.3）：那不是失败，
+// 而是「请先输入凭据」，所以转成 CredentialPromptDialog，填完带凭据重试一次。
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { t } from '@/i18n'
-import { describeError, type SessionView } from '@/serverapi'
+import { ApiError, describeError, type SessionView } from '@/serverapi'
 import { useMobileLayout } from '@/composables/useMobileLayout'
 import { useAppTabsStore } from '@/stores/appTabs'
-import { useHomeStore } from '@/stores/home'
+import { useHomeStore, type SessionCredential } from '@/stores/home'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
 import { sessionLabel } from '@/utils/format'
 import SessionCard from '@/components/home/SessionCard.vue'
 import SessionFormDialog from '@/components/home/SessionFormDialog.vue'
+import SessionTerminalsDialog from '@/components/home/SessionTerminalsDialog.vue'
+import CredentialPromptDialog from '@/components/CredentialPromptDialog.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 
 const home = useHomeStore()
@@ -23,16 +28,18 @@ const terminals = useTerminalsStore()
 const toast = useToastStore()
 const isMobile = useMobileLayout()
 
-const keyword = ref('')
 const formVisible = ref(false)
 const editing = ref<SessionView | null>(null)
 /** 正在打开/关闭的会话 id（按钮禁用，防连点）。 */
 const busyId = ref('')
 
+/** 终端列表弹窗（点卡片上的「N 个终端」）。空串 = 没打开。 */
+const terminalsSid = ref('')
+const terminalsVisible = ref(false)
+
 // ---------- 卡片列表 ----------
 
 const list = computed(() => {
-  const kw = keyword.value.trim().toLowerCase()
   const items = [...home.sessions]
   // 最近用过的排前面：会话通常比一屏多，常用的应该在第一屏（lastUsedAt 为空时退到 updatedAt）
   items.sort((a, b) => {
@@ -40,16 +47,7 @@ const list = computed(() => {
     const bt = b.lastUsedAt || b.updatedAt || b.createdAt
     return bt.localeCompare(at)
   })
-  if (!kw) return items
-  return items.filter((s) => {
-    return (
-      sessionLabel(s).toLowerCase().includes(kw) ||
-      s.host.toLowerCase().includes(kw) ||
-      s.user.toLowerCase().includes(kw) ||
-      String(s.port).includes(kw) ||
-      (s.note ?? '').toLowerCase().includes(kw)
-    )
-  })
+  return items
 })
 
 const openCount = computed(() => home.sessions.filter((s) => home.isOpen(s.id)).length)
@@ -72,21 +70,64 @@ onBeforeUnmount(() => {
 
 // ---------- 打开 / 关闭 ----------
 
+/**
+ * 待输入凭据的会话（null = 没有弹窗）。loading 与 error 都放在这里：弹窗只是表单，
+ * 「正在连接 / 上次为什么失败」属于调用方的状态（它才知道 open 的结果）。
+ */
+const credPrompt = ref<{ session: SessionView; loading: boolean; error: string } | null>(null)
+
+/** 后端要求的「请先输入凭据」（不保存凭据的会话）。 */
+function needsCredential(e: unknown): boolean {
+  return e instanceof ApiError && e.code === 'credential_required'
+}
+
+/**
+ * 真正执行打开：openSession（可带凭据）→ 建应用标签 → 恢复/新建终端。
+ *
+ * 抽出来是因为它要跑两次——第一次不带凭据，收到 credential_required 后带着用户填的凭据再跑
+ * 一次。两次的顺序完全一样，复制一份必然有一份会先腐坏。
+ */
+async function openWith(session: SessionView, credential?: SessionCredential) {
+  const state = await home.openSession(session.id, credential)
+  tabs.openSession(session.id, sessionLabel(session))
+  // ensure 恢复后端已有的终端（并把激活项落到第一个），add 新建即激活 —— 两者都会写
+  // sessionUi，这里不需要（也不应该）再去改激活项，否则会和 store 的选择打架。
+  terminals.ensure(session.id, state)
+  if (!isMobile.value && terminals.countOf(session.id) === 0) terminals.add(session.id)
+  toast.show(t('home_open_success', { name: sessionLabel(session) }), 'success')
+}
+
 async function onOpen(session: SessionView) {
   if (busyId.value) return
   busyId.value = session.id
   try {
-    const state = await home.openSession(session.id)
-    tabs.openSession(session.id, sessionLabel(session))
-    // ensure 恢复后端已有的终端（并把激活项落到第一个），add 新建即激活 —— 两者都会写
-    // sessionUi，这里不需要（也不应该）再去改激活项，否则会和 store 的选择打架。
-    terminals.ensure(session.id, state)
-    if (!isMobile.value && terminals.countOf(session.id) === 0) terminals.add(session.id)
-    toast.show(t('home_open_success', { name: sessionLabel(session) }), 'success')
+    await openWith(session)
   } catch (e) {
+    if (needsCredential(e)) {
+      // 不是失败，是「这个会话没存凭据」：别报错，弹输入框，填完带凭据重试
+      credPrompt.value = { session, loading: false, error: '' }
+      return
+    }
     toast.show(t('home_open_failed', { error: describeError(e) }), 'error')
   } finally {
     busyId.value = ''
+  }
+}
+
+async function onCredentialSubmit(credential: SessionCredential) {
+  const pending = credPrompt.value
+  if (!pending) return
+  pending.loading = true
+  pending.error = ''
+  try {
+    await openWith(pending.session, credential)
+    credPrompt.value = null
+  } catch (e) {
+    // 弹窗留着并把原因显示在里面：用户多半是打错了密码，让他改一个字符重试，
+    // 而不是从「打开」按钮从头再来一遍。
+    pending.error = describeError(e)
+  } finally {
+    pending.loading = false
   }
 }
 
@@ -102,8 +143,25 @@ async function onClose(session: SessionView) {
     return
   }
   home.forgetSession(session.id)
+  closeTerminalsDialog(session.id)
   toast.show(t('home_close_success', { name: sessionLabel(session) }), 'success')
   busyId.value = ''
+}
+
+// ---------- 终端列表弹窗 ----------
+
+function onViewTerminals(session: SessionView) {
+  terminalsSid.value = session.id
+  terminalsVisible.value = true
+}
+
+/**
+ * 会话被关掉 / 删掉时收起它的终端清单弹窗。
+ * 不收的话弹窗会留在屏幕上显示一个空列表（终端标签已经跟着 forget 清掉了），
+ * 用户只能自己点 ×——而那一刻他会以为「终端都消失了」。
+ */
+function closeTerminalsDialog(sid: string) {
+  if (terminalsSid.value === sid) terminalsVisible.value = false
 }
 
 // ---------- 编辑 / 删除 ----------
@@ -161,6 +219,7 @@ async function onDelete(session: SessionView) {
       home.forgetSession(session.id)
     }
     await home.remove(session.id)
+    closeTerminalsDialog(session.id)
     toast.show(t('home_delete_success', { name }), 'success')
   } catch (e) {
     toast.show(t('home_delete_failed', { error: describeError(e) }), 'error')
@@ -182,27 +241,6 @@ async function onDelete(session: SessionView) {
         <span v-if="openCount" class="g-chip g-chip-active">{{ t('home_open_count', { n: openCount }) }}</span>
 
         <span class="flex-1"></span>
-
-        <div class="relative">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-faint dark:text-ink-faint-dark"
-          >
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
-          <input
-            v-model="keyword"
-            class="g-input !w-40 !pl-9 sm:!w-56"
-            :placeholder="t('home_search')"
-            type="search"
-          />
-        </div>
 
         <button
           class="g-btn-secondary"
@@ -242,9 +280,6 @@ async function onDelete(session: SessionView) {
           {{ t('home_new') }}
         </button>
       </div>
-      <p class="mt-2 hidden text-xs text-ink-faint dark:text-ink-faint-dark sm:block">
-        {{ t('home_subtitle') }}
-      </p>
     </div>
 
     <div class="thin-scroll min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
@@ -271,13 +306,6 @@ async function onDelete(session: SessionView) {
         <button class="g-btn-primary mt-5" @click="onAdd">{{ t('home_new') }}</button>
       </div>
 
-      <div
-        v-else-if="!list.length"
-        class="g-panel p-8 text-center text-sm text-ink-soft dark:text-ink-soft-dark"
-      >
-        {{ t('home_search_empty') }}
-      </div>
-
       <!-- 只平铺：卡片按容器宽度自动分列，卡片做大（minmax(min(22rem,100%),1fr)）——
            用 min(22rem,100%) 而不是裸的 22rem，否则窄屏（<~380px）上单列比容器还宽，会横向溢出。 -->
       <div class="grid grid-cols-[repeat(auto-fill,minmax(min(22rem,100%),1fr))] gap-4">
@@ -293,11 +321,24 @@ async function onDelete(session: SessionView) {
           @close="pending = { kind: 'close', session }"
           @edit="onEdit(session)"
           @remove="pending = { kind: 'delete', session }"
+          @terminals="onViewTerminals(session)"
         />
       </div>
     </div>
 
     <SessionFormDialog v-model:visible="formVisible" :session="editing" @saved="onSaved" />
+
+    <SessionTerminalsDialog v-model:visible="terminalsVisible" :sid="terminalsSid" />
+
+    <!-- 凭据输入：只在「不保存凭据」的会话上出现（第一次 open 回了 credential_required） -->
+    <CredentialPromptDialog
+      :visible="credPrompt !== null"
+      :session="credPrompt?.session ?? null"
+      :loading="credPrompt?.loading ?? false"
+      :error="credPrompt?.error ?? ''"
+      @submit="onCredentialSubmit"
+      @update:visible="(v) => { if (!v) credPrompt = null }"
+    />
 
     <ConfirmDialog
       :visible="pending !== null"
