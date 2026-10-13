@@ -35,7 +35,6 @@ export const zh: Record<string, string> = {
   app_session_gone: '该会话已不存在（可能已在别处关闭）',
 
   // ===== 首页：会话列表 =====
-  home_title: '远程会话',
   home_new: '添加远程会话',
   home_refresh: '刷新列表',
   home_empty_title: '还没有远程会话',
@@ -61,12 +60,10 @@ export const zh: Record<string, string> = {
   home_delete_confirm_msg: '删除「{name}」？登录数据、专属快捷指令与该会话的历史都会一并删除。',
   home_delete_success: '已删除「{name}」',
   home_delete_failed: '删除失败：{error}',
-  home_total: '共 {n} 个会话',
   home_cred_unsaved: '不保存凭据',
   home_cred_unsaved_hint: '该会话不保存凭据，每次连接都需要重新输入',
   home_view_terminals: '查看终端',
   home_rename_failed: '改名失败：{error}',
-  home_open_count: '{n} 个已打开',
 
   // ===== 会话表单 =====
   form_new_title: '添加远程会话',
@@ -154,7 +151,7 @@ export const zh: Record<string, string> = {
   err_internal: '服务端内部错误',
   err_unknown: '操作失败：{error}',
   err_credential_required: '该会话没有保存凭据，请先输入凭据',
-  err_no_archive_tool: '远程主机缺少所需的压缩工具（tar / unzip）',
+  err_no_archive_tool: '远程主机缺少所需的压缩工具（tar / zip / unzip）',
   err_archive_unsupported: '不支持的压缩包格式',
   err_no_share_path: '未配置飞牛共享目录（TRIM_DATA_SHARE_PATHS）',
 
@@ -164,7 +161,6 @@ export const zh: Record<string, string> = {
   session_close_terminal: '关闭终端标签',
   session_terminal_n: '终端 {n}',
   session_terminal_titled: '终端 {n}：{title}',
-  session_full_files: '完整文件管理',
   session_rename_title: '重命名终端标签',
   session_rename_prompt: '新名称',
   cred_title_password: '输入登录密码',
@@ -177,14 +173,10 @@ export const zh: Record<string, string> = {
   cred_passphrase: '私钥口令',
   termlist_title: '「{name}」的终端',
   termlist_empty: '该会话还没有打开终端',
-  termlist_new: '新建终端',
   termlist_created: '创建于 {time}',
-  termlist_name_hint: '这里的名字与终端标签同步',
-  termlist_session_name_hint: '会话名称会同步到顶栏标签',
   termlist_close_confirm_title: '关闭终端',
   termlist_close_confirm_msg: '关闭「{title}」？该终端在远程主机上的 shell 会被终止。',
   session_left_title: '文件',
-  session_hide_files: '返回终端',
   session_new_terminal_here: '在此目录新建终端',
   session_close_confirm_title: '关闭终端标签',
   session_close_confirm_msg: '关闭「{title}」？该终端会话及其在远程主机上的 shell 会被终止。',
@@ -201,6 +193,7 @@ export const zh: Record<string, string> = {
   term_act_search: '搜索',
   term_act_paste: '粘贴',
   term_act_clear: '清屏',
+  term_act_quick_cmds: '快捷指令',
   term_act_reconnect: '重连',
   term_labels_collapse: '折叠功能名',
   term_labels_expand: '展开功能名',
@@ -353,6 +346,7 @@ export const zh: Record<string, string> = {
   qc_move_down: '下移',
   qc_auto_tag: 'Auto',
   qc_send: '发送到当前终端',
+  qc_send_to: '发送到 {name}',
   qc_scope_switch: '切换全局 / 专属',
 
   // ===== 设置 =====

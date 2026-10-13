@@ -339,6 +339,182 @@ func TestFsCompressAndExtract(t *testing.T) {
 	a.fail(t, "/api/fs/extract", map[string]any{"sid": sid, "path": filepath.Join(root, "nope.tar.gz")}, "not_found", 0)
 }
 
+// TestFsCompressZip 覆盖 format=zip（契约 13.5）：产物是真 zip、多父目录追加进同一个包、
+// 后缀按 format 走、并且能被 unzip 列出与解压。
+func TestFsCompressZip(t *testing.T) {
+	a, sid, _ := fsOpApp(t, appOptions{})
+	root := a.sshRoot
+	archiveDir := a.renv.ArchiveDir
+
+	// 1) 缺省名字 + 单目录
+	out := a.ok(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "paths": []string{filepath.Join(root, "docs")}, "format": "zip",
+	})
+	archive, _ := out["archive"].(map[string]any)
+	archivePath := strOf(archive, "path")
+	if strOf(archive, "dir") != archiveDir {
+		t.Fatalf("archive.dir = %v，期望 %v", archive["dir"], archiveDir)
+	}
+	if !strings.HasSuffix(archivePath, ".zip") || !strings.Contains(filepath.Base(archivePath), "webssh-") {
+		t.Fatalf("zip 产物名 = %q（期望 webssh-<时间戳>.zip）", archivePath)
+	}
+	fi, err := os.Stat(archivePath)
+	if err != nil {
+		t.Fatalf("zip 产物不存在：%v", err)
+	}
+	if fi.Size() == 0 || numOf(archive, "size") != float64(fi.Size()) {
+		t.Fatalf("size 与实际不符：%v vs %d", archive["size"], fi.Size())
+	}
+	entries := listZip(t, archivePath)
+	for _, want := range []string{"docs/readme.md", "docs/sub/deep.txt"} {
+		if _, ok := entries[want]; !ok {
+			t.Fatalf("zip 里缺少 %q：%v", want, entries)
+		}
+	}
+	// 用系统的 unzip -l 再确认一遍（用户真正会用的工具；本机没有就跳过这条）
+	if unzipPath, err := exec.LookPath("unzip"); err == nil {
+		listing, err := exec.Command(unzipPath, "-l", archivePath).Output()
+		if err != nil {
+			t.Fatalf("unzip -l 失败：%v", err)
+		}
+		if !strings.Contains(string(listing), "docs/readme.md") || !strings.Contains(string(listing), "docs/sub/deep.txt") {
+			t.Fatalf("unzip -l 没列出成员：\n%s", listing)
+		}
+	} else {
+		t.Log("本机没有 unzip，跳过 unzip -l 校验")
+	}
+
+	// 2) 多父目录：两个条目分属不同目录，依次 cd 追加进**同一个**包，名字用用户给的名字
+	other := filepath.Join(root, "elsewhere")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatalf("建目录失败：%v", err)
+	}
+	writeLocal(t, filepath.Join(other, "two.txt"), "two\n")
+	out = a.ok(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "name": "multi-zip", "format": "zip",
+		"paths": []string{filepath.Join(root, "hello.txt"), filepath.Join(other, "two.txt")},
+	})
+	archive, _ = out["archive"].(map[string]any)
+	multiPath := strOf(archive, "path")
+	if filepath.Base(multiPath) != "multi-zip.zip" {
+		t.Fatalf("名字没按 format 补后缀：%q", multiPath)
+	}
+	entries = listZip(t, multiPath)
+	if _, ok := entries["hello.txt"]; !ok {
+		t.Errorf("追加后的包缺少第一个条目：%v", entries)
+	}
+	if _, ok := entries["two.txt"]; !ok {
+		t.Errorf("第二个父目录的条目没追加进同一个包：%v", entries)
+	}
+	if len(entries) != 2 {
+		t.Errorf("追加后的包应当正好两个条目：%v", entries)
+	}
+
+	// 3) 用户给的包名自带别的归档后缀时换掉（不是往后叠一个）
+	out = a.ok(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "name": "docs.tar.gz", "format": "zip",
+		"paths": []string{filepath.Join(root, "docs")},
+	})
+	if got := filepath.Base(strOf(out["archive"], "path")); got != "docs.zip" {
+		t.Errorf("自带 .tar.gz 的包名应当换成 docs.zip，实际 %q", got)
+	}
+
+	// 4) 同名产物要先清掉：zip 是追加语义，不清就会把上一次的条目带进来
+	writeLocal(t, filepath.Join(root, "solo.txt"), "solo\n")
+	out = a.ok(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "name": "fresh", "format": "zip", "paths": []string{filepath.Join(root, "docs")},
+	})
+	if _, ok := listZip(t, strOf(out["archive"], "path"))["solo.txt"]; ok {
+		t.Fatalf("第一次的包里不该有 solo.txt")
+	}
+	out = a.ok(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "name": "fresh", "format": "zip", "paths": []string{filepath.Join(root, "solo.txt")},
+	})
+	entries = listZip(t, strOf(out["archive"], "path"))
+	if _, ok := entries["solo.txt"]; !ok {
+		t.Fatalf("第二次的包应当只有 solo.txt：%v", entries)
+	}
+	if _, ok := entries["docs/readme.md"]; ok {
+		t.Fatalf("同名重压必须重头打（zip 的追加语义会把上一次的条目留下来）：%v", entries)
+	}
+
+	// 5) 回到原位解压（用后端自己的 extract 走一遍 zip 分支）
+	out = a.ok(t, "/api/fs/extract", map[string]any{"sid": sid, "path": multiPath})
+	if strOf(out, "dir") != archiveDir {
+		t.Fatalf("解压根目录 = %v", out["dir"])
+	}
+	if got := readLocal(t, filepath.Join(archiveDir, "two.txt")); got != "two\n" {
+		t.Fatalf("zip 解压出来的内容不对：%q", got)
+	}
+
+	// 6) 非法 format：必须明确报错，而不是默默按 tar.gz 打一个
+	a.fail(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "paths": []string{filepath.Join(root, "docs")}, "format": "rar",
+	}, "invalid", http.StatusBadRequest)
+	// 缺省（空串）= tar.gz（回归：老前端不发 format 时行为不变）
+	out = a.ok(t, "/api/fs/compress", map[string]any{"sid": sid, "paths": []string{filepath.Join(root, "docs")}, "format": ""})
+	if !strings.HasSuffix(strOf(out["archive"], "path"), ".tar.gz") {
+		t.Errorf("空 format 应当走 tar.gz：%v", out["archive"])
+	}
+}
+
+// TestFsCompressZipMissingTool 覆盖「远端没有 zip」：用只含 sh/mkdir 的 PATH 模拟一台
+// 装了 shell 但没有 zip 的主机（tar.gz 与 zip 两个分支都要报 no_archive_tool）。
+func TestFsCompressZipMissingTool(t *testing.T) {
+	fakePath := t.TempDir()
+	// 只放 shell 与 mkdir：这样 `sh -c 'mkdir -p … && zip …'` 能跑起来，但找不到 zip。
+	// 直接整个 PATH 指向空目录是不行的——那样连 sh 都起不来，验不到「缺 zip」这条分支。
+	for _, tool := range []string{"sh", "mkdir"} {
+		src, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("本机没有 %s，跳过", tool)
+		}
+		if err := os.Symlink(src, filepath.Join(fakePath, tool)); err != nil {
+			t.Fatalf("建软链接失败：%v", err)
+		}
+	}
+	a, sid, _ := fsOpApp(t, appOptions{sshOptions: &testssh.Options{
+		User: "demo", Password: "demo",
+		Env: []string{"PATH=" + fakePath},
+	}})
+
+	out := a.fail(t, "/api/fs/compress", map[string]any{
+		"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "docs")}, "format": "zip",
+	}, "no_archive_tool", http.StatusBadGateway)
+	if msg := strOf(out, "error"); !strings.Contains(msg, "zip") {
+		t.Errorf("错误文案应当点出缺的是 zip：%v", msg)
+	}
+	// 同一个环境里 tar.gz 分支同样缺工具
+	a.fail(t, "/api/fs/compress", map[string]any{"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "docs")}}, "no_archive_tool", 0)
+}
+
+// TestFsCompressPermissionDenied 校验「归档目录不可写」稳定映射到 permission（403），
+// 而不是 internal——前端要把这句话直接 toast 出来。
+//
+// 权限位对 root 无效（root 无视目录的写权限），所以换个用户跑时才验得了。
+func TestFsCompressPermissionDenied(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("当前是 root：目录权限位对 root 无效，测不出 permission")
+	}
+	a, sid, _ := fsOpApp(t, appOptions{})
+	if err := os.MkdirAll(a.renv.ArchiveDir, 0o755); err != nil {
+		t.Fatalf("建归档目录失败：%v", err)
+	}
+	if err := os.Chmod(a.renv.ArchiveDir, 0o555); err != nil {
+		t.Fatalf("改权限失败：%v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(a.renv.ArchiveDir, 0o755) })
+
+	for _, format := range []string{"tar.gz", "zip"} {
+		out := a.fail(t, "/api/fs/compress", map[string]any{
+			"sid": sid, "paths": []string{filepath.Join(a.sshRoot, "docs")}, "format": format,
+		}, "permission", http.StatusForbidden)
+		if msg := strOf(out, "error"); !strings.Contains(strings.ToLower(msg), "permission") {
+			t.Errorf("%s：错误文案应当带上命令的输出关键行：%v", format, msg)
+		}
+	}
+}
+
 // TestFsCompressSizeLimit 校验压缩产物的体积上限：超限要报 too_large 并删掉产物
 // （远端 /tmp 通常很小，留一个巨大的包会把整台主机的临时空间吃掉）。
 func TestFsCompressSizeLimit(t *testing.T) {
@@ -490,6 +666,21 @@ func listTarGz(t *testing.T, path string) []string {
 		names = append(names, hdr.Name)
 	}
 	return names
+}
+
+// listZip 用标准库读一个 zip 的成员（不依赖本机的 unzip）。
+func listZip(t *testing.T, path string) map[string]int64 {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("打开 zip 失败（%s）：%v", path, err)
+	}
+	defer zr.Close()
+	out := make(map[string]int64, len(zr.File))
+	for _, f := range zr.File {
+		out[f.Name] = int64(f.UncompressedSize64)
+	}
+	return out
 }
 
 // writeZip 造一个 zip 文件（测试解压用，不依赖本机的 zip 命令）。

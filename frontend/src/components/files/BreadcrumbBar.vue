@@ -1,29 +1,29 @@
 <script setup lang="ts">
-// BreadcrumbBar — 左栏顶部的**按钮条**（第二轮起不再显示路径，见契约 11.2 / 11.3）。
+// BreadcrumbBar — 左栏顶部的**按钮条**（不显示路径，见契约 11.3 / 13.1）。
 //
 // 为什么去掉路径：左栏宽度只有 11~20rem，一串「根目录 / vol1 / 1000 / docker / …」在这里
 // 只能靠横向滚动看，而它想回答的「我在哪」在文件管理器的面包屑里已经回答过了（那里有整行
 // 宽度）。左栏这一行的价值在于**动作**：
-//   [家目录] [完整文件管理（切换主区域）] [在此目录新建终端] [刷新]
+//   [家目录] [在此目录新建终端] [刷新]
 //
-// 与文件管理器的分工：这里不 emit 任何事件，主区域的切换直接写 sessionUi.mainMode——
-// 唯一的真相在 store 里，组件之间不需要再传一层事件（事件接错一处就会出现「点了没反应」）。
+// 第三轮删掉了这一行里的「完整文件管理」按钮：子标签栏恢复了固定的「文件管理」子标签，
+// 它与左栏是**二选一**（切到文件管理子标签时左栏收起），所以左栏里再放一个切换入口就是
+// 两套开关——而且 `sessionUi` 里那套 mainMode 已经删掉，判据只该有 activeSub 一个。
+//
+// 本组件不 emit 任何事件：动作全部直接落到 store（sftp / terminals）上。
 import { computed, nextTick } from 'vue'
 import { t } from '@/i18n'
 import { usePaneControlsStore } from '@/stores/paneControls'
-import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 
 const { sid } = defineProps<{ sid: string }>()
 
 const sftp = useSftpStore()
-const sessionUi = useSessionUiStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 
 const state = computed(() => sftp.stateOf(sid))
-const filesActive = computed(() => sessionUi.mainModeOf(sid) === 'files')
 
 /**
  * 家目录按钮。
@@ -40,22 +40,13 @@ function goHome() {
   void sftp.expandPath(sid, home)
 }
 
-/** 切换主区域：终端 ↔ 完整文件管理。切回终端时还要把焦点还给 xterm。 */
-function toggleMain() {
-  const mode = sessionUi.toggleMainMode(sid)
-  if (mode !== 'terminal') return
-  void nextTick(() => {
-    const uid = terminals.activeOf(sid)?.uid ?? terminals.tabsOf(sid)[0]?.uid
-    if (uid) panes.get(sid, uid)?.focus()
-  })
-}
-
 /** 在当前目录里新开一个终端（目录还没有（ensure 未完成）时不给点）。 */
 function openTerminalHere() {
   const dir = state.value.dir || state.value.home
   if (!dir) return
+  // openTerminalAt 会把新标签设成激活项（→ sessionUi.setActiveSub）：子标签栏随之切到这个
+  // 终端、左栏让位给主区域，用户立刻看到自己新开的 shell。这里只需把键盘焦点也交给它。
   terminals.openTerminalAt(sid, dir)
-  sessionUi.setMainMode(sid, 'terminal')
   void nextTick(() => {
     const uid = terminals.activeOf(sid)?.uid ?? terminals.tabsOf(sid)[0]?.uid
     if (uid) panes.get(sid, uid)?.focus()
@@ -93,30 +84,6 @@ function refresh() {
         <path d="M9 22V12h6v10" />
       </svg>
       <span class="truncate">{{ t('files_home') }}</span>
-    </button>
-
-    <!-- 完整文件管理：主区域双模式的开关，当前已经在文件管理时高亮 -->
-    <button
-      type="button"
-      class="tree-tool"
-      :class="filesActive ? '!text-brand' : ''"
-      :title="filesActive ? t('session_hide_files') : t('session_full_files')"
-      :aria-label="filesActive ? t('session_hide_files') : t('session_full_files')"
-      :aria-pressed="filesActive ? 'true' : 'false'"
-      @click="toggleMain"
-    >
-      <svg
-        class="h-4 w-4"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.5"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-      >
-        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-        <path d="m9 13 2 2 4-4" />
-      </svg>
     </button>
 
     <button

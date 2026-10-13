@@ -23,7 +23,7 @@ import {
   type PresetCmd,
   type PresetGroup
 } from '@/data/presetCommands'
-import { useSessionUiStore } from '@/stores/sessionUi'
+import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
 import { useHomeStore } from '@/stores/home'
 import { usePaneControlsStore } from '@/stores/paneControls'
 import { useQuickCmdsStore } from '@/stores/quickCmds'
@@ -159,16 +159,42 @@ watch(sessionId, (sid) => {
 
 // ---------- 发送到当前激活终端 ----------
 
+/**
+ * 弹窗把指令发到哪个终端：**就是当前激活子标签对应的那个终端**（契约 13.1）。
+ *
+ * 用户的原话是「每个子终端标签页都要有快捷指令按钮，否则在弹窗里点指令都不知道输入到了哪个
+ * 终端」——所以这里不再「文件管理在前台时退回本会话最后用过的终端」：那正是他会点错的那种
+ * 情况。文件管理子标签在前台时没有激活的终端，就是没有目标，点击时如实报 `qc_not_connected`
+ * （工具条上的按钮此时也已经是禁用态，正常路径根本进不来，这里是兜底）。
+ */
 function currentControls() {
   const sid = sessionId.value
   if (!sid) return undefined
-  const tabs = terminals.tabsOf(sid)
   const sub = sessionUi.activeSubOf(sid)
+  if (sub === FILES_TAB) return undefined
+  const tabs = terminals.tabsOf(sid)
   const uid = tabs.some((tab) => tab.uid === sub)
     ? sub
     : (terminals.activeOf(sid)?.uid ?? tabs.at(-1)?.uid ?? null)
   return paneControls.get(sid, uid)
 }
+
+/**
+ * 弹窗当前会把指令发给哪个终端——只用于页脚提示。
+ *
+ * 用户的原话是「在弹窗点击指令都不知道输入到了哪个终端里」，所以除了把按钮放回会话工具条
+ * （保证有明确的激活终端）之外，这里再把**目标终端的名字**显式写出来：用户点之前就知道
+ * 这条命令会进哪个 shell，不用靠记忆判断「刚才激活的是哪个标签」。
+ */
+const targetLabel = computed(() => {
+  const sid = sessionId.value
+  if (!sid) return ''
+  const sub = sessionUi.activeSubOf(sid)
+  if (sub === FILES_TAB) return ''
+  const tabs = terminals.tabsOf(sid)
+  const tab = tabs.find((item) => item.uid === sub) ?? terminals.activeOf(sid) ?? tabs.at(-1)
+  return tab ? terminals.titleOf(sid, tab) : ''
+})
 
 /**
  * 发给当前激活终端；返回是否真的发出去了（false = 没有可用终端）。
@@ -523,7 +549,11 @@ function close() {
                 class="text-[11px]"
                 :class="page === 'preset' ? 'text-warning' : 'text-ink-faint dark:text-ink-faint-dark'"
               >
-                {{ page === 'preset' ? t('qc_preset_danger') : t('qc_send') }}
+                {{ page === 'preset'
+                  ? t('qc_preset_danger')
+                  : targetLabel
+                    ? t('qc_send_to', { name: targetLabel })
+                    : t('qc_send') }}
               </p>
             </div>
           </div>

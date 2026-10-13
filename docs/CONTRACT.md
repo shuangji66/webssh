@@ -850,3 +850,23 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 `frontend/src/stores/sessionUi.ts`（`mainMode` 已删）、`frontend/src/serverapi/index.ts`
 （`fsCompress(..., format?)` + `ArchiveFormat`）、`frontend/src/i18n/*`（新增 `files_copy`、
 `files_compress_zip`、`files_open_terminal`）、`frontend/scripts/check-i18n.mjs`（双向检查）。
+
+### 13.7 zip 压缩的实现细节（backend 实测后补记）
+
+- 命令是 **`zip -qry`**，不是契约 13.5 里写的 `-qr`：不加 `-y` 时（Info-ZIP 3.0 实测）
+  指向目录的软链接会把**链接指向的整棵树**打进包、失效的软链接被**静默丢弃**（只 warn、退出码 0）、
+  只选中一个失效链接时 zip 直接以退出码 12 失败。加 `-y` 后链接按链接本身存，与 tar 侧
+  「不跟随链接」的口径一致。
+- zip 是**追加/更新**语义，所以同名产物**先删后建**（否则上一次的条目会留在包里）；
+  同名目标若恰好是**目录**则拒绝（`invalid`）；失败清理**只删非目录产物**——
+  顺手堵掉了「清理半成品时把同名目录递归删掉」这条最不能接受的失败路径。
+- 包名自带别的归档后缀时**替换**而不是叠加（`docs.tar.gz` + zip → `docs.zip`）；
+  只剩后缀的名字（`.zip`）拒绝（否则产物是个隐藏文件）。
+- 条目名取 basename（`cd <父目录>` 的自然结果）：**不同父目录下的同名条目会互相覆盖**
+  （zip 按名字更新，以最后一张为准）。tar 侧没有这个问题（多父目录用 `-C /` + 相对路径）。
+- 权限不足（tar / zip / unzip 非 0 退出且输出含 permission 字样）→ `permission`(403)；
+  缺工具（127/命令不存在）→ `no_archive_tool`(502)；其余 → `internal`(500)，都带输出关键行。
+  单测覆盖 tar/zip/mkdir 的中英消息 + 集成用例「archiveDir 不可写」两个格式各一次
+  （以 root 跑时该用例会 skip 并写明原因）。
+- `format` 只认 `tar.gz` / `zip`（大小写敏感，`tgz`/`ZIP` 一律 `invalid`——不猜，
+  否则「前端发错字段值」永远查不出来）。

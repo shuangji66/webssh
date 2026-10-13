@@ -1,9 +1,12 @@
 <script setup lang="ts">
-// AppTabBar — 应用级标签条（壳层顶栏第一行）：首页标签固定不可关 + 每个已打开的会话一个标签。
+// AppTabBar — 应用级标签条（壳层顶栏）：首页标签固定不可关 + 每个已打开的会话一个标签。
 //
 // 关闭会话标签是**应用级动作**（契约 6.3）：先在后端终止该会话（终端 + SFTP 全断），
 // 成功后再关标签并清四个 store 的前端状态。顺序不能反：先关标签再关后端，一旦后端失败，
 // 用户就再也点不到那个会话去重试了（标签已经没了，只能刷新页面）。
+//
+// 右侧不再有任何按钮（契约 13.2）：快捷指令在会话工具条里（要「作用于哪个终端」才说得清，
+// 13.1），设置在首页工具条里。所以这里不抛任何事件，只渲染标签。
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { describeError } from '@/serverapi'
@@ -15,11 +18,6 @@ import { sessionLabel } from '@/utils/format'
 import { revealActive, wheelToHorizontal } from '@/utils/scroll'
 import ConfirmDialog from './ConfirmDialog.vue'
 import PromptDialog from './PromptDialog.vue'
-
-const emit = defineEmits<{
-  (e: 'settings'): void
-  (e: 'quick-cmds'): void
-}>()
 
 const tabs = useAppTabsStore()
 const home = useHomeStore()
@@ -291,39 +289,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 全局入口：快捷指令 / 设置。脚本里的弹窗挂在 App.vue，这里只抛事件 -->
-    <div class="flex shrink-0 items-center gap-0.5">
-      <button class="g-btn-ghost !h-8 !px-2" :title="t('qc_title')" @click="emit('quick-cmds')">
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-4 w-4"
-        >
-          <polyline points="4 17 10 11 4 5" />
-          <line x1="12" y1="19" x2="20" y2="19" />
-        </svg>
-      </button>
-      <button class="g-btn-ghost !h-8 !px-2" :title="t('settings_title')" @click="emit('settings')">
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-4 w-4"
-        >
-          <path
-            d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"
-          />
-          <circle cx="12" cy="12" r="3" />
-        </svg>
-      </button>
-    </div>
+    <!-- 顶栏右侧不再有任何按钮（契约 13.2）：只剩应用标签本身 -->
 
     <!-- 右键菜单：只放「关闭其他标签」（其余动作在标签上和首页卡片上） -->
     <div

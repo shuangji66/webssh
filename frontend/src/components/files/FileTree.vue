@@ -12,15 +12,14 @@
 //   - **点目录不再切换主区域**（也不 emit 任何事件）：只把「当前目录」改成它（与文件管理器
 //     共用同一个当前目录）并展开/高亮。从树里点一下就跳走会打断正在终端里干活的人；
 //   - 右键 / 「…」菜单补齐目录可用的全部动作（新建 / 上传 / 新终端 / 粘贴 / 重命名 / 删除 /
-//     压缩 / 导出至飞牛 / 复制路径 / 刷新）。
+//     压缩为 tar.gz / 压缩为 zip / 导出至飞牛 / 复制路径 / 刷新）。
 //
 // 菜单里对 `/` 隐藏了重命名 / 删除 / 压缩 / 导出：根目录没有父目录可压缩、也不能被改名或
 // 删除（后端会拒），藏起来比给一个点了报错的项好。
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { t } from '@/i18n'
-import { ApiError, describeError } from '@/serverapi'
+import { ApiError, describeError, type ArchiveFormat } from '@/serverapi'
 import { usePaneControlsStore } from '@/stores/paneControls'
-import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
@@ -31,10 +30,9 @@ import UploadDialog from './UploadDialog.vue'
 
 const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
 
-// 本组件**不 emit**：点目录只更新共享的当前目录（sftp store）与展开状态，主区域由左栏顶部
-// 那个「完整文件管理」按钮 / 终端子标签决定（11.3）。
+// 本组件**不 emit**：点目录只更新共享的当前目录（sftp store）与展开状态；主区域显示什么由
+// 子标签栏决定（`sessionUi.activeSubOf`），从树里点一下就切走会打断正在终端里干活的人。
 const sftp = useSftpStore()
-const sessionUi = useSessionUiStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 const toastStore = useToastStore()
@@ -315,14 +313,15 @@ async function doRemove(path: string, name: string) {
   }
 }
 
-async function compressHere() {
+async function compressHere(format: ArchiveFormat) {
   const path = menu.path
   if (path === '/') return
   hideMenu()
   try {
-    const archive = await sftp.compress(sid, [path])
+    const archive = await sftp.compress(sid, [path], format)
     toast(t('files_compress_done', { path: archive.path }), 'success')
   } catch (e) {
+    // 远端缺 tar/zip（no_archive_tool）、权限不足、名字非法……一律把后端原文报出来
     toast(t('files_op_failed', { error: describeError(e) }))
   }
 }
@@ -373,12 +372,17 @@ async function copyPath() {
   }
 }
 
-/** 在此目录新建终端：切回终端主区域并聚焦，否则桌面端点了看不到任何变化。 */
+/**
+ * 在此目录新建终端。
+ *
+ * 只做两件事：建标签（openTerminalAt 内部会把它设成激活项 → 子标签栏切过去、主区域显示它）
+ * 与把键盘焦点交给它。第三轮删掉「主区域模式」之后这里不再需要切模式——激活子标签本身
+ * 就是切换。
+ */
 function openTerminalHere() {
   const dir = menu.path
   hideMenu()
   terminals.openTerminalAt(sid, dir)
-  sessionUi.setMainMode(sid, 'terminal')
   void nextTick(() => {
     const uid = terminals.activeOf(sid)?.uid ?? terminals.tabsOf(sid)[0]?.uid
     if (uid) panes.get(sid, uid)?.focus()
@@ -462,7 +466,8 @@ const menuItems = computed<MenuItem[]>(() => {
   if (!root) {
     items.push({ label: t('files_rename'), run: renameHere })
     items.push({ label: t('common_delete'), danger: true, run: askDelete })
-    items.push({ label: t('files_compress'), run: () => void compressHere() })
+    items.push({ label: t('files_compress'), run: () => void compressHere('tar.gz') })
+    items.push({ label: t('files_compress_zip'), run: () => void compressHere('zip') })
     items.push(exportItem(path))
   }
   items.push({ label: t('files_copy_path'), run: () => void copyPath() })

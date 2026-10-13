@@ -28,6 +28,11 @@ const terminals = useTerminalsStore()
 const toast = useToastStore()
 const isMobile = useMobileLayout()
 
+/** 设置弹窗挂在壳层（App.vue），这里只抛事件——它是应用级设置（主题/语言/字体），不是首页的。 */
+const emit = defineEmits<{
+  (e: 'settings'): void
+}>()
+
 const formVisible = ref(false)
 const editing = ref<SessionView | null>(null)
 /** 正在打开/关闭的会话 id（按钮禁用，防连点）。 */
@@ -49,8 +54,6 @@ const list = computed(() => {
   })
   return items
 })
-
-const openCount = computed(() => home.sessions.filter((s) => home.isOpen(s.id)).length)
 
 // 相对时间（「打开于 X 分钟前」）要自己走字：没有定时器的话，只有别的状态变化才会重算，
 // 放在那儿的会话会一直显示「刚刚」。30s 粒度足够（最小单位是分钟）。
@@ -177,8 +180,8 @@ function onEdit(session: SessionView) {
 }
 
 function onSaved(session: SessionView) {
-  // 表单弹窗自己已 toast；这里只把标签标题跟一下（用户手动改过名的标签保持不动）。
-  // 用 syncTitle 而不是 openSession：后者会把激活项切到那个会话，用户会被从首页拽走。
+  // 表单弹窗自己已 toast。改完名字要同步已打开会话的顶栏标签（契约 13.3：卡片名与标签名
+  // 双向同步）——syncTitle 不覆盖别的会话、也不改激活项；用 openSession 会把用户从首页拽走。
   tabs.syncTitle(session.id, sessionLabel(session))
 }
 
@@ -231,16 +234,24 @@ async function onDelete(session: SessionView) {
 
 <template>
   <div class="flex h-full min-h-0 flex-col bg-bg dark:bg-bg-dark">
-    <!-- 工具条固定在顶部：会话多的时候它跟着滚出去就没法用了 -->
+    <!-- 工具条固定在顶部：会话多的时候它跟着滚出去就没法用了。
+         一行两段（契约 13.2）：左 = 新建 + 刷新，右 = 设置（从顶栏移下来）。 -->
     <div class="shrink-0 border-b border-line px-3 py-3 dark:border-line-dark sm:px-4">
-      <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-        <h1 class="font-display text-lg font-semibold text-ink dark:text-ink-dark">
-          {{ t('home_title') }}
-        </h1>
-        <span v-if="home.sessions.length" class="g-chip">{{ t('home_total', { n: home.sessions.length }) }}</span>
-        <span v-if="openCount" class="g-chip g-chip-active">{{ t('home_open_count', { n: openCount }) }}</span>
-
-        <span class="flex-1"></span>
+      <div class="flex items-center gap-2 sm:gap-3">
+        <button class="g-btn-primary" @click="onAdd">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            class="h-4 w-4"
+          >
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          {{ t('home_new') }}
+        </button>
 
         <button
           class="g-btn-secondary"
@@ -265,19 +276,24 @@ async function onDelete(session: SessionView) {
           <span class="hidden sm:inline">{{ t('common_refresh') }}</span>
         </button>
 
-        <button class="g-btn-primary" @click="onAdd">
+        <span class="flex-1"></span>
+
+        <button class="g-btn-ghost !h-10 !px-3" :title="t('settings_title')" @click="emit('settings')">
           <svg
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.5"
             stroke-linecap="round"
+            stroke-linejoin="round"
             class="h-4 w-4"
           >
-            <line x1="12" y1="5" x2="12" y2="19" />
-            <line x1="5" y1="12" x2="19" y2="12" />
+            <path
+              d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"
+            />
+            <circle cx="12" cy="12" r="3" />
           </svg>
-          {{ t('home_new') }}
+          <span class="hidden sm:inline">{{ t('settings_title') }}</span>
         </button>
       </div>
     </div>

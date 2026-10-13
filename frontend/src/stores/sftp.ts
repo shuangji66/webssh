@@ -18,7 +18,7 @@
 //   clipboard / copyToClipboard / cutToClipboard / paste / clipboardFor / clipboardIsForeign
 //                                          剪贴板（全局一份、不跨会话；粘贴成功后清空）
 //   paste / compress / extract / exportToNas
-//                                          本轮新增的四个批量/远程操作
+//                                          批量/远程操作（compress 支持 tar.gz 与 zip 两种格式）
 //   expandPath / refreshTree               树：展开到某条链路（家目录）、刷新某个节点
 //   runtime / ensureRuntime / exportRoot / archiveDir
 //                                          运行信息（导出目标目录、压缩包输出目录）
@@ -30,6 +30,7 @@ import {
   describeError,
   downloadPath,
   uploadLocal as uploadLocalRequest,
+  type ArchiveFormat,
   type ArchiveResult,
   type ExportResult,
   type FsEntry,
@@ -609,7 +610,7 @@ export const useSftpStore = defineStore('sftp', () => {
   // ---------- 压缩 / 解压 / 导出至飞牛 ----------
 
   /**
-   * 归档名（传后端的 `name`，后缀由后端补）。
+   * 归档名（传后端的 `name`，后缀由后端按 format 补）。
    *
    * 单个条目用它自己的名字（`photos.tar.gz` 比 `webssh-20260214-101530.tar.gz` 好认太多）；
    * 多选同一个目录下的条目用父目录名；跨目录多选给不出有意义的名字，留空让后端用时间戳。
@@ -623,14 +624,22 @@ export const useSftpStore = defineStore('sftp', () => {
   }
 
   /**
-   * 压缩为 tar.gz。
+   * 压缩（tar.gz / zip）。
    *
    * 产物落在**服务端固定目录**（默认 /tmp/webssh-archive，见 /api/info 的 archiveDir），
    * 因此成功后把当前目录切过去：用户点「压缩」的直接目的就是拿到那个包，停在原目录里
    * 只看到一条 toast、还得自己去找路径，等于没完成。
+   *
+   * 后缀由**后端**按 format 补（archive.go 的 archiveName），所以这里只给不带后缀的名字。
+   * zip 与 tar.gz 的差别只有「远端要装 zip 命令」——缺工具时后端回 no_archive_tool，
+   * 由调用方把原文 toast 出来，前端不自己猜。
    */
-  async function compress(sid: string, paths: string[]): Promise<ArchiveResult> {
-    const res = await api.fsCompress(sid, paths, archiveNameFor(paths))
+  async function compress(
+    sid: string,
+    paths: string[],
+    format: ArchiveFormat = 'tar.gz'
+  ): Promise<ArchiveResult> {
+    const res = await api.fsCompress(sid, paths, archiveNameFor(paths), format)
     await navigate(sid, res.archive.dir)
     // navigate 对「已经加载过且还在缓存里」的目录会直接返回（同目录不重复请求），而这里
     // 必须看到刚生成的那个包，所以强制再拉一次。

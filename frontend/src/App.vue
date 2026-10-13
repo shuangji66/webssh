@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// App.vue — 应用外壳：顶栏（应用标签）+ 首页 / 各会话视图（全部保持挂载）+ 全局弹窗 + Toast。
+// App.vue — 应用外壳：顶栏（应用标签）+ 首页 / 各会话视图（全部保持挂载）+ Toast。
 //
 // 启动顺序（契约 6.3，不能调换）：
 //   1. useTheme() + useViewportHeight()：先把主题与可视视口变量准备好（壳层高度依赖后者，
@@ -10,6 +10,11 @@
 //   5. 逐个会话接线终端标签：terminals.ensure(state) 恢复已有的终端，桌面端一个都没有时
 //      自动建一个——「打开了会话就能直接打字」。
 // 恢复数量 > 0 时给一条 toast：用户刷新后需要知道「刚才那些会话回来了」。
+//
+// 弹窗归属（契约 13.1/13.2）：顶栏不再有快捷指令与设置入口——快捷指令按钮进会话工具条
+// （它的作用对象是「当前激活终端」，属于会话内部的语境），设置按钮进首页工具条。两个弹窗实例
+// 仍然由壳层持有：设置本来就是应用级的（主题/语言/字体），快捷指令只需要一个实例 + 一个 sid
+// 上下文，没必要在每个会话视图里各挂一份。
 import { onMounted, ref } from 'vue'
 import { t } from '@/i18n'
 import { useMobileLayout } from '@/composables/useMobileLayout'
@@ -37,18 +42,14 @@ const isMobile = useMobileLayout()
 
 const settingsVisible = ref(false)
 const quickCmdsVisible = ref(false)
-/** 快捷指令弹窗的会话上下文：首页打开时为空（弹窗只显示全局分组）。 */
+/** 快捷指令弹窗的会话上下文：由「打开它的那个会话视图」给（工具条按钮就在那儿）。 */
 const quickCmdsSid = ref<string | null>(null)
 /** 启动恢复期间显示提示条（终端的恢复在面板里自己等 `\x1b]ready\x07`）。 */
 const restoring = ref(true)
 
-function openQuickCmds(sid: string | null) {
+function openQuickCmds(sid: string) {
   quickCmdsSid.value = sid
   quickCmdsVisible.value = true
-}
-
-function onTabBarQuickCmds() {
-  openQuickCmds(tabs.activeId === HOME_TAB_ID ? null : tabs.activeId)
 }
 
 onMounted(async () => {
@@ -82,19 +83,24 @@ onMounted(async () => {
     <!-- 顶栏：class="app-header" 是 useViewportHeight 测量 --header-h 的锚点，
          弹窗定位带（.region-center）靠它避开顶栏，别改名。 -->
     <header class="app-header shrink-0 border-b border-line bg-surface dark:border-line-dark dark:bg-surface-dark">
-      <AppTabBar @settings="settingsVisible = true" @quick-cmds="onTabBarQuickCmds" />
+      <AppTabBar />
     </header>
 
     <main class="relative min-h-0 flex-1">
       <!-- 首页与每个会话视图都保持挂载：切标签不重建终端与文件浏览状态。
-           会话视图不再有「快捷指令 / 设置」入口（契约 11.6），所以这里不接它的事件。 -->
-      <HomeView v-show="tabs.activeId === HOME_TAB_ID" class="absolute inset-0" />
+           入口按钮在各视图自己的工具条上（13.1/13.2），弹窗实例由壳层持有。 -->
+      <HomeView
+        v-show="tabs.activeId === HOME_TAB_ID"
+        class="absolute inset-0"
+        @settings="settingsVisible = true"
+      />
       <SessionView
         v-for="tab in tabs.sessionTabs"
         v-show="tabs.activeId === tab.id"
         :key="tab.id"
         :sid="tab.id"
         class="absolute inset-0"
+        @quick-cmds="openQuickCmds(tab.id)"
       />
 
       <div

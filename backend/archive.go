@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// 压缩 / 解压（契约 11.4 / 11.5）：调**远程主机**的 tar / unzip
+// 压缩 / 解压（契约 11.4 / 11.5 / 13.5）：调**远程主机**的 tar / zip / unzip
 //
 // 为什么是远程命令而不是 SFTP 自己打包：tar.gz 的压缩比与流式处理由 tar 做得好得多，
 // 而且压缩包必须落在远程主机上（用户接下来要在远程文件管理器里看到它、下载它、或者解压
@@ -27,6 +27,34 @@ const (
 	archiveTar = "tar"
 	archiveZip = "zip"
 )
+
+// 压缩请求的 format 取值（契约 13.5）。
+const (
+	archiveFormatTarGz = "tar.gz"
+	archiveFormatZip   = "zip"
+)
+
+// resolveArchiveFormat 校验请求里的 format：缺省（含空串）= tar.gz，也接受 zip，
+// 其余一律 invalid——**不猜**（例如把 "tgz" 当 tar.gz 收下）会让「前端发错了字段值」这类
+// 问题永远查不出来，而用户会以为「我选了 zip，出来的却是 tar.gz」。
+func resolveArchiveFormat(raw string) (string, *apiError) {
+	switch strings.TrimSpace(raw) {
+	case "", archiveFormatTarGz:
+		return archiveFormatTarGz, nil
+	case archiveFormatZip:
+		return archiveFormatZip, nil
+	default:
+		return "", errInvalid("不支持的压缩格式：%q（只支持 %s 与 %s）", raw, archiveFormatTarGz, archiveFormatZip)
+	}
+}
+
+// archiveExtOf 返回某种格式的文件名后缀。
+func archiveExtOf(format string) string {
+	if format == archiveFormatZip {
+		return ".zip"
+	}
+	return ".tar.gz"
+}
 
 // tarExts 是 tar 家族的后缀。GNU tar 会自己按魔数选解压器，所以 `tar -xf` 对全部这些后缀
 // 都有效，不需要我们给 tar 加 -z/-j/-J。
@@ -61,12 +89,15 @@ func archiveKindOf(name string) string {
 	return ""
 }
 
-// handleFsCompress 把远程的若干条目打成 <archiveDir>/<name>.tar.gz（契约 11.5）。
+// handleFsCompress 把远程的若干条目打成 <archiveDir>/<name>.<ext>（契约 11.5 / 13.5）。
+//
+// format 决定用哪个工具与后缀：tar.gz（缺省，`tar -czf`）或 zip（`zip -qry`）。
 func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *apiError {
 	var req struct {
-		SID   string   `json:"sid"`
-		Paths []string `json:"paths"`
-		Name  string   `json:"name"`
+		SID    string   `json:"sid"`
+		Paths  []string `json:"paths"`
+		Name   string   `json:"name"`
+		Format string   `json:"format"`
 	}
 	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
 		return apiErr
@@ -83,7 +114,11 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	if len(req.Paths) > maxCompressItems {
 		return errInvalid("一次最多压缩 %d 个条目（本次 %d 个）：请改为压缩它们所在的目录", maxCompressItems, len(req.Paths))
 	}
-	name, apiErr := archiveName(req.Name)
+	format, apiErr := resolveArchiveFormat(req.Format)
+	if apiErr != nil {
+		return apiErr
+	}
+	name, apiErr := archiveName(req.Name, format)
 	if apiErr != nil {
 		return apiErr
 	}
@@ -91,32 +126,40 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	if apiErr != nil {
 		return apiErr
 	}
+	out := path.Join(root, name)
 
-	// 1) 解析路径（相对路径相对家目录）+ 校验存在 + 去重。这一步用 SFTP 做：路径语义
-	//    （家目录、相对路径）与其它文件接口保持一致，交给 SFTP 比让远程 shell 去 cd 更可控。
+	// 1) 解析路径（相对路径相对家目录）+ 校验存在 + 去重，并先把同名产物挪开。
+	//    这一步用 SFTP 做：路径语义（家目录、相对路径）与其它文件接口保持一致，
+	//    交给 SFTP 比让远程 shell 去 cd 更可控。
 	var items []string
 	opErr := rt.withSFTP(r.Context(), func(sess *sftpSession) error {
 		var err error
 		items, err = resolveSources(sess, req.Paths)
-		return err
+		if err != nil {
+			return err
+		}
+		return prepareArchiveTarget(sess, out)
 	})
 	if opErr != nil {
 		return fsError("压缩失败", opErr)
 	}
 
-	out := path.Join(root, name)
 	// 2) 一次远程命令完成「建目录 + 打包」。用 `&&` 串起来：建目录失败就不该继续打包，
 	//    否则 tar 会以「输出目录不存在」报错，把真正的原因（没权限建目录）盖掉。
 	//    用 mkdir -p 是因为 archiveDir 固定且可能在 /tmp 下、开机后不存在。
-	command := "mkdir -p " + shellQuote(root) + " && " + compressCommand(out, items)
+	archiveCmd := tarCommand(out, items)
+	if format == archiveFormatZip {
+		archiveCmd = zipCommand(out, items)
+	}
+	command := "mkdir -p " + shellQuote(root) + " && " + archiveCmd
 	res, runErr := rt.runRemote(r.Context(), command)
 	if runErr != nil {
 		return runErr
 	}
 	if !res.ok() {
-		// 失败时清掉半成品压缩包：tar 写到一半失败会留下一个看着正常、其实不完整（也解不开）
-		// 的 .tar.gz，用户会把它当成一个可用的归档下载走。
-		removeRemoteQuietly(rt, out)
+		// 失败时清掉半成品压缩包：写到一半失败会留下一个看着正常、其实不完整（也解不开）
+		// 的归档，用户会把它当成一个可用的包下载走。
+		removeArchiveQuietly(rt, out)
 		return archiveCommandError("压缩失败", res)
 	}
 
@@ -137,7 +180,7 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	// 所以这里只能事后判：超限就把刚生成的包删掉并如实报错——远端 /tmp 通常很小，一个
 	// 意外巨大的包会把整个主机的临时空间吃掉，那比「这次压缩失败」严重得多。
 	if size > maxTransferBytes {
-		removeRemoteQuietly(rt, out)
+		removeArchiveQuietly(rt, out)
 		return errTooLarge("压缩包超过单次上限 %s（实际 %s），已删除产物：请分批压缩", humanSize(maxTransferBytes), humanSize(size))
 	}
 	return respond(w, map[string]any{
@@ -146,13 +189,13 @@ func (m *AdminMux) handleFsCompress(w http.ResponseWriter, r *http.Request) *api
 	})
 }
 
-// compressCommand 拼出 tar 命令（契约 11.5 的规则）。
+// tarCommand 拼出 tar 命令（契约 11.5 的规则）。
 //
 // 单父目录：`-C <父目录> <项的名字>` —— 压缩包里的成员就是用户选中的那些名字（没有多余的
 // 父目录前缀），解压出来与原来一致。
 // 多父目录：只能 `-C /` + 绝对路径（tar 只接受一个 -C 会作用于其后的所有成员）。此时
 // 成员名带上了各自的目录层级，这是唯一能同时表达「来自不同目录的几个条目」的方式。
-func compressCommand(out string, items []string) string {
+func tarCommand(out string, items []string) string {
 	parents := make([]string, 0, 1)
 	seen := map[string]bool{}
 	for _, item := range items {
@@ -184,12 +227,88 @@ func compressCommand(out string, items []string) string {
 	return sb.String()
 }
 
-// archiveName 规整压缩包文件名（契约 11.5：缺省用 webssh-<时间戳>）。
+// zipCommand 拼出 zip 命令（契约 13.5）。
+//
+// zip 的原生语义是「往一个包里追加/更新条目」，所以条目分属不同父目录时依次 `cd` 进各自的
+// 目录再追加进同一个包——这比 tar 的「一个 -C 作用于其后所有成员」更贴近用户「把选中的
+// 东西放进一个包」的预期，包里的名字也保持用户在界面上看到的样子（不带多余的目录层级）。
+//
+// 为什么是 `-qry` 而不是 `-qr`（多处一个 -y）：不加 -y 时 zip 会**跟随软链接**，
+//   - 目录软链接会把链接指向的整棵树搬进包（可能是在别处的几百 MB，用户只想压一个链接）；
+//   - 失效软链接会被静默跳过（zip 只打一条 warning、退出码 0）→ 用户以为压进去了；
+//     若选中的**只有**失效链接，zip 直接 `Nothing to do!` 退出 12，整个压缩失败。
+//
+// 加 -y 后软链接按「链接本身」存（unzip 解压时会重建链接），与 tar 侧不跟随链接的行为
+// （没加 -h）保持一致。
+func zipCommand(out string, items []string) string {
+	// 按父目录分组，组的顺序 = 条目首次出现的顺序（决定 `cd` 的顺序，不影响结果）。
+	type zipGroup struct {
+		dir   string
+		names []string
+	}
+	var groups []zipGroup
+	index := map[string]int{}
+	for _, item := range items {
+		dir := path.Dir(item)
+		i, ok := index[dir]
+		if !ok {
+			index[dir] = len(groups)
+			groups = append(groups, zipGroup{dir: dir})
+			i = len(groups) - 1
+		}
+		groups[i].names = append(groups[i].names, path.Base(item))
+	}
+	var sb strings.Builder
+	for i, g := range groups {
+		if i > 0 {
+			sb.WriteString(" && ")
+		}
+		sb.WriteString("cd ")
+		sb.WriteString(shellQuote(g.dir))
+		sb.WriteString(" && zip -qry ")
+		sb.WriteString(shellQuote(out))
+		for _, name := range g.names {
+			sb.WriteString(" ")
+			sb.WriteString(shellQuote(name))
+		}
+	}
+	return sb.String()
+}
+
+// prepareArchiveTarget 在打包前处理同名产物（由 SFTP 侧执行，且必须在写命令之前）。
+//
+//   - 同名的**目录**直接拒绝：zip/tar 都写不进去，而失败后的清理绝不能去删一个本来就在
+//     那儿的目录——那是用户的数据，不是我们的半成品。
+//   - 同名的文件/软链接先删掉：**zip 是追加/更新语义**，同名包会把上一次留下的条目继续
+//     带在包里（这次没选的文件也在），删掉才能保证「包里的东西 = 这次选中的东西」；
+//     tar 本来就是覆盖写，两边一致更省心。
+func prepareArchiveTarget(sess *sftpSession, out string) error {
+	fi, err := sess.client.Lstat(out)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+		return errInvalid("压缩包名字与一个已存在的目录重名：%s（请换个名字）", out)
+	}
+	if err := sess.client.Remove(out); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// archiveName 规整压缩包文件名（契约 11.5 / 13.5：缺省用 webssh-<时间戳>，后缀按 format）。
 //
 // 名字是**用户输入**且会被拼进远程路径，所以必须严格：不允许路径分隔符（否则能写到
-// archiveDir 外面）、不允许 `.`/`..`、不允许控制字符。没带 `.tar.gz` 后缀时自动补——
-// 前端的「压缩为 tar.gz」菜单项传的就是选中的名字。
-func archiveName(raw string) (string, *apiError) {
+// archiveDir 外面）、不允许 `.`/`..`、不允许控制字符。
+//
+// 后缀处理：用户往往是拿「选中的那个条目的名字」当包名（前端的菜单就是这么传的），
+// 而它可能自带别的归档后缀（`docs.tar.gz`、`backup.zip`）。这时**换掉**而不是在后面再挂
+// 一个——`docs.tar.gz.zip` 这种名字看着就像出了问题。只有认识的后缀才换，
+// `notes.txt` 这种普通后缀保留（`notes.txt.zip` 是合理结果）。
+func archiveName(raw, format string) (string, *apiError) {
 	name := strings.TrimSpace(raw)
 	if name == "" {
 		name = "webssh-" + time.Now().Format("20060102-150405")
@@ -203,10 +322,35 @@ func archiveName(raw string) (string, *apiError) {
 	if strings.ContainsFunc(name, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return "", errInvalid("压缩包名字不能包含控制字符：%q", raw)
 	}
-	if !strings.HasSuffix(name, ".tar.gz") {
-		name += ".tar.gz"
+	ext := archiveExtOf(format)
+	if !strings.HasSuffix(name, ext) {
+		name = strings.TrimSuffix(name, knownArchiveExt(name)) + ext
+	}
+	// 只剩后缀的名字（".zip" / ".tar.gz"）会生成一个隐藏文件：用户在归档目录里列不出来，
+	// 只会看到「压缩成功了但找不到产物」。与其让他对着这一步发呆，不如当场拒绝。
+	if strings.TrimSuffix(name, ext) == "" {
+		return "", errInvalid("压缩包名字不能只有后缀：%q", raw)
 	}
 	return name, nil
+}
+
+// knownArchiveExt 返回名字末尾那个**我们认识的**归档后缀（没有则空串）。
+//
+// 取最长的匹配：`a.tar.gz` 必须返回 `.tar.gz`，返 `.gz`（不在表里）或 `.tar`（不匹配）
+// 都会导致换后缀时把名字切错。
+func knownArchiveExt(name string) string {
+	lower := strings.ToLower(name)
+	best := ""
+	for _, ext := range append(append([]string{}, tarExts...), ".zip") {
+		if strings.HasSuffix(lower, ext) && len(ext) > len(best) {
+			best = ext
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	// 用原名里的那一段（保留用户的大小写习惯）。
+	return name[len(name)-len(best):]
 }
 
 // handleFsExtract 就地解压（契约 11.5）：dir 返回压缩包所在目录。
@@ -303,15 +447,27 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }
 
-// removeRemoteQuietly 尽力删掉一个远端路径（善后专用：失败只记日志，不再上抛——
-// 因为此时更重要的错误（原始失败原因）已经在返回路径上了）。
-func removeRemoteQuietly(rt *sessionRuntime, target string) {
+// removeArchiveQuietly 删掉一个「我们刚写坏的」压缩产物（善后专用：失败只记日志，
+// 不再上抛——此时更重要的错误（原始失败原因）已经在返回路径上了）。
+//
+// 与 removeRemoteTree 的区别在于多了一道「不是目录」的检查：清理的只能是我们自己写坏的
+// 那个文件。同名路径上如果是个目录，那是用户的数据（见 prepareArchiveTarget），
+// 无论什么情况都不能删——「清理半成品把用户的目录删了」是所有失败路径里最不能接受的一种。
+func removeArchiveQuietly(rt *sessionRuntime, out string) {
 	ctx, cancel := cleanupContext(context.Background())
 	defer cancel()
 	err := rt.withSFTP(ctx, func(sess *sftpSession) error {
-		return removeRemoteTree(sess.client, target)
+		fi, err := sess.client.Lstat(out)
+		if err != nil {
+			return err
+		}
+		if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+			warnf("清理压缩产物 %s 时发现它是目录，已跳过（不动用户数据）", out)
+			return nil
+		}
+		return sess.client.Remove(out)
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		warnf("清理远端半成品 %s 失败：%v", target, err)
+		warnf("清理压缩产物 %s 失败：%v", out, err)
 	}
 }

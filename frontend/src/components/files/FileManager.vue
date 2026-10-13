@@ -4,13 +4,16 @@
 // 目录内容全部来自 sftp store（见 stores/sftp.ts 的说明）：这个面板与左栏文件树共用同一份
 // 数据，组件只管「怎么显示」与「把用户动作翻成 store 调用」，不自己缓存目录列表。
 //
-// 第二轮在这里落的四件事：
-//   1) 列表表头可点排序（升序 → 降序 → 取消），状态与持久化都在 store，这里只画箭头；
-//   2) 权限列在符号（-rw-r--r--）与八进制（0644）之间切换，八进制由 modeToOctal 换算；
-//   3) 「更多」菜单补齐 复制 / 剪切 / 粘贴 / 压缩为 tar.gz / 解压 / 导出至飞牛 /
-//      在此目录新建终端（去掉了「打开」——点行本身就是打开）；
-//   4) 桌面端工具栏加「返回终端」：主区域双模式下，文件管理器占满主区域，用户需要一个
-//      就地回到终端的入口（另一个入口是左栏顶部那个「完整文件管理」图标按钮）。
+// 这个面板负责的事：
+//   1) 列表表头三列可点排序（升序 → 降序 → 取消），状态与持久化都在 store，这里只画箭头；
+//   2) 表头的「权限」列可点，在符号（-rw-r--r--）与八进制（0644）之间切换显示形态
+//      （八进制由 modeToOctal 换算）。它**故意**与排序共用表头但互不干扰：排序是三列的三态
+//      循环，权限列只切换显示形态，不参与排序——两件事混在一起后用户点一下会同时改变两处；
+//   3) 行内「更多」菜单 + **空白处右键菜单**（桌面）：粘贴 / 打开终端 / 复制路径；
+//   4) 复制 / 剪切 / 粘贴 / 压缩为 tar.gz / 压缩为 zip / 解压 / 导出至飞牛 / 在此目录新建终端。
+//
+// 切回终端不再由这个面板负责（第三轮去掉了「返回终端」按钮）：子标签栏里那个固定「文件管理」
+// 子标签与终端标签是二选一，切回去点终端标签即可——面板里再放一个开关就是两套开关打架。
 //
 // 弹窗（重命名 / 新建 用 PromptDialog，删除与覆盖确认用 ConfirmDialog）由 shell 模块提供，见契约 6.2。
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
@@ -18,12 +21,12 @@ import { t } from '@/i18n'
 import {
   ApiError,
   describeError,
+  type ArchiveFormat,
   type FsEntry,
   type UploadEntry,
   type UploadResult
 } from '@/serverapi'
 import { usePaneControlsStore } from '@/stores/paneControls'
-import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
@@ -47,7 +50,6 @@ import UploadDialog from './UploadDialog.vue'
 const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
 
 const sftp = useSftpStore()
-const sessionUi = useSessionUiStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 const toastStore = useToastStore()
@@ -126,18 +128,6 @@ function selectAll() {
   )
 }
 
-/**
- * 回到终端。
- *
- * 主区域双模式（桌面）下，文件管理器占满主区域，这个按钮就是回程；切换之后还要把焦点
- * 还给 xterm——只切模式不聚焦的话，用户接着敲的字符没有落点（要点一下终端才生效），
- * 这正是「点了按钮就没反应」的经典来源。
- */
-function backToTerminal() {
-  sessionUi.setMainMode(sid, 'terminal')
-  focusTerminal()
-}
-
 /** 聚焦当前激活的终端；activeOf 为 null（激活项在文件管理上）时退回第一个终端。 */
 function focusTerminal() {
   void nextTick(() => {
@@ -151,9 +141,9 @@ function openTerminalHere(dir: string) {
   const target = dir || state.value.dir
   if (!target) return
   hideMenu()
+  // openTerminalAt 会把新标签设成激活项（terminals.setActive → sessionUi.setActiveSub），
+  // 子标签栏随之切到那个终端、左栏也回来——不需要（也没有）额外的「主区域模式」开关。
   terminals.openTerminalAt(sid, target)
-  // 「在此目录新建终端」的结果是终端，不把主区域切过去就等于没有反馈（桌面）
-  sessionUi.setMainMode(sid, 'terminal')
   focusTerminal()
 }
 
@@ -187,9 +177,12 @@ function modeText(entry: FsEntry): string {
   return state.value.mode === 'octal' ? modeToOctal(entry.mode) : permText(entry.mode)
 }
 
-/** 权限显示模式按钮的提示 = **目标**形态（点下去会切成什么）。 */
+/**
+ * 「权限」表头的提示：与三列排序不同，这里说的是**当前**形态（文案本身就是
+ * 「权限显示：符号（-rw-r--r--）」这种描述），点一下切到另一种。
+ */
 const modeTitle = computed(() =>
-  state.value.mode === 'symbolic' ? t('files_mode_octal') : t('files_mode_symbolic')
+  state.value.mode === 'symbolic' ? t('files_mode_symbolic') : t('files_mode_octal')
 )
 
 /**
@@ -200,9 +193,16 @@ const modeTitle = computed(() =>
  */
 const inArchiveDir = computed(() => !!sftp.archiveDir() && state.value.dir === sftp.archiveDir())
 
-// ---- 行内菜单（右键 / 「···」都走它） ----
+// ---- 行内菜单（右键 / 「···」都走它；空白处右键走同一份菜单状态） ----
 
-const menu = reactive({ show: false, x: 0, y: 0, path: '' })
+/**
+ * `blank = true` 表示这一份菜单是「在空白处右键」弹的：作用于**当前目录**（粘贴到当前目录、
+ * 在当前目录开终端、复制当前目录的路径），而不是某一行。
+ *
+ * 为什么共用一份状态而不是两个菜单：菜单同时只该有一个，分成两份就要各自处理「点别处关掉」、
+ * 夹回窗口边界、以及互相关闭，代码会立刻翻倍。
+ */
+const menu = reactive({ show: false, x: 0, y: 0, path: '', blank: false })
 const menuEl = ref<HTMLElement | null>(null)
 /** 菜单离窗口边缘至少留这么多，免得贴着边被切掉 */
 const MENU_MARGIN = 8
@@ -212,9 +212,43 @@ function openMenu(entry: FsEntry, event: MouseEvent) {
   menu.x = event.clientX
   menu.y = event.clientY
   menu.path = entry.path
+  menu.blank = false
   // 菜单里「导出至飞牛」是否可点取决于运行信息：万一 home store 那次请求失败了，这里再试一次
   void sftp.ensureRuntime()
   // 先按指针位置摆好，渲染出来量到真实尺寸后再夹回窗口内（同一帧内完成，看不出来）
+  void nextTick(clampMenu)
+  window.setTimeout(() => window.addEventListener('click', hideMenu, { once: true }), 0)
+}
+
+/**
+ * 列表/网格区域的右键：行（含网格格子）自己处理，其余的落点都算「空白处」。
+ *
+ * 为什么不用 `.self` 判断：`event.target` 只有在真的点到容器本身时才是容器，而空白处的
+ * 形态有很多种——最后一行下面的留白、网格的行尾、还有「这个目录是空的」那块占位文字。
+ * 用「落点不在任何一行里」来判定，这些情况一次全覆盖（空目录里最想做的事恰恰是粘贴）。
+ */
+function onBlankContext(event: MouseEvent) {
+  const target = event.target as HTMLElement | null
+  if (target?.closest('[data-fs-entry]')) return
+  openBlankMenu(event)
+}
+
+/**
+ * 空白处右键（桌面）。
+ *
+ * 触屏不弹：长按在移动端也会触发 contextmenu，但那一套「按住不动看看有什么」的交互与桌面
+ * 右键不是一回事，而这个菜单的三个动作在移动端都有各自更直接的入口（子标签、行菜单）。
+ * 当前目录还没定位到（首次加载中 / 加载失败）时也不弹：三个动作全都以当前目录为对象，
+ * 没有目录就没有可做的事。
+ */
+function openBlankMenu(event: MouseEvent) {
+  if (mobile || !state.value.dir) return
+  menu.show = true
+  menu.x = event.clientX
+  menu.y = event.clientY
+  menu.path = ''
+  menu.blank = true
+  void sftp.ensureRuntime()
   void nextTick(clampMenu)
   window.setTimeout(() => window.addEventListener('click', hideMenu, { once: true }), 0)
 }
@@ -515,7 +549,13 @@ async function pasteInto(toDir: string) {
     if (res.count) toast(t('files_paste_done', { n: res.count }), 'success')
     // 后端只回「跳过了几项」，名字是 store 按「源里的名字没出现在结果里」对出来的
     const conflict = res.conflicts[0]
-    if (res.skipped && conflict) toast(t('files_paste_exists', { name: conflict }))
+    if (res.skipped) {
+      // 一项都没贴上（全被同名挡下）时也要说话：静默等于「点了没反应」
+      toast(conflict ? t('files_paste_exists', { name: conflict }) : t('files_op_failed_short'))
+    } else if (!res.count) {
+      // 后端既没贴也没跳过（理论上不会发生）：兜底报一句，别让失败看起来像成功
+      toast(t('files_op_failed_short'))
+    }
   } catch (e) {
     if (e instanceof ApiError && e.code === 'duplicate') {
       toast(first ? t('files_paste_exists', { name: baseName(first) }) : t('files_op_failed_short'))
@@ -535,16 +575,19 @@ function isArchive(name: string): boolean {
 }
 
 /**
- * 压缩为 tar.gz。
+ * 压缩（tar.gz / zip）。
  *
  * 归档名（按被压缩项推导）与「跳到产物目录」都在 store 里做：产物落在服务端固定的
  * archiveDir 下，用户点压缩的目的就是拿到那个包，停在原目录只看到一条 toast 等于没完成。
+ *
+ * 远端缺 tar/zip 时后端回 `no_archive_tool`，`describeError` 会翻成「远程主机缺少所需的
+ * 压缩工具」——所以这里不去预判工具在不在（前端无从知道），失败就把后端原文报出来。
  */
-async function compressEntries(paths: string[]) {
+async function compressEntries(paths: string[], format: ArchiveFormat) {
   hideMenu()
   if (!paths.length) return
   try {
-    const archive = await sftp.compress(sid, paths)
+    const archive = await sftp.compress(sid, paths, format)
     toast(t('files_compress_done', { path: archive.path }), 'success')
   } catch (e) {
     toast(t('files_op_failed', { error: describeError(e) }))
@@ -659,17 +702,35 @@ function onUploaded(_result: UploadResult) {
  */
 type MenuItem = { label: string; run: () => void; danger?: boolean; dim?: boolean }
 
-/** 粘贴项：没有剪贴板就整项不出现；剪贴板来自别的会话时禁用并说明原因（11.4）。 */
-function pasteItem(toDir: string): MenuItem | null {
-  if (sftp.clipboardIsForeign(sid)) {
-    return {
-      label: t('files_paste'),
-      dim: true,
-      run: () => toast(t('files_paste_cross_session'), 'info')
-    }
+/**
+ * 剪贴板现在能不能粘：返回 null = 可以，返回文案 = 不能粘的原因。
+ *
+ * 空白处菜单要**总是**显示「粘贴」（放灰 + 点一下说明原因），行菜单则在没有剪贴板时整项
+ * 不出现——两种菜单对「没剪贴板」的处理不同是契约里定死的（11.4 与 13.4），所以把判据
+ * 抽成一个函数，免得两处各写一套、日后走样。
+ */
+function pasteBlockedReason(): string | null {
+  if (sftp.clipboardIsForeign(sid)) return t('files_paste_cross_session')
+  if (!sftp.clipboardFor(sid)) return t('files_clipboard_empty')
+  return null
+}
+
+/**
+ * 粘贴项。
+ *
+ * `always = false`（行菜单）：没有剪贴板就整项不出现（11.4）。
+ * `always = true`（空白处菜单）：总是出现，粘不了时置灰并在点击时说明原因（13.4）。
+ */
+function pasteItem(toDir: string, always: boolean): MenuItem | null {
+  const blocked = pasteBlockedReason()
+  if (!blocked) return { label: t('files_paste'), run: () => void pasteInto(toDir) }
+  if (!always) {
+    // 行菜单里「别的会话复制的东西」还是要露出来：用户需要知道「为什么这里没有粘贴」
+    return sftp.clipboardIsForeign(sid)
+      ? { label: t('files_paste'), dim: true, run: () => toast(blocked, 'info') }
+      : null
   }
-  if (!sftp.clipboardFor(sid)) return null
-  return { label: t('files_paste'), run: () => void pasteInto(toDir) }
+  return { label: t('files_paste'), dim: true, run: () => toast(blocked, 'info') }
 }
 
 /** 导出项：exportRoot 为空 = 服务端没配共享目录，禁用并说明。 */
@@ -684,14 +745,27 @@ function exportItem(entry: FsEntry): MenuItem {
   return { label: t('files_export_nas'), run: () => void exportEntry(entry, false) }
 }
 
+/** 空白处菜单（13.4）：粘贴到当前目录 / 在当前目录开终端 / 复制当前目录路径。 */
+function blankMenuItems(): MenuItem[] {
+  const dir = state.value.dir
+  const items: MenuItem[] = []
+  const paste = pasteItem(dir, true)
+  if (paste) items.push(paste)
+  items.push({ label: t('files_open_terminal'), run: () => openTerminalHere(dir) })
+  items.push({ label: t('files_copy_path'), run: () => void copyPath(dir) })
+  return items
+}
+
 const menuItems = computed<MenuItem[]>(() => {
+  if (menu.blank) return blankMenuItems()
   const entry = entries.value.find((item) => item.path === menu.path)
   if (!entry) return []
   const targets = targetPaths(entry)
   const items: MenuItem[] = []
-  // 顺序按契约 11.4：粘贴（有剪贴板时）/ 重命名 / 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 /
-  // 压缩为 tar.gz / 解压（可解压时）/ 复制完整路径 / 在此目录新建终端
-  const paste = pasteItem(entry.dir ? entry.path : state.value.dir)
+  // 顺序按契约 11.4（13.4 加了「压缩为 zip」紧跟 tar.gz）：粘贴（有剪贴板时）/ 重命名 /
+  // 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 / 压缩为 tar.gz / 压缩为 zip / 解压 /
+  // 复制完整路径 / 在此目录新建终端
+  const paste = pasteItem(entry.dir ? entry.path : state.value.dir, false)
   if (paste) items.push(paste)
   items.push({ label: t('files_rename'), run: renameEntry })
   items.push({ label: t('files_copy'), run: () => copyEntries(targets) })
@@ -704,7 +778,11 @@ const menuItems = computed<MenuItem[]>(() => {
       targets.length > 1
         ? t('files_compress_selected', { n: targets.length })
         : t('files_compress'),
-    run: () => void compressEntries(targets)
+    run: () => void compressEntries(targets, 'tar.gz')
+  })
+  items.push({
+    label: t('files_compress_zip'),
+    run: () => void compressEntries(targets, 'zip')
   })
   if (!entry.dir && isArchive(entry.name)) {
     items.push({ label: t('files_extract'), run: () => void extractEntry(entry) })
@@ -929,45 +1007,8 @@ onBeforeUnmount(hideMenu)
           <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
         </svg>
       </button>
-      <!--
-        权限显示模式开关：只在桌面端出现——权限列本身在移动端不渲染（列宽不够），
-        留着这个按钮就会是「点了什么也没变」。
-        图标区显示的是**当前**形态的文字（-rw / 0644）：两种状态用图形区分不出来，
-        直接显示它把权限画成什么样最直观，也和权限列的等宽字体对得上。
-      -->
-      <button
-        v-if="!mobile"
-        type="button"
-        class="tree-tool"
-        :title="modeTitle"
-        :aria-label="modeTitle"
-        @click="sftp.toggleMode(sid)"
-      >
-        <span class="font-mono text-[11px]">{{ state.mode === 'octal' ? '0644' : '-rw-' }}</span>
-      </button>
-      <!-- 桌面端的「返回终端」：文件管理器占满主区域时，这是就地切回终端的入口 -->
-      <button
-        v-if="!mobile"
-        type="button"
-        class="tree-tool"
-        :title="t('session_hide_files')"
-        :aria-label="t('session_hide_files')"
-        @click="backToTerminal"
-      >
-        <svg
-          class="h-4 w-4"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <path d="M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3" />
-          <path d="m16 8-4 4 4 4" />
-          <path d="M20 12h-8" />
-        </svg>
-      </button>
+      <!-- 权限显示模式不再是独立按钮：点列表表头里的「权限」就能切（见下面的表头区），
+           工具栏只留「做什么」的动作按钮。 -->
     </div>
 
     <!-- 有选中项时面包屑让位给「已选 / 删除所选」；否则是路径分段（点哪段去哪层） -->
@@ -1037,9 +1078,10 @@ onBeforeUnmount(hideMenu)
     </div>
 
     <!--
-      列表的表头：名称 / 大小 / 修改时间三列可点排序（循环 升序 → 降序 → 取消）。
+      列表的表头：名称 / 大小 / 修改时间三列可点排序（循环 升序 → 降序 → 取消）；
+      「权限」列点一下切换显示形态（符号 ↔ 八进制），它不参与排序。
       目录恒在文件前面由 compareEntries 保证，与点哪一列无关。
-      权限列在移动端省掉（列宽不够），与工具栏那个显示模式开关的显隐一致。
+      权限列在移动端省掉（列宽不够）：没有这一列，也就没有切换形态的入口。
     -->
     <div
       v-if="state.view === 'list'"
@@ -1069,7 +1111,29 @@ onBeforeUnmount(hideMenu)
           <path :d="sortDirOf(head.key) === 'asc' ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'" />
         </svg>
       </button>
-      <span v-if="!mobile" class="w-20 shrink-0 text-right">{{ t('files_mode') }}</span>
+      <button
+        v-if="!mobile"
+        type="button"
+        class="flex w-20 shrink-0 items-center justify-end gap-0.5 rounded px-0.5 hover:text-ink dark:hover:text-white"
+        :title="modeTitle"
+        :aria-label="modeTitle"
+        @click="sftp.toggleMode(sid)"
+      >
+        <span class="truncate">{{ t('files_mode') }}</span>
+        <!-- 双向箭头：这一列点一下是「换一种写法」，不是排序（排序箭头只在另外三列上） -->
+        <svg
+          class="h-3 w-3 shrink-0 opacity-60"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M4 8h13M4 8l3-3M4 8l3 3" />
+          <path d="M20 16H7M20 16l-3-3M20 16l-3 3" />
+        </svg>
+      </button>
       <span class="w-6 shrink-0" />
     </div>
 
@@ -1079,6 +1143,7 @@ onBeforeUnmount(hideMenu)
       @dragover.prevent="onDragOver"
       @dragleave="onDragLeave"
       @drop.prevent="onDrop"
+      @contextmenu.prevent="onBlankContext($event)"
     >
       <div v-if="state.loading" class="px-3 py-6 text-center text-sm text-ink-faint">
         {{ t('files_loading') }}
@@ -1103,6 +1168,7 @@ onBeforeUnmount(hideMenu)
           :key="entry.path"
           class="group flex cursor-pointer items-center gap-2 border-b border-line/60 px-2 py-1.5 text-sm hover:bg-black/5 dark:border-line-dark/60 dark:hover:bg-white/5"
           :class="selected.includes(entry.path) ? 'bg-brand-soft' : ''"
+          data-fs-entry
           @click="onEntryClick(entry)"
           @contextmenu.prevent="openMenu(entry, $event)"
         >
@@ -1173,9 +1239,10 @@ onBeforeUnmount(hideMenu)
 
       <!-- 网格：列宽按容器自适应，用 inline style 而不是 Tailwind 任意值——后者要写一长串
            带括号与逗号的类名，扫不到就静默退化成单列 -->
+      <!-- 网格：格子之间的空白同样是「空白处」，由外层容器的右键处理器兜住 -->
       <div
         v-else
-        class="grid gap-1 p-2"
+        class="grid min-h-full gap-1 p-2"
         style="grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr))"
       >
         <div
@@ -1183,6 +1250,7 @@ onBeforeUnmount(hideMenu)
           :key="entry.path"
           class="group relative flex cursor-pointer flex-col items-center gap-1 rounded-md border border-transparent px-2 py-2 text-center hover:border-line hover:bg-black/5 dark:hover:border-line-dark dark:hover:bg-white/5"
           :class="selected.includes(entry.path) ? 'bg-brand-soft' : ''"
+          data-fs-entry
           @click="onEntryClick(entry)"
           @contextmenu.prevent="openMenu(entry, $event)"
         >

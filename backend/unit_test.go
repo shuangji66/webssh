@@ -518,24 +518,63 @@ func TestArchiveKindOf(t *testing.T) {
 	}
 }
 
-// TestArchiveName 校验压缩包名字的规整与拒绝规则。
+// TestResolveArchiveFormat 校验 format 的取值规则（契约 13.5）。
+func TestResolveArchiveFormat(t *testing.T) {
+	for raw, want := range map[string]string{"": archiveFormatTarGz, "tar.gz": archiveFormatTarGz, " zip ": archiveFormatZip} {
+		got, apiErr := resolveArchiveFormat(raw)
+		if apiErr != nil || got != want {
+			t.Errorf("resolveArchiveFormat(%q) = %q %v，期望 %q", raw, got, apiErr, want)
+		}
+	}
+	// 不认识的值必须报错而不是猜一个（猜了的话「前端发错字段值」这类问题永远查不出来）
+	for _, raw := range []string{"tgz", "tar", "ZIP", "rar", "7z", "gz"} {
+		if got, apiErr := resolveArchiveFormat(raw); apiErr == nil || apiErr.Code != "invalid" {
+			t.Errorf("resolveArchiveFormat(%q) = %q %v，期望 invalid", raw, got, apiErr)
+		}
+	}
+}
+
+// TestArchiveName 校验压缩包名字的规整与拒绝规则（后缀按 format 走）。
 func TestArchiveName(t *testing.T) {
-	got, apiErr := archiveName("")
+	got, apiErr := archiveName("", archiveFormatTarGz)
 	if apiErr != nil {
 		t.Fatalf("缺省名字不该报错：%v", apiErr)
 	}
 	if !strings.HasPrefix(got, "webssh-") || !strings.HasSuffix(got, ".tar.gz") {
 		t.Errorf("缺省名字 = %q，期望 webssh-<时间戳>.tar.gz", got)
 	}
-	if got, apiErr = archiveName(" docs "); apiErr != nil || got != "docs.tar.gz" {
+	if got, apiErr = archiveName("", archiveFormatZip); apiErr != nil || !strings.HasPrefix(got, "webssh-") || !strings.HasSuffix(got, ".zip") {
+		t.Errorf("zip 的缺省名字 = %q %v", got, apiErr)
+	}
+	if got, apiErr = archiveName(" docs ", archiveFormatTarGz); apiErr != nil || got != "docs.tar.gz" {
 		t.Errorf("archiveName(docs) = %q %v", got, apiErr)
 	}
-	if got, apiErr = archiveName("x.tar.gz"); apiErr != nil || got != "x.tar.gz" {
+	if got, apiErr = archiveName("docs", archiveFormatZip); apiErr != nil || got != "docs.zip" {
+		t.Errorf("archiveName(docs, zip) = %q %v", got, apiErr)
+	}
+	if got, apiErr = archiveName("x.tar.gz", archiveFormatTarGz); apiErr != nil || got != "x.tar.gz" {
 		t.Errorf("已经有后缀时不该再加一遍：%q %v", got, apiErr)
 	}
+	// 自带**别的**归档后缀时换掉它：docs.tar.gz.zip 这种名字看着就像出了问题
+	if got, apiErr = archiveName("docs.tar.gz", archiveFormatZip); apiErr != nil || got != "docs.zip" {
+		t.Errorf("archiveName(docs.tar.gz, zip) = %q %v", got, apiErr)
+	}
+	if got, apiErr = archiveName("docs.ZIP", archiveFormatTarGz); apiErr != nil || got != "docs.tar.gz" {
+		t.Errorf("archiveName(docs.ZIP, tar.gz) = %q %v", got, apiErr)
+	}
+	// 普通后缀保留（docs.txt.zip 是合理结果）
+	if got, apiErr = archiveName("docs.txt", archiveFormatZip); apiErr != nil || got != "docs.txt.zip" {
+		t.Errorf("archiveName(docs.txt, zip) = %q %v", got, apiErr)
+	}
+	// 只剩后缀的名字会变成隐藏文件，直接拒绝（两种 format 都要拒）
+	for _, bad := range []string{".zip", ".tar.gz"} {
+		if got, apiErr := archiveName(bad, archiveFormatZip); apiErr == nil || apiErr.Code != "invalid" {
+			t.Errorf("archiveName(%q, zip) 应当报 invalid，实际 %q %v", bad, got, apiErr)
+		}
+	}
 	for _, bad := range []string{"../escape", "a/b", `a\b`, ".", "..", "a\nb", strings.Repeat("x", 200)} {
-		if _, apiErr := archiveName(bad); apiErr == nil || apiErr.Code != "invalid" {
-			t.Errorf("archiveName(%q) 应当报 invalid，实际 %v", bad, apiErr)
+		if _, apiErr := archiveName(bad, archiveFormatZip); apiErr == nil || apiErr.Code != "invalid" {
+			t.Errorf("archiveName(%q, zip) 应当报 invalid，实际 %v", bad, apiErr)
 		}
 	}
 }
@@ -583,27 +622,51 @@ func TestRuntimeEnvArchiveAndExport(t *testing.T) {
 	}
 }
 
-// TestCompressCommand 校验 tar 命令的拼装：单父目录用 -C <父目录>，多父目录退回 -C / +
+// TestTarCommand 校验 tar 命令的拼装：单父目录用 -C <父目录>，多父目录退回 -C / +
 // 绝对路径，并且每个插值路径都被单引号引用。
-func TestCompressCommand(t *testing.T) {
+func TestTarCommand(t *testing.T) {
 	// 单目录：成员名就是选中的那个名字
-	got := compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/docs"})
+	got := tarCommand("/tmp/out/a.tar.gz", []string{"/home/u/docs"})
 	if got != `tar -czf '/tmp/out/a.tar.gz' -C '/home/u' 'docs'` {
 		t.Errorf("单父目录命令 = %q", got)
 	}
 	// 同一个父目录下的多项：只写一次 -C
-	got = compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/a.txt", "/home/u/b.txt"})
+	got = tarCommand("/tmp/out/a.tar.gz", []string{"/home/u/a.txt", "/home/u/b.txt"})
 	if got != `tar -czf '/tmp/out/a.tar.gz' -C '/home/u' 'a.txt' 'b.txt'` {
 		t.Errorf("同父目录多项命令 = %q", got)
 	}
 	// 多个父目录：-C / + 去掉前导斜杠的绝对路径（GNU tar 自己会剥掉 `/` 并打警告）
-	got = compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/a.txt", "/srv/b.txt"})
+	got = tarCommand("/tmp/out/a.tar.gz", []string{"/home/u/a.txt", "/srv/b.txt"})
 	if got != `tar -czf '/tmp/out/a.tar.gz' -C / 'home/u/a.txt' 'srv/b.txt'` {
 		t.Errorf("多父目录命令 = %q", got)
 	}
 	// 带空格与单引号的路径必须被引用住
-	got = compressCommand("/tmp/out/a.tar.gz", []string{"/home/u/it's here/docs"})
+	got = tarCommand("/tmp/out/a.tar.gz", []string{"/home/u/it's here/docs"})
 	if got != `tar -czf '/tmp/out/a.tar.gz' -C '/home/u/it'\''s here' 'docs'` {
+		t.Errorf("含引号的路径没被正确引用：%q", got)
+	}
+}
+
+// TestZipCommand 校验 zip 命令的拼装：每个父目录一次 `cd`，多组之间用 `&&` 串起来
+// （zip 是追加语义，同一个包会被依次追加）。
+func TestZipCommand(t *testing.T) {
+	got := zipCommand("/tmp/out/a.zip", []string{"/home/u/docs"})
+	if got != `cd '/home/u' && zip -qry '/tmp/out/a.zip' 'docs'` {
+		t.Errorf("单父目录 zip 命令 = %q", got)
+	}
+	// 同父目录下的多项：只 cd 一次
+	got = zipCommand("/tmp/out/a.zip", []string{"/home/u/a.txt", "/home/u/b.txt"})
+	if got != `cd '/home/u' && zip -qry '/tmp/out/a.zip' 'a.txt' 'b.txt'` {
+		t.Errorf("同父目录多项 zip 命令 = %q", got)
+	}
+	// 多父目录：依次 cd 追加进同一个包
+	got = zipCommand("/tmp/out/a.zip", []string{"/home/u/a.txt", "/srv/b.txt", "/home/u/c.txt"})
+	if got != `cd '/home/u' && zip -qry '/tmp/out/a.zip' 'a.txt' 'c.txt' && cd '/srv' && zip -qry '/tmp/out/a.zip' 'b.txt'` {
+		t.Errorf("多父目录 zip 命令 = %q", got)
+	}
+	// 带空格与单引号的路径必须被引用住
+	got = zipCommand("/tmp/out/a.zip", []string{"/home/u/it's here/docs"})
+	if got != `cd '/home/u/it'\''s here' && zip -qry '/tmp/out/a.zip' 'docs'` {
 		t.Errorf("含引号的路径没被正确引用：%q", got)
 	}
 }

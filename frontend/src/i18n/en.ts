@@ -34,7 +34,6 @@ export const en: Record<string, string> = {
   app_session_gone: 'This session no longer exists (closed elsewhere?)',
 
   // ===== home: session list =====
-  home_title: 'Remote sessions',
   home_new: 'Add remote session',
   home_refresh: 'Refresh',
   home_empty_title: 'No remote sessions yet',
@@ -60,12 +59,10 @@ export const en: Record<string, string> = {
   home_delete_confirm_msg: 'Delete “{name}”? Its credentials, quick commands and history will be removed as well.',
   home_delete_success: 'Deleted “{name}”',
   home_delete_failed: 'Failed to delete: {error}',
-  home_total: '{n} session(s)',
   home_cred_unsaved: 'Credential not saved',
   home_cred_unsaved_hint: 'This session does not store credentials — every connection asks again',
   home_view_terminals: 'View terminals',
   home_rename_failed: 'Rename failed: {error}',
-  home_open_count: '{n} open',
 
   // ===== session form =====
   form_new_title: 'Add remote session',
@@ -153,7 +150,7 @@ export const en: Record<string, string> = {
   err_internal: 'Internal server error',
   err_unknown: 'Failed: {error}',
   err_credential_required: 'No credential is stored for this session — enter one first',
-  err_no_archive_tool: 'The remote host lacks the required archiver (tar / unzip)',
+  err_no_archive_tool: 'The remote host lacks the required archiver (tar / zip / unzip)',
   err_archive_unsupported: 'Unsupported archive format',
   err_no_share_path: 'No fnOS share directory configured (TRIM_DATA_SHARE_PATHS)',
 
@@ -163,7 +160,6 @@ export const en: Record<string, string> = {
   session_close_terminal: 'Close terminal tab',
   session_terminal_n: 'Terminal {n}',
   session_terminal_titled: 'Terminal {n}: {title}',
-  session_full_files: 'Full file manager',
   session_rename_title: 'Rename terminal tab',
   session_rename_prompt: 'New name',
   cred_title_password: 'Enter the password',
@@ -176,14 +172,10 @@ export const en: Record<string, string> = {
   cred_passphrase: 'Key passphrase',
   termlist_title: 'Terminals of “{name}”',
   termlist_empty: 'No terminal open in this session',
-  termlist_new: 'New terminal',
   termlist_created: 'Created {time}',
-  termlist_name_hint: 'The name here is synced with the terminal tab',
-  termlist_session_name_hint: 'The session name is synced with the top tab',
   termlist_close_confirm_title: 'Close terminal',
   termlist_close_confirm_msg: 'Close “{title}”? The remote shell of this terminal will be terminated.',
   session_left_title: 'Files',
-  session_hide_files: 'Back to terminals',
   session_new_terminal_here: 'New terminal here',
   session_close_confirm_title: 'Close terminal tab',
   session_close_confirm_msg: 'Close “{title}”? The terminal session and its remote shell will be terminated.',
@@ -200,6 +192,7 @@ export const en: Record<string, string> = {
   term_act_search: 'Search',
   term_act_paste: 'Paste',
   term_act_clear: 'Clear',
+  term_act_quick_cmds: 'Commands',
   term_act_reconnect: 'Reconnect',
   term_labels_collapse: 'Collapse labels',
   term_labels_expand: 'Expand labels',
@@ -352,6 +345,7 @@ export const en: Record<string, string> = {
   qc_move_down: 'Move down',
   qc_auto_tag: 'Auto',
   qc_send: 'Send to the active terminal',
+  qc_send_to: 'Send to {name}',
   qc_scope_switch: 'Switch global / session',
 
   // ===== settings =====

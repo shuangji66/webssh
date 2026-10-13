@@ -6,6 +6,11 @@
 //
 // 这里**只**管标签本身：关闭会话标签时「终止后端会话 + 清终端/SFTP/界面状态」属于
 // 业务动作，由入口（AppTabBar）按契约 6.3 的顺序完成，store 不替调用方做决定。
+//
+// **标签标题不是本地偏好，而是会话配置名字的投影**（契约 13.3）：双击改标签会写回
+// `/api/sessions/save`，编辑表单改名也会同步过来（`syncTitle`）。这里曾经存过一份
+// localStorage 的「本机改名表」，用来让标签名不被配置名覆盖——现在两个方向都要同步，那份
+// 覆盖表只会让「表单改了名、标签不动」，所以删掉了：配置是唯一真相。
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { t } from '@/i18n'
@@ -21,27 +26,7 @@ export interface AppTab {
   closable: boolean
 }
 
-// 用户双击改过的标签名记在浏览器本地：标签名是「我在这台设备上给它起的简称」，
-// 不应该写回会话配置（那是会话的真实名字）。按 sid 存，删掉会话标签也不清，
-// 重开同一个会话还能看到自己起过的名字。
-const TITLES_KEY = 'webssh-tab-titles'
-
-function readTitles(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem(TITLES_KEY)
-    const parsed: unknown = raw ? JSON.parse(raw) : null
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, string>
-    }
-  } catch {
-    // 解析失败按「没有改名记录」处理：这只是展示偏好，不能因为它让整个应用起不来
-  }
-  return {}
-}
-
 export const useAppTabsStore = defineStore('appTabs', () => {
-  const renamed = ref<Record<string, string>>(readTitles())
-
   // 首页标题这里给的是初始值；语言切换后由 AppTabBar 用 t('app_tab_home') 覆盖渲染，
   // 否则切到英文后标签上的「首页」会留在中文。
   const tabs = ref<AppTab[]>([
@@ -55,15 +40,12 @@ export const useAppTabsStore = defineStore('appTabs', () => {
     activeId.value = HOME_TAB_ID
   }
 
-  /** 打开（或切回）一个会话标签。已存在时只激活，并按需更新标题。 */
+  /** 打开（或切回）一个会话标签。已存在时只激活，并按配置名更新标题。 */
   function openSession(sid: string, title?: string) {
-    const existing = tabs.value.find((tab) => tab.id === sid)
     const wanted = title?.trim() || ''
-    const stored = renamed.value[sid] || ''
+    const existing = tabs.value.find((tab) => tab.id === sid)
     if (existing) {
-      // 用户手动改过名就不再被配置名覆盖：否则「首页点打开 → 标签名又变回去」，
-      // 用户会以为重命名没保存。
-      if (!stored && wanted) existing.title = wanted
+      if (wanted) existing.title = wanted
       activeId.value = sid
       return
     }
@@ -71,7 +53,7 @@ export const useAppTabsStore = defineStore('appTabs', () => {
       id: sid,
       kind: 'session',
       closable: true,
-      title: stored || wanted || sid
+      title: wanted || sid
     })
     activeId.value = sid
   }
@@ -106,30 +88,27 @@ export const useAppTabsStore = defineStore('appTabs', () => {
     return removed
   }
 
-  /** 改标签名（空字符串 = 放弃改名，保持原样）。 */
+  /**
+   * 改标签名（空字符串 = 放弃改名，保持原样）。**只改展示**：写回配置由调用方（AppTabBar）
+   * 走 `home.renameSession`，这样「配置 ↔ 标签」两个方向用的是同一份数据。
+   */
   function setTitle(sid: string, title: string) {
     const value = title.trim()
     if (!value) return
-    renamed.value[sid] = value
-    try {
-      localStorage.setItem(TITLES_KEY, JSON.stringify(renamed.value))
-    } catch {
-      // 存储满/隐私模式下写不进去：名字这一次仍然生效，只是刷新后丢，不必打扰用户
-    }
     const tab = tabs.value.find((item) => item.id === sid)
     if (tab) tab.title = value
   }
 
   /**
-   * 会话配置改名后同步标签标题（**不**改变激活项，也不覆盖用户手动改过的名字）。
+   * 会话配置改名后同步标签标题（**不**改变激活项）。
    *
    * 与 openSession 分开：改完配置还在首页 / 别的会话里，不该被拽到那个会话的标签上。
+   * 无条件覆盖：配置是标签名的唯一真相（契约 13.3），编辑表单改名后标签必须跟着变。
    */
   function syncTitle(sid: string, title: string) {
     const tab = tabs.value.find((item) => item.id === sid)
-    if (!tab || renamed.value[sid]) return
     const value = title.trim()
-    if (value) tab.title = value
+    if (tab && value) tab.title = value
   }
 
   return {
