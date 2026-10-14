@@ -11,12 +11,13 @@
 //
 // 「不保存凭据」的会话会在这里收到 `credential_required`（契约 11.1.3）：那不是失败，
 // 而是「请先输入凭据」，所以转成 CredentialPromptDialog，填完带凭据重试一次。
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, describeError, type SessionView } from '@/serverapi'
-import { useAppTabsStore } from '@/stores/appTabs'
+import { HOME_TAB_ID, useAppTabsStore } from '@/stores/appTabs'
 import { useHomeStore, type SessionCredential } from '@/stores/home'
 import { usePaneControlsStore } from '@/stores/paneControls'
+import { useSessionStatsStore } from '@/stores/sessionStats'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
 import { sessionLabel } from '@/utils/format'
@@ -29,6 +30,7 @@ const home = useHomeStore()
 const tabs = useAppTabsStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
+const sessionStats = useSessionStatsStore()
 const toast = useToastStore()
 
 /** 设置弹窗挂在壳层（App.vue），这里只抛事件——它是应用级设置（主题/语言/字体），不是首页的。 */
@@ -57,6 +59,30 @@ const list = computed(() => {
 onMounted(() => {
   if (!home.loaded) void home.load()
 })
+
+// ---------- 卡片上的系统信息（第十三轮，契约 23） ----------
+
+/**
+ * 已打开会话的 id（只有打开着的才有连接可问，后端对没打开的会话回 `not_open`）。
+ *
+ * `list` 依赖 lastUsedAt 排序，而打开会话会写 lastUsedAt，所以顺序变化也会让这个 computed
+ * 重算——`sync` 只把「集合变了」当成需要立刻重拉，重复一次请求是无害的。
+ */
+const openIds = computed(() =>
+  list.value.filter((s) => home.stateOf(s.id)?.open === true).map((s) => s.id)
+)
+
+/**
+ * 把「该问哪些会话 + 首页在不在前台」交给 sessionStats store：它负责 5 秒一次的轮询与停止。
+ *
+ * 首页是 v-show 隐藏的（切到终端标签后卡片仍然挂载着），所以「可见性」必须显式传进去，
+ * 否则用户在看终端的时候后端会一直每 5 秒跑一条远程命令。
+ */
+watch(
+  [openIds, () => tabs.activeId === HOME_TAB_ID],
+  ([ids, visible]) => sessionStats.sync(ids, visible),
+  { immediate: true }
+)
 
 // ---------- 打开 / 关闭 ----------
 

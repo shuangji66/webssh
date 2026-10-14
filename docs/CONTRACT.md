@@ -186,6 +186,7 @@ data/
 | POST | `/api/sessions/trust` | `{host, port, fingerprint}` | `{ok}` |
 | POST | `/api/sessions/open` | `{id}` | `{ok, state: SessionState}` |
 | POST | `/api/sessions/close` | `{id}` | `{ok}` |
+| POST | `/api/sessions/stats` | `{id}` | `{ok, stats: SessionStats}`（远端系统信息，见 23；会话没打开时 `not_open`） |
 | GET | `/api/hostkeys` | — | `{ok, hosts:[HostKeyRecord]}` |
 | POST | `/api/hostkeys/forget` | `{host, port}` | `{ok}` |
 | POST | `/api/terminals/history` | `{sid, tid}` | `{ok, content, size}` |
@@ -229,6 +230,12 @@ TestOutcome  { success, code, detail?, stage?, fingerprint?, keyType?,
                trusted?, mismatch?, banner?, latencyMs? }
 TerminalInfo { id, title, createdAt, exited }
 SessionState { id, open, openedAt?, terminals: [TerminalInfo], sftpOpen }
+SessionStats { available, reason?, cpuPercent?, memUsed?, memTotal?, diskPercent?, load?: [n,n,n],
+               cpuCount? }
+             // 卡片上的系统信息，见 23。available=false = 远端读不出来（不是 Linux），
+             // 各字段互相独立（没有 /proc 的机器可能只给 diskPercent）；
+             // 单位：内存是字节，两个 percent 是 0–100 的数（不是字符串）；
+             // cpuCount = 在线核数（负载的颜色按 load1 ÷ cpuCount 判，见 23.6）
 FsEntry      { name, path, dir, size, mode, mtime, symlink?, broken? }  // path 是绝对路径
 FsInfo       FsEntry + { uid, gid, owner?, group?, dirCount, fileCount, countError? }
              // 见 15.5 / 17.7：owner/group 是远端 `id` 查出来的名字，查不到就没有（界面显示数字）
@@ -494,6 +501,16 @@ useQuickCmdsStore(): {
 export const FONT_FAMILY_KEY: string   // main.ts 用到
 useSettingsStore(): { fontSize: number; terminalFont: 'maple'|'system';
                       setFontSize(n: number): void; setTerminalFont(v: 'maple'|'system'): void }
+
+// [D] stores/sessionStats.ts（第十三轮，见 23）
+export const STATS_INTERVAL_MS = 5000
+export const STATS_THRESHOLDS = { cpu:{warn,danger}, load:{...}, mem:{...}, disk:{...} }
+export type StatLevel = 'ok' | 'warn' | 'danger'
+cpuLevel(pct): StatLevel; loadLevel(load1, cores): StatLevel
+memLevel(used, total): StatLevel; diskLevel(pct): StatLevel
+statLevelClass(level: StatLevel): string        // 'text-success' | 'text-warning' | 'text-danger'
+useSessionStatsStore(): { statsOf(sid: string): SessionStats | undefined
+                          sync(sids: string[], visible: boolean): void }
 
 // [D] stores/toast.ts
 useToastStore(): { toasts: {id:number;msg:string;type:'success'|'error'|'info'}[];
@@ -1878,3 +1895,159 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   `启动 shell 失败：open /dev/ptmx: permission denied`），所以**终端本身起不来**（面板显示
   「终端不存在 / 连接已关闭」）。本轮改动只在标签栏的渲染条件上，与 PTY 无关；没验的是
   「真机触屏/窄屏下的标签栏」——移动端用的是同一份 `SessionView` 子标签栏，没有第二套渲染。
+
+---
+
+## 23. 第十三轮：会话卡片上的系统信息
+
+### 23.1 需求与形态
+
+- 用户原话：「会话已连接时，在会话卡片上显示基本信息，cpu和负载一行，内存占用和存储空间一行，
+  只需要数值，不需要图形，5秒刷新一次，关闭会话后停止并隐藏，显示子终端列表之上」。
+- 卡片上的最终形态（子终端列表**之上**，两行纯文字，等宽字体）：
+
+  ```
+  CPU 11.5%   负载 0.88 1.15 1.20
+  内存 3.9 GB / 7.6 GB   磁盘 60.8%
+  ```
+
+- 数字全部来自**远端主机自己**（不是跑 webssh 的这台机器）：`/proc/stat`（两次采样算 CPU）、
+  `/proc/meminfo`、`/proc/loadavg`、`df -P -k`。本应用不在本机执行用户命令（AGENTS.md 第 1 节），
+  所以后端跑的仍然是一条交给远端登录用户 shell 的只读命令。
+- 取值口径（都是刻意选的，换之前先看这里）：
+  - **CPU**：`(1 − Δidle+Δiowait/Δtotal) × 100`，两次读 `/proc/stat` 之间隔 0.5 秒。
+    iowait 算「空闲」——不然一台在做大量磁盘 IO 的 NAS 会一直显示 90%+。
+  - **内存**：已用 = `MemTotal − MemAvailable`（不是 `MemFree`，否则有缓存的机器会常年显示 90%）。
+    老内核（< 3.14）没有 `MemAvailable` 时退到 `Free + Buffers + Cached`。
+  - **磁盘**：`df -P -k "$HOME"`（家目录所在的文件系统，也是文件管理默认进去的地方），
+    家目录不可用时退到 `/`；占用率自己按 `used/(used+avail)` 算，**不用** df 那个取整的百分比
+    （它只给整数，界面上要一位小数）。
+  - **负载**：`/proc/loadavg` 的前三个数（1 / 5 / 15 分钟）。
+- `available=false`（远端不是 Linux、`/proc` 与 `df` 都读不出来）时**整块不显示**，卡片上不堆
+  错误文案；原因记服务端日志（`stats.go` 的 `logx.Warnf`）。各字段互相独立：macOS 那种没有
+  `/proc` 但 `df` 能用的机器只显示磁盘那一项。
+
+### 23.2 后端
+
+- `stats.go`：`sessionStats` / `parseStats`（纯函数，全部有单测）+ `statsClientFor` /
+  `dropStatsClient`。
+- **轮询连接与 `r.base` 分开**（`sessionRuntime.statsClient`，懒建、会话关闭时一起关）：
+  1. 前端每 5 秒问一次，每次新拨一条 SSH（认证 + 密钥交换）对 NAS 这种弱 CPU 的机器是实打实的
+     负担，远端 sshd 日志也会被刷满；
+  2. `r.base` 被 `sftpMu` 保护着——一次大文件上传会占住它几分钟，轮询会跟着卡死（反过来也一样）。
+  连接坏掉（超时被杀、远端重启）时 `stats()` 会 `dropStatsClient` 丢掉它，下一次轮询重新拨，
+  不会一直撞在死连接上。
+- 命令执行的公共部分从 `runRemote` 里抽成 `execOn(ctx, client, command, timeout)`
+  （`remote_exec.go`）：`runRemote` 仍然是「拨号 + 跑一条 + 关掉这条连接」，stats 走同一条
+  执行/采集/超时路径，只是复用一条常驻连接。超时时 `execOn` 会关掉这条连接（**缓存了 client
+  的调用方必须自己丢掉**，见 `dropStatsClient`）。
+- 单次取数超时 `statsTimeout = 10s`（不是给 tar 用的 5 分钟）；输出走 `limitedBuffer` 的 64 KiB 上限。
+- 接口 `POST /api/sessions/stats {id}`：会话没打开回 `not_open`(409)，会话不存在回
+  `session_gone`(404)；「远端读不出来」**不是**错误（`stats.available=false`）。
+
+### 23.3 前端
+
+- 取数与轮询全在 `stores/sessionStats.ts`（组件不自己起定时器：卡片会被反复挂载/卸载，
+  定时器放组件里就会出现「卸载了还在问」或「重挂载了多问一份」）。
+- `HomeView` 是唯一的驱动方，用 `watch` 把两件事交给 store 的 `sync(openIds, visible)`：
+  - `openIds` = 已打开会话的 id（`home.stateOf(id)?.open === true`）；
+  - `visible` = `tabs.activeId === HOME_TAB_ID`。**首页是 v-show 隐藏的**，切到终端标签后卡片
+    仍然挂载着，不显式传可见性的话，用户在看终端时后端会一直每 5 秒跑一条远程命令。
+- 行为：集合或可见性变化时**立刻拉一次**（刚打开的会话马上有数字、切回首页不会先闪旧值），
+  之后每 `STATS_INTERVAL_MS`（5000）拉一次；不在首页 / 没有已打开会话 → 停表。
+  每个会话各自记「上一请求还在飞」，远端慢的时候不会堆成一串并发请求。
+- 拿不到数据（接口失败、`available=false`）时**清掉**该会话的数字（整块消失），不保留上一次的
+  旧值——卡片上挂一份不知道多久以前的占用率比不显示更容易误导人；这是 5 秒一次的后台轮询，
+  **不弹 toast**。不再「已打开」的会话立刻从 store 里删掉。
+- 展示（`SessionCard.vue`）：两行 flex，`font-mono text-xs`，只给数字，没有任何进度条/图形；
+  内存用 `humanSize()`（与文件管理同一套口径）；CPU / 磁盘保留一位小数，负载两位。
+
+### 23.4 冻结文件（本轮）
+
+- 无（新增文件：`backend/stats.go`、`backend/stats_test.go`、`frontend/src/stores/sessionStats.ts`）。
+  改到 `src/serverapi/index.ts`（加类型与一个 API 函数）与 `src/i18n/*`（4 个 key ×2），
+  都是**只增不改**——按第 3 节的要求先写了本节再改实现。
+
+### 23.5 本轮的验证
+
+- `make test` 全绿（新增 7 个解析单测 + 1 个接口集成测试；**11 个 PTY 用例照例 skip**，
+  本机 `/dev/ptmx` permission denied，见第 7 节）；`npm run type-check` 无错误；
+  `npm run check:i18n` 403 key 一一对应（+4）；`make` 构建通过。
+- 解析单测覆盖：CPU 两次采样（含「计数器没动 → 不给假 0%」、缺字段、只有 `cpu0`）、
+  meminfo 新旧内核两种口径、loadavg（三数/两数/空）、df（**英文与中文表头**、长设备名、
+  只有错误信息）、以及「只有 df 能跑」的部分可用与「什么都读不到」的 available=false。
+- 接口集成测试（进程内 testssh + HTTP）：Linux 上必须真的读到 cpuPercent / memTotal / 三个负载，
+  且 0 ≤ cpuPercent,diskPercent ≤ 100、memUsed ≤ memTotal；会话没打开 → 409 `not_open`；
+  关闭后再取 → 409；不存在的 id → 404 `session_gone`。
+- **浏览器实测**（`.tmp/r13/`，真二进制 + `testsshd` + socat 桥到 18083，baseurl `/app/WebSSH`，
+  1280×720；数值与宿主机的 `/proc`、`free -b`、`df` 逐项对过）：
+
+  | # | 操作 | 期望 | 实测 |
+  | --- | --- | --- | --- |
+  | 1 | 会话未打开 | 卡片上没有这一块、0 个 `/api/sessions/stats` 请求 | 卡片只有名字与地址；请求数 0 ✓ |
+  | 2 | 点「打开」 | 立刻出现两行数字 | `CPU 27.8% 负载 0.98 1.52 1.30` / `内存 3.8 GB / 7.6 GB 磁盘 60.8%` ✓（宿主机 `free -b` 已用 4074741760 B → 3.8 GB、`df` 172216576/283397632 = 60.8%） |
+  | 3 | 量两行数字的位置 | CPU 与负载同一行、内存与磁盘同一行、整体在子终端列表**之上** | `getBoundingClientRect`：CPU(top 193,left 33) 与 负载(top 193,left 114) 同一行；内存(top 211,left 33) 与 磁盘(top 211,left 189) 同一行；数字块 bottom 227 < 终端列表 top 239 ✓ |
+  | 4 | 停在首页 12 秒 | 每 5 秒一次 | 请求间隔 `5001, 5000, 5000, 5000, 5000`（ms），CPU 数值每次都在变（27.8 → 10.6 → 10.9）✓ |
+  | 5 | 切到会话标签（首页被 v-show 隐藏）12 秒 | **停止轮询** | 间隔里出现一个 132333 ms 的空档；切回首页立刻又拉了一次（CPU 立刻刷新）✓ |
+  | 6 | 卡片上「关闭」→ 确认 | 整块消失 + 停止轮询 | 卡片文本只剩名字与地址、这一块从 DOM 里消失；此后 101 秒内 0 个新请求 ✓ |
+  | 7 | 重新「打开」 | 数字回来 | `CPU 26.6% 负载 0.96 1.17 1.21 …` ✓ |
+  | 8 | 语言切到英文（`localStorage.webssh-language='en'` 后刷新） | 四个标签走英文 | `CPU 31.4% Load 1.03 1.15 1.20 Mem 3.9 GB / 7.6 GB Disk 60.8%` ✓（刷新后恢复的会话也会立刻重新取数） |
+  | 9 | 服务端日志 | Linux 远端不该有「读不到系统信息」的告警 | `webssh.log` 空 ✓ |
+
+- 没验的部分（如实记录）：**非 Linux 远端**（没有 `/proc`）在真机上只走了解析单测的
+  `available=false` / 只有 df 两条分支，没有真的连过一台 macOS/BSD；**远端在轮询途中断线**
+  的那条自愈路径（`dropStatsClient` → 下次重拨）只有代码审查，没有构造出「连接半死」的场景。
+- **最终二进制复跑**：把上面那一套（注释里「第十二轮/第十三轮」写错的那两处改对后）重新 `make`
+  了一遍（`./webssh` 13:34 那次），在**最终产物**上又量了一遍关键三条：打开后立刻有数字
+  （`CPU 39.0% 负载 3.33 2.10 1.53` / `内存 3.9 GB / 7.6 GB 磁盘 60.8%`，与宿主机
+  `free -b` 的 4156592128 B、`df` 的 172237712/283396224 = 60.8% 一致）、停在首页时请求间隔
+  `5001, 5000, 5000, 5000`（ms）、关闭会话后这一块从卡片上消失且此后不再有新请求。
+  环境是 `.tmp/r13b/`（临时目录，未提交；这一轮用 `fetch` 直接调接口建会话，
+  其余断言仍是读真实 DOM），验完 2222/18084 已释放。
+
+---
+
+## 24. 第十四轮：四个数值的绿 / 黄 / 红阈值
+
+### 24.1 阈值（**唯一来源是 `stores/sessionStats.ts` 的 `STATS_THRESHOLDS`**，本节只是它的说明）
+
+| 指标 | 绿（正常） | 黄（偏高） | 红（过高） | 为什么这么定 |
+| --- | --- | --- | --- | --- |
+| CPU | < 60% | 60–85% | ≥ 85% | 短时 100% 也常见（一次解压、一次编译），60% 才开始值得看一眼；85% 以上基本是持续满载 |
+| 负载 | < 0.7 | 0.7–1.0 | ≥ 1.0 | **按核数折算**（`load1 ÷ cpuCount`）：1.0 = 每个核上正好排着一个任务，也就是刚好跑满；0.7 起提醒。不折算的话 8 核上的 1.5 会被误判成重载 |
+| 内存 | < 70% | 70–90% | ≥ 90% | 内存比 CPU 更早影响使用：开始换页就卡了，所以 70% 就转黄（Linux 的缓存会让「已用」天然偏高，这也是不按 50% 转黄的原因） |
+| 磁盘 | < 75% | 75–90% | ≥ 90% | 在 NAS 上后果最重（写满 = 写失败，压缩/上传/日志全挂），所以最早转黄（75%）、90% 转红 |
+
+- 边界口径：`value >= danger` 红、`value >= warn` 黄、其余绿（所以 60% 已经是黄、85% 已经是红）。
+- 颜色只加在**数值**上（`CPU 72.0%` 里的 `72.0%`），标签保持中性灰；三档的类名只有一份：
+  `statLevelClass()` → `text-success` / `text-warning` / `text-danger`（与
+  `terminals.termStatusDotClass()` 同一套做法）。
+- 整块带一条 `title`（`home_stat_hint`）把口径与三档阈值写清楚——颜色不能是没有说明的暗号。
+- **负载需要核数**，所以后端在 `SessionStats` 里多给一个 `cpuCount`（`/proc/stat` 里 `cpuN` 的
+  行数，与内核统计负载的口径一致，且这份数据本来就已经读回来了，不额外跑命令）。核数缺失
+  （非 Linux）时前端按 1 核折算——宁可偏严，也不要把 8 核的 1.5 当成正常。
+
+### 24.2 本轮的验证
+
+- 后端：`countCPUCores` 的单测（8 核 / 空输入 / `cpuinfo`、`ctxt` 这类干扰行不能算成核）+
+  `parseStats` 的核数断言 + 集成测试在 Linux 上必须拿到 `cpuCount ≥ 1`。
+- 前端：`npm run type-check`、`check:i18n`（404 key）无错误；`make` 通过。
+- **绿黄红的端到端实测**（真二进制 + `testsshd` + socat 桥到 18085）：用页内临时改写
+  `window.fetch`（与 21.5 那次同样的手法）让 `/api/sessions/stats` 返回构造好的数值，
+  等**真实的 5 秒轮询**把它渲染出来，再读 DOM 上那四个数值 span 的 class。一份 payload 一次
+  轮询，五个 payload 覆盖全部 12 个格子与边界：
+
+  | payload（cpu / load1 / mem / disk） | 期望 | 实测（class） |
+  | --- | --- | --- |
+  | 30% / 1.60 / 40% / 50% | 绿绿绿绿 | `text-success` ×4 ✓ |
+  | 60% / 5.60 / 70% / 75%（**都正好压在下界**） | 黄黄黄黄 | `text-warning` ×4 ✓ |
+  | 85% / 8.00 / 90% / 90%（**都正好压在红界**） | 红红红红 | `text-danger` ×4 ✓ |
+  | 59.9% / 5.50 / 69.9% / 74.9%（各差一点） | 绿绿绿绿 | `text-success` ×4 ✓ |
+  | 99% / 16.0 / 99% / 99% | 红红红红 | `text-danger` ×4 ✓ |
+
+  负载那一列同时钉住了「按核数折算」：payload 里的 `cpuCount` 是 8，5.60/8 = 0.7 → 黄、
+  8.00/8 = 1.0 → 红、1.60/8 = 0.2 → 绿。
+- 真实数值（未打桩）那一遍：宿主机 8 核、CPU 12–13%、load1 1.3、内存 51%、磁盘 60.8%，
+  四个数值全是 `text-success`；截图里 `CPU 72.0%`（黄）/ `负载 9.60 …`（红）/
+  `内存 6.3 GB / 7.5 GB`（黄）/ `磁盘 95.0%`（红）四色同框，标签仍是中性灰。
+- 环境是 `.tmp/r14/`（临时目录，未提交），验完 2222/18085 已释放。

@@ -117,8 +117,6 @@ func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteR
 	if !ok {
 		return remoteResult{}, errSessionGone("会话不存在：%s", r.id)
 	}
-	ctx, cancel := context.WithTimeout(ctx, remoteCommandTimeout)
-	defer cancel()
 
 	req, apiErr := r.mgr.dialRequestOf(cfg)
 	if apiErr != nil {
@@ -131,7 +129,22 @@ func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteR
 	// 这条连接只服务这一条命令：命令结束（或被杀）就整条关掉，不留半死不活的通道。
 	defer res.client.Close()
 
-	sess, err := res.client.NewSession()
+	return r.execOn(ctx, res.client, command, remoteCommandTimeout)
+}
+
+// execOn 在一条**已经建立**的连接上跑一条命令（命令约定与 runRemote 相同）。
+//
+// 单独拆出来是给「系统信息」轮询用的（stats.go）：那条轮询每 5 秒一次，不能每次都重新拨号
+// （认证 + 密钥交换对 NAS 这种弱 CPU 的机器是实打实的负担），于是它自己养一条常驻连接，
+// 复用的就是这里的执行/采集/超时逻辑。
+//
+// 超时或客户端取消时会杀掉远端进程并**关掉这条连接**——缓存了 client 的调用方必须自己丢掉它
+// （stats.go 的 dropStatsClient 就是干这个的），否则下一条命令会撞在一条死连接上。
+func (r *sessionRuntime) execOn(ctx context.Context, client *ssh.Client, command string, timeout time.Duration) (remoteResult, *apierr.Error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	sess, err := client.NewSession()
 	if err != nil {
 		return remoteResult{}, apierr.ShellFailed("无法打开 SSH 会话通道：%v", err)
 	}
@@ -188,9 +201,9 @@ func (r *sessionRuntime) runRemote(ctx context.Context, command string) (remoteR
 		// 不会漏协程）。SIGKILL 而不是 SIGTERM：tar 收到 TERM 也未必立刻退（它在写大文件）。
 		_ = sess.Signal(ssh.SIGKILL)
 		_ = sess.Close()
-		_ = res.client.Close()
+		_ = client.Close()
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return remoteResult{}, apierr.Fail(504, "internal", "远程命令超过 %s 还没结束，已终止", remoteCommandTimeout)
+			return remoteResult{}, apierr.Fail(504, "internal", "远程命令超过 %s 还没结束，已终止", timeout)
 		}
 		return remoteResult{}, apierr.Aborted("远程命令已取消")
 	}

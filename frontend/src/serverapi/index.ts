@@ -187,6 +187,32 @@ export interface SessionState {
   sftpOpen: boolean
 }
 
+/**
+ * 已打开会话所在远端主机的系统信息（卡片上的两行数字，契约 23）。
+ *
+ * `available === false` 表示**远端读不出来**（不是 Linux、没有 /proc 且 df 也没输出）：
+ * 这不是错误，界面整块不显示即可，原因在 `reason` 里（只给日志，不给用户看）。
+ * 各字段互相独立：macOS 那种没有 /proc 的机器会只给 diskPercent。
+ */
+export interface SessionStats {
+  available: boolean
+  reason?: string
+  /** CPU 占用率 0–100。 */
+  cpuPercent?: number
+  /** 已用 / 总内存，单位字节。 */
+  memUsed?: number
+  memTotal?: number
+  /** 家目录所在文件系统的占用率 0–100。 */
+  diskPercent?: number
+  /** 1 / 5 / 15 分钟平均负载。 */
+  load?: number[]
+  /**
+   * 在线 CPU 核数。负载要除以它才有意义（1.5 在 2 核上是重载、在 32 核上什么都不算），
+   * 前端据此折算负载的绿黄红；缺省（非 Linux）时按 1 核处理。
+   */
+  cpuCount?: number
+}
+
 export interface FsEntry {
   name: string
   path: string
@@ -464,6 +490,15 @@ export const api = {
 
   /** 关闭会话：终止它下面所有终端与 SFTP 连接（配置保留）。 */
   closeSession: (id: string) => request<{ ok: boolean }>('/api/sessions/close', { json: { id } }),
+
+  /**
+   * 已打开会话的系统信息（CPU / 负载 / 内存 / 磁盘）。
+   *
+   * 只有打开着的会话才有：没打开时后端回 `not_open`（409）。远端读不出来时**不是**错误，
+   * 而是 `stats.available === false`。
+   */
+  sessionStats: (id: string) =>
+    request<{ ok: boolean; stats: SessionStats }>('/api/sessions/stats', { json: { id } }),
 
   terminalHistory: (sid: string, tid: string) =>
     request<{ ok: boolean; content: string; size: number }>('/api/terminals/history', {

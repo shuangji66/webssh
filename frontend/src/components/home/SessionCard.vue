@@ -15,8 +15,16 @@
 import { computed } from 'vue'
 import { t } from '@/i18n'
 import type { SessionState, SessionView } from '@/serverapi'
+import {
+  cpuLevel,
+  diskLevel,
+  loadLevel,
+  memLevel,
+  statLevelClass,
+  useSessionStatsStore
+} from '@/stores/sessionStats'
 import { termStatusDotClass, useTerminalsStore, type TermTab } from '@/stores/terminals'
-import { formatTime, sessionLabel, sessionTarget } from '@/utils/format'
+import { formatTime, humanSize, sessionLabel, sessionTarget } from '@/utils/format'
 
 const props = defineProps<{
   session: SessionView
@@ -40,10 +48,13 @@ const emit = defineEmits<{
 }>()
 
 const terminals = useTerminalsStore()
+const sessionStats = useSessionStatsStore()
 
 const label = computed(() => sessionLabel(props.session))
 const target = computed(() => `${props.session.user}@${sessionTarget(props.session)}`)
 const isOpen = computed(() => props.state?.open === true)
+/** 已连接时的系统信息（undefined = 这一块不显示：没打开、或远端读不出来）。 */
+const stats = computed(() => sessionStats.statsOf(props.session.id))
 </script>
 
 <template>
@@ -147,6 +158,46 @@ const isOpen = computed(() => props.state?.open === true)
     <p v-if="session.note" class="mt-2 line-clamp-2 text-sm text-ink-soft dark:text-ink-soft-dark">
       {{ session.note }}
     </p>
+
+    <!-- 子终端列表**之上**的系统信息（第十三轮，契约 23）：已连接时才有，两行纯数字
+         （CPU + 负载 / 内存 + 磁盘），5 秒刷新一次（见 stores/sessionStats.ts）。
+         **数值**按阈值染成绿/黄/红（阈值与理由在 store 的 STATS_THRESHOLDS，标签保持中性色）；
+         整块带一条 title 说明口径与分档，免得颜色变成看不懂的暗号。
+         读不到就整块不显示——远端不是 Linux、连接断了这些都不该在卡片上堆错误文案。 -->
+    <div
+      v-if="stats"
+      class="mt-2 flex flex-col gap-0.5 font-mono text-xs text-ink-soft dark:text-ink-soft-dark"
+      :title="t('home_stat_hint')"
+    >
+      <div class="flex flex-wrap gap-x-4">
+        <span v-if="stats.cpuPercent !== undefined">
+          {{ t('home_stat_cpu') }}
+          <span :class="statLevelClass(cpuLevel(stats.cpuPercent))">
+            {{ stats.cpuPercent.toFixed(1) }}%
+          </span>
+        </span>
+        <span v-if="stats.load?.length">
+          {{ t('home_stat_load') }}
+          <span :class="statLevelClass(loadLevel(stats.load[0] ?? 0, stats.cpuCount))">
+            {{ stats.load.map((v) => v.toFixed(2)).join(' ') }}
+          </span>
+        </span>
+      </div>
+      <div class="flex flex-wrap gap-x-4">
+        <span v-if="stats.memTotal">
+          {{ t('home_stat_mem') }}
+          <span :class="statLevelClass(memLevel(stats.memUsed ?? 0, stats.memTotal))">
+            {{ humanSize(stats.memUsed ?? 0) }} / {{ humanSize(stats.memTotal) }}
+          </span>
+        </span>
+        <span v-if="stats.diskPercent !== undefined">
+          {{ t('home_stat_disk') }}
+          <span :class="statLevelClass(diskLevel(stats.diskPercent))">
+            {{ stats.diskPercent.toFixed(1) }}%
+          </span>
+        </span>
+      </div>
+    </div>
 
     <!-- 凭据未保存的提醒（不是敏感信息，是「下次连要重新输入」这个事实） -->
     <span

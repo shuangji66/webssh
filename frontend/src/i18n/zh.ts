@@ -179,6 +179,14 @@ export const zh: Record<string, string> = {
   session_show_left: '展开面包屑',
   home_term_open: '打开此终端',
   home_term_close: '关闭此终端',
+  // 卡片上那两行系统信息（只给数值，不做图形；读不到时整块不显示）
+  home_stat_cpu: 'CPU',
+  home_stat_load: '负载',
+  home_stat_mem: '内存',
+  home_stat_disk: '磁盘',
+  home_stat_hint:
+    '数值取自远端主机（5 秒刷新）。颜色阈值：CPU <60% 正常、60–85% 偏高、≥85% 过高；' +
+    '负载按核数折算（<0.7 / 0.7–1 / ≥1）；内存 <70% / 70–90% / ≥90%；磁盘 <75% / 75–90% / ≥90%。',
   session_left_resize: '拖动调整宽度',
   session_left_title: '文件',
   session_close_confirm_title: '关闭终端标签',

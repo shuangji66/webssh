@@ -239,6 +239,28 @@ func (m *AdminMux) handleSessionsClose(w http.ResponseWriter, r *http.Request) *
 	return apierr.Respond(w, map[string]any{"ok": true})
 }
 
+// handleSessionsStats 取「已打开会话」所在远端主机的系统信息（CPU / 负载 / 内存 / 磁盘）。
+//
+// 只有打开着的会话才有：没打开就没有连接可问（回 409 err_not_open，前端此时也不会来问——
+// 它只对已打开的会话轮询）。取数失败（远端读不到 /proc）**不是**错误，是 stats.available=false。
+func (m *AdminMux) handleSessionsStats(w http.ResponseWriter, r *http.Request) *apierr.Error {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
+		return apiErr
+	}
+	rt, apiErr := m.sessions.runtimeFor(req.ID)
+	if apiErr != nil {
+		return apiErr
+	}
+	stats, apiErr := rt.stats(r.Context())
+	if apiErr != nil {
+		return apiErr
+	}
+	return apierr.Respond(w, map[string]any{"ok": true, "stats": stats})
+}
+
 func (m *AdminMux) handleHostKeys(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	if apiErr := requireMethod(r, http.MethodGet); apiErr != nil {
 		return apiErr

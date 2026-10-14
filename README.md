@@ -196,6 +196,11 @@ $WEBSSH_DATA_DIR/
 
 **首页**：远程会话卡片（大卡片平铺）显示地址、登录名、认证方式、打开状态、开了几个终端子标签、
 打开时间与最近使用时间；可打开 / 关闭 / 编辑 / 删除，右上角可搜索。
+**会话已连接时，卡片上还会显示远端主机的基本信息**（子终端列表之上，两行纯数字、5 秒刷新一次）：
+第一行 CPU 占用率与平均负载，第二行内存占用与磁盘占用；关闭会话即停止并隐藏。
+数值按阈值染成绿 / 黄 / 红（CPU 60%/85%、负载按核数折算 0.7/1.0、内存 70%/90%、磁盘 75%/90%，
+鼠标悬停有完整说明）；数值来自远端主机自己的 `/proc` 与 `df`，远端读不出来（例如非 Linux）
+时这一块不显示。
 
 **会话标签**：打开会话后进入会话视图。
 
@@ -252,12 +257,13 @@ webssh/
 │   ├── fileops.go archive.go exportnas.go   复制移动 / 压缩解压 / 导出至飞牛
 │   ├── sshclient.go hostkeys.go             SSH 拨号 / 主机密钥 TOFU
 │   ├── credentials.go remote_exec.go        内存凭据 / 远程命令 helper
+│   ├── stats.go                             远端系统信息（CPU/负载/内存/磁盘，会话卡片用）
 │   ├── quickcmds.go trimapi.go              快捷指令 / 飞牛 API 的 HTTP 入口
 │   └── internal/                            子包：apierr / logx / secret / store / trimapi / ws / testssh
 └── frontend/
     ├── src/serverapi/                     API 客户端（契约的代码化）
     ├── src/i18n/                          中英文案（唯一来源）
-    ├── src/stores/                        Pinia：appTabs/home/terminals/sftp/quickCmds/settings/toast/sessionUi
+    ├── src/stores/                        Pinia：appTabs/home/terminals/sftp/quickCmds/settings/toast/sessionUi/sessionStats
     ├── src/components/                    AppTabBar / home / terminal / files / 各类弹窗
     └── src/views/                         HomeView / SessionView
 ```

@@ -51,6 +51,8 @@ func (m *AdminMux) buildHandler() http.Handler {
 			m.route(m.handleSessionsOpen)(w, r)
 		case p == "/api/sessions/close":
 			m.route(m.handleSessionsClose)(w, r)
+		case p == "/api/sessions/stats":
+			m.route(m.handleSessionsStats)(w, r)
 		case p == "/api/hostkeys":
 			m.route(m.handleHostKeys)(w, r)
 		case p == "/api/hostkeys/forget":

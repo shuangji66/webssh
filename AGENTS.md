@@ -134,6 +134,12 @@
   （症状：`fs/list` 能列出它，但 list/export/remove 全回 `not_found`）。见第 12.2 节。
 - 压缩/解压/导出的上限与取舍（条目数 2000、产物 4 GiB、软链接跳过、跨设备 move 报 conflict）
   都写在 `docs/CONTRACT.md` 第 12.1 节，改之前先读。
+- 远程命令的**两条路**别用错：`runRemote` 是「拨号 + 跑一条 + 关掉这条连接」（tar 这类一次性
+  长命令）；`execOn(ctx, client, cmd, timeout)` 是在**已有的**连接上跑一条，给**高频短命令**用。
+  目前只有系统信息轮询走第二条（`stats.go` 的 `statsClient`，5 秒一次）——它要是每次新拨一条
+  SSH，NAS 上光认证与密钥交换就够呛；但也不能挂在 `r.base` 上（那被 `sftpMu` 保护，
+  一次大文件上传会把轮询堵死）。`execOn` 超时会关掉那条连接，所以缓存 client 的调用方
+  必须在失败时丢掉它（见 `dropStatsClient`），否则之后每次轮询都撞在死连接上。
 
 **数据与凭据（`internal/store` / `internal/secret` / `hostkeys.go`）**
 
@@ -218,6 +224,17 @@
   点一行是「快捷打开」（切应用标签 + `terminals.setActive` + `panes.get().focus()`），
   关闭单个终端要先确认（会终止远端 shell）。卡片右上角是三个仅图标按钮，不标注认证方式，
   也不显示状态灯/时间。终端状态点的配色只有一份：`terminals.termStatusDotClass()`。
+- 卡片上的**系统信息**（第十三轮，见 CONTRACT 23）：已连接的会话在子终端列表**之上**显示两行
+  纯数字（CPU + 负载 / 内存 + 磁盘），5 秒刷新一次。**轮询一律走 `stores/sessionStats.ts`，
+  由 `HomeView` 用 `sync(openIds, visible)` 驱动**——不要把定时器写进卡片组件（卡片会被反复
+  挂载/卸载，会变成「卸载了还在问」或「重挂载多问一份」），也不要漏掉 `visible`：
+  首页是 `v-show` 隐藏的，不看首页时必须停表，否则用户在看终端时后端每 5 秒跑一条远程命令。
+  读不到（远端不是 Linux / 接口失败）就整块不显示，**不保留旧数字、不弹 toast**。
+  四个数值按阈值染绿/黄/红（阈值与理由只在 `STATS_THRESHOLDS` 一处，见 CONTRACT 24）：
+  **只染数值、标签保持中性灰**；负载的颜色必须 `load1 ÷ cpuCount`（后端给的核数，
+  缺了它 8 核上的 1.5 会被当成重载），核数缺失时按 1 核算。颜色规则别写进组件模板里。
+  后端的取数连接与 `r.base` 分开（`sessionRuntime.statsClient`）：`r.base` 被 `sftpMu` 占着，
+  一次大文件上传会让轮询卡死；而每 5 秒新拨一条 SSH 对 NAS 是实打实的负担。
 - **清空会话名**：后端 `save` 里「显式空串 = 清除、字段缺省 = 保持原值」（与凭据/备注同一套）；
   展示名统一走 `store.Session.DisplayName()` / 前端 `sessionLabel()`（空 → `user@host`）。
   `home.renameSession` **只发 `{id, name}`**，不要把本地缓存的 host/user/authType 回传——

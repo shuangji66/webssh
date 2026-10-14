@@ -178,6 +178,16 @@ export const en: Record<string, string> = {
   session_show_left: 'Show breadcrumb',
   home_term_open: 'Open this terminal',
   home_term_close: 'Close this terminal',
+  // The two system-info lines on the card (numbers only, no gauges; hidden when unreadable)
+  home_stat_cpu: 'CPU',
+  home_stat_load: 'Load',
+  home_stat_mem: 'Mem',
+  home_stat_disk: 'Disk',
+  home_stat_hint:
+    'Read from the remote host (refreshed every 5s). Colour thresholds: ' +
+    'CPU <60% ok, 60–85% high, ≥85% critical; ' +
+    'load divided by core count (<0.7 / 0.7–1 / ≥1); ' +
+    'memory <70% / 70–90% / ≥90%; disk <75% / 75–90% / ≥90%.',
   session_left_resize: 'Drag to resize',
   session_left_title: 'Files',
   session_close_confirm_title: 'Close terminal tab',

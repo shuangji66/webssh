@@ -182,6 +182,11 @@ type sessionRuntime struct {
 	// 远端家目录的缓存在 sftpSession 里（与登录同生命周期）。
 	base *ssh.Client
 
+	// statsClient 是「系统信息」轮询专用的连接（懒建，见 stats.go）。故意与 base 分开：轮询
+	// 每 5 秒一次，而 base 被 sftpMu 保护着（一次大文件上传会占住它几分钟）。
+	// 由上面的 mu 保护——与其他会话状态共用一把锁，close 与并发轮询就不会各锁一半。
+	statsClient *ssh.Client
+
 	// ownerMu 保护 ownerNames：{uid,gid} → {账号名, 组名}（见 resolveOwnerNames）。
 	// 名字只用于显示（权限判定用的是数字 uid/gid），所以进程内缓存到会话结束就够：
 	// 远端改了账号名要重开会话才看得到，这个代价远小于「每点一次『信息』就新拨一条 SSH」。
@@ -369,7 +374,8 @@ func (r *sessionRuntime) reapWhenExited(t *terminal) {
 	}
 }
 
-// close 关闭整个会话：终止全部终端 + SFTP 连接，然后删掉历史目录（配置保留）。
+// close 关闭整个会话：终止全部终端 + SFTP 连接 + 系统信息轮询连接，然后删掉历史目录
+// （配置保留）。
 func (r *sessionRuntime) close() {
 	r.mu.Lock()
 	if r.closed {
@@ -385,10 +391,17 @@ func (r *sessionRuntime) close() {
 	}
 	r.terminals = map[string]*terminal{}
 	r.order = nil
+	// 轮询连接在锁里摘下来（防止并发轮询刚装上一条，见 statsClient）：在锁外关，
+	// 因为 Close 会等对端的响应。
+	stats := r.statsClient
+	r.statsClient = nil
 	r.mu.Unlock()
 
 	for _, t := range terms {
 		t.close()
+	}
+	if stats != nil {
+		stats.Close()
 	}
 	r.sftpMu.Lock()
 	r.dropSFTPLocked()
