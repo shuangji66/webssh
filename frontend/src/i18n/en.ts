@@ -300,9 +300,20 @@ export const en: Record<string, string> = {
   files_download_started_n: 'Started downloading {n} items',
   files_download_failed_n: '{n} download(s) failed: {error}',
   files_download_failed: 'Download failed: {error}',
-  files_preview_binary: 'This file is not text and cannot be previewed',
+  files_preview_binary:
+    'This file is not UTF-8 / UTF-16 text (binary data or another encoding) and cannot be previewed',
   files_preview_title: 'Preview: {name}',
   files_preview_failed: 'Failed to read the file: {error}',
+  files_preview_empty: '(empty file)',
+  files_preview_lines: '{n} lines',
+  files_preview_wrap: 'Wrap lines (line numbers when off)',
+  files_preview_image_too_large:
+    'Image is {size}, above the {limit} preview limit — preview skipped',
+  files_preview_image_too_large_unknown: 'Image is above the {limit} preview limit — preview skipped',
+  files_preview_image_invalid:
+    'This file is not a previewable image (its contents are not an image, only the name looks like one)',
+  files_preview_image_unsupported: 'The browser cannot open images in this format (e.g. HEIC / TIFF)',
+  files_preview_image_failed: 'Failed to read the image: {error}',
   files_symlink: 'symlink',
   files_broken_symlink: 'broken symlink',
   files_dir: 'Directory',

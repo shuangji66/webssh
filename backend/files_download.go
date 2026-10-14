@@ -10,7 +10,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/pkg/sftp"
 	"webssh/backend/internal/apierr"
@@ -19,6 +18,9 @@ import (
 
 // ---------------------------------------------------------------------------
 // SFTP 文件操作 API（契约第 4.2 节的 /api/fs/*）
+//
+// 本文件只管**下载**（文件流 / 目录打 zip）；两个「读内容给界面看」的接口
+// （/api/fs/read 文本预览、/api/fs/image 图片预览）在 files_preview.go。
 //
 // 三条贯穿全部实现的约束：
 //  1. 目标路径一律 path.Clean 并**拒绝 `..`**：SFTP 服务端也会拦，但我们要给出清晰的中文
@@ -209,81 +211,6 @@ func zipRemoteTree(ctx context.Context, c *sftp.Client, root string, w io.Writer
 		return err
 	}
 	return zw.Close()
-}
-
-// handleFsRead 读取远程文本文件（文件管理器预览用）。
-func (m *AdminMux) handleFsRead(w http.ResponseWriter, r *http.Request) *apierr.Error {
-	var req fsReq
-	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
-		return apiErr
-	}
-	rt, apiErr := m.sessions.runtimeFor(req.SID)
-	if apiErr != nil {
-		return apiErr
-	}
-	var (
-		size     int64
-		content  []byte
-		tooLarge bool
-	)
-	opErr := rt.withSFTP(r.Context(), func(sess *sftpSession) error {
-		target, err := requiredRemotePath(sess, req.Path)
-		if err != nil {
-			return err
-		}
-		fi, err := sess.client.Stat(target)
-		if err != nil {
-			return err
-		}
-		if fi.IsDir() {
-			return errTargetIsDir
-		}
-		size = fi.Size()
-		if size > maxReadBytes {
-			tooLarge = true
-			return nil
-		}
-		f, err := sess.client.Open(target)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		content, err = io.ReadAll(io.LimitReader(f, maxReadBytes+1))
-		if int64(len(content)) > maxReadBytes {
-			// 读了之后才变大（写日志的文件正是这样）：按超限处理，别把内容塞进 JSON。
-			tooLarge = true
-			content = nil
-		}
-		return err
-	})
-	if opErr != nil {
-		return fsError("读取文件失败", opErr)
-	}
-	text := !tooLarge && utf8.Valid(content) && !bytesContainZero(content)
-	out := string(content)
-	if !text {
-		out = ""
-	}
-	return apierr.Respond(w, map[string]any{
-		"ok":       true,
-		"size":     size,
-		"text":     text,
-		"tooLarge": tooLarge,
-		"content":  out,
-	})
-}
-
-func bytesContainZero(b []byte) bool {
-	limit := len(b)
-	if limit > 8192 {
-		limit = 8192
-	}
-	for i := 0; i < limit; i++ {
-		if b[i] == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // sanitizeHeader 去掉 Content-Disposition 文件名里会破坏报文头的字符。

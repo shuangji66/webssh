@@ -208,7 +208,8 @@ data/
 | POST | `/api/fs/upload` | multipart：`sid`、`path`(目标目录)、`overwrite`、`files[]` | `{ok, files:[{path,size}], skipped}` |
 | POST | `/api/fs/upload-from-nas` | `{sid, path, source, overwrite}` | `{ok, files, skipped}` |
 | POST | `/api/fs/download` | `{sid, path}` | 文件流（`Content-Disposition`；目录打 zip） |
-| POST | `/api/fs/read` | `{sid, path}` | `{ok, size, text, tooLarge, content}` |
+| POST | `/api/fs/read` | `{sid, path}` | `{ok, size, text, tooLarge, content, encoding}`（文本预览，见 25.2） |
+| POST | `/api/fs/image` | `{sid, path}` | 图片**原始字节**（`Content-Type` = 按内容嗅探出的类型 + `nosniff`）；不是图片 → `invalid`，超过 4 MiB → `too_large`（见 25.2） |
 | POST | `/api/quickcmds/list` | `{sid}`（空 = 全局） | `{ok, scope, commands:[QuickCmd]}` |
 | POST | `/api/quickcmds/save` | `{sid, commands:[QuickCmd]}` | `{ok, scope, commands}` |
 | GET | `/api/trim/status` | — | `{ok, trim:{available, message, app}}` |
@@ -2051,3 +2052,91 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   四个数值全是 `text-success`；截图里 `CPU 72.0%`（黄）/ `负载 9.60 …`（红）/
   `内存 6.3 GB / 7.5 GB`（黄）/ `磁盘 95.0%`（红）四色同框，标签仍是中性灰。
 - 环境是 `.tmp/r14/`（临时目录，未提交），验完 2222/18085 已释放。
+
+---
+
+## 25. 第十五轮：文件预览（图片 + 文本）
+
+### 25.1 需求
+
+用户原话：「文件管理的预览为最流行的几个图片格式添加预览，图片最大限制 4MB，超过不显示，
+完善文本文件的预览（配置文件，常见代码文件）」。
+
+拆成两件事：
+1. **图片预览**：png / jpeg / gif / webp / bmp / ico / avif 七种（浏览器与后端嗅探都认的
+   那几个），**上限 4 MiB，超过只说明原因、不显示预览**；
+2. **文本预览**：让「配置文件、常见代码文件」真的能读——补上 UTF-16（Windows 上另存的
+   .ini / .reg 全是它）与 BOM，加上行号 / 换行开关 / 体积 / 行数 / 编码这些读代码需要的元信息。
+
+### 25.2 后端
+
+**新增 `POST /api/fs/image`**（`backend/files_preview.go`）：
+
+- 成功时回**原始字节**（不是 base64 JSON）：`Content-Type` 用 `http.DetectContentType`
+  嗅探出来的类型，另加 `X-Content-Type-Options: nosniff` 与 `Cache-Control: no-store`。
+  理由有两条：① 4 MiB 的图片走 base64 会变成 5.4 MiB 的 JSON，还要在前端拼 data: URL；
+  ② 这是**唯一**把远端文件内容以 inline 交给浏览器的接口，类型必须由内容决定、且不让浏览器
+  再猜（猜出 HTML 就等于给这个地址开了个同源脚本执行入口）。
+- 白名单**按内容判，不看扩展名**：`image/png`、`image/jpeg`、`image/gif`、`image/webp`、
+  `image/bmp`、`image/x-icon`（标准库嗅探）+ `image/avif`（ISO-BMFF 的 `ftyp` + `avif/avis`
+  品牌，标准库的嗅探表里没有它，实测回 `application/octet-stream`）。不在白名单 → `invalid`。
+- **不含 SVG**（`image/svg+xml`）：SVG 是能带 `<script>` 的 XML，而 blob:/同源地址一旦被当
+  页面打开就是同源脚本执行。SVG 归文本预览（它本来就是 XML 文本）。
+- 上限 `maxImageBytes = 4 << 20`（`backend/sftp.go`，与 `maxReadBytes` 同值但含义不同，
+  所以是两个常量）。**先 `Stat` 再读**：超限直接 `too_large`（413），一个字节都不会传过来；
+  读的过程中变大（正在被写入的文件）也按超限处理。
+
+**`POST /api/fs/read` 的文本判定重写**（`decodeText`，同一个文件）：
+
+- 认三种：UTF-8（**剥 BOM**，留着首行会多一个看不见的字符）、带 BOM 的 UTF-16 LE/BE、
+  以及**无 BOM 的 UTF-16**（按 NUL 分布猜字节序：ASCII 的高位字节是 0，所以 NUL 只落在同一
+  奇偶性上；长度必须是偶数、解出来不能有 NUL、不能有 U+FFFD、可打印字符 ≥ 95% 才认）。
+- **GBK / GB18030 仍判非文本**：解码要 `golang.org/x/text`，而 go.mod 只允许 x/crypto 与
+  pkg/sftp（AGENTS 第 3 节）。按字节硬猜只会把乱码当内容展示，比明说「不是文本」更糟——
+  前端文案里点了「其它编码」，说的就是这一种。
+- 响应多一个 `encoding` 字段（`utf-8` / `utf-16le` / `utf-16be`，认不出为空串）；
+  `text=false` 时 `content` 仍是空串（不把二进制塞进 JSON）。
+- 空文件算文本（打开一个空配置文件不该看到「不是文本文件」）。
+
+### 25.3 前端
+
+- `PreviewDialog.vue` 两种模式，按**扩展名**选（后端再按内容确认）：
+  - 图片：`fetchImageBlob`（`serverapi/index.ts`，POST + JSON body 拿 blob）→
+    `URL.createObjectURL` → `<img>`；**关闭/换文件/卸载时 revoke**（几 MB 的东西不留内存里）。
+    失败按错误码分三种说法：`too_large`（带上列表里已知的体积与 4 MiB 上限）、`invalid`
+    （名字像图片、内容不是）、`<img>` 自己的 `error`（后端放行但浏览器解不开，例如 HEIC）。
+  - 文本：默认**不换行 + 行号**（代码/配置文件按行读才对得上；行号列 `sticky left-0`，横向
+    滚动时钉在左边；超过 20000 行不给行号，内容照常显示）；「自动换行」开关打开后行号消失
+    （换行会让一行占多行，行号就对不上了）。**这个开关是用户偏好，不随文件重置**。
+  - 标题右侧一行元信息：体积 · 行数 · 编码（只在不是 UTF-8 时点出来）；图片模式显示体积与
+    像素尺寸（`<img>` 的 `naturalWidth/Height`，加载后才有）。
+- `FileManager.vue` 把列表里已知的体积传进弹窗（`previewSize`）：图片超限时后端不回内容，
+  只有列表知道它多大——弹窗得靠它把「4.6 MB 超过上限 4.0 MB」说清楚。
+- 新增 i18n：`files_preview_empty` / `files_preview_lines` / `files_preview_wrap` /
+  `files_preview_image_{too_large,too_large_unknown,invalid,unsupported,failed}`；
+  `files_preview_binary` 改成「不是 UTF-8 / UTF-16 文本（可能是二进制文件或其它编码）」。
+
+### 25.4 冻结文件（本轮）
+
+`frontend/src/serverapi/index.ts`（新增 `fetchImageBlob`、`fsRead` 的返回类型加 `encoding`）、
+`frontend/src/i18n/{zh,en}.ts`、`docs/CONTRACT.md`。后端 `backend/sftp.go` 只加了一个常量。
+
+### 25.5 本轮的验证
+
+- 后端：`make test` 全绿，新增两条用例——
+  `TestFsReadEncodings`（空文件 / UTF-8 BOM / UTF-16 LE·BE 带 BOM（含汉字）/ 无 BOM UTF-16LE /
+  GBK 字节 / NUL 分布混合的二进制）与 `TestFsImagePreview`（PNG 原样字节 + `Content-Type` +
+  `nosniff` + `no-store`；文本文件、目录、不存在、`../` 逃逸各自的错误码；改名成 .png 的文本
+  文件按内容判 `invalid`；**正好 4 MiB 能预览、多一个字节 `too_large`**）。
+- 前端：`make check`（vue-tsc + i18n 双向）无错误。
+- 端到端手测（真二进制 + `testsshd` + socat 桥到 18080/18081，baseurl=`/webssh`）：
+  `shot.png` → 图渲染出来，标题右侧 `524 B · 240×120`；`notes.conf` → 行号 1–24 对齐、
+  `529 B · 24 行`、切「自动换行」后行号消失且长行折回；`utf16.ini` → `[core] name=值 …` 正常
+  显示并标 `UTF-16LE`；`utf16-nobom.conf` → 无 BOM 也认出来；`main.go` → 缩进与行号都对；
+  `empty.conf` → 「（空文件）」；`big.png`（4.6 MB）→ 「图片 4.6 MB，超过预览上限 4.0 MB，
+  不显示预览」+ 下载按钮，**没有图**；`fake.png` →「不是可预览的图片（内容不是图片，只是名字像）」；
+  `blob.bin` →「不是 UTF-8 / UTF-16 文本」。
+- 长行（1408 字符）+ 行号的布局用页内 `script.evaluate` 量过：滚动容器 `scrollWidth 10236 /
+  clientWidth 894`（确实能横向滚），`scrollLeft = 500` 之后行号列的 `left` 仍是 205（sticky
+  钉住），两侧 `<pre>` 的 `line-height` 都是 `19.5px`（行对齐）。
+- 环境是 `.tmp/e2e-preview/`（临时目录，未提交，验完已删），端口 2222 / 18080 / 18081 已释放。

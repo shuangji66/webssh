@@ -43,6 +43,13 @@ const (
 	// maxReadBytes 是 /api/fs/read 的读取上限：超过就只回元信息 + tooLarge，
 	// 让界面提示「去下载」而不是把一个几百 MB 的二进制塞进 JSON。
 	maxReadBytes = 4 << 20
+	// maxImageBytes 是 /api/fs/image（图片预览）的体积上限：超过就回 too_large，界面
+	// **不显示**预览（用户要求：图片最大 4 MB）。先 Stat 再读，超限的图片一个字节都不会
+	// 真的传过来；单张 4 MiB 常驻内存与 maxReadBytes 同量级，可接受。
+	//
+	// 与 maxReadBytes 同值但**含义不同**（一个是文本预览、一个是图片预览），所以分成两个
+	// 常量：以后要单独调其中一个，不必去猜另一个是不是「同一个东西」。
+	maxImageBytes = 4 << 20
 	// maxNasFileBytes 是 upload-from-nas 单个文件的体积上限。
 	//
 	// 这条路径没有请求体可卡（source 是本机路径，服务端自己读），所以单独设一个上限：

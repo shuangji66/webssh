@@ -3,6 +3,8 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unicode/utf16"
 )
 
 // fsTestApp 起一个后端 + SSH 服务器，并在远端根目录里准备好几个文件。
@@ -593,6 +596,9 @@ func TestFsDownloadAndRead(t *testing.T) {
 	if out["text"] != true || out["tooLarge"] != false || strOf(out, "content") != "hello world\n" || numOf(out, "size") != 12 {
 		t.Fatalf("read 结果 = %v", out)
 	}
+	if strOf(out, "encoding") != encodingUTF8 {
+		t.Errorf("纯 UTF-8 文件的 encoding = %v", out["encoding"])
+	}
 	// 二进制文件：不带内容回来（避免把二进制塞进 JSON）
 	out = a.ok(t, "/api/fs/read", map[string]any{"sid": sid, "path": filepath.Join(root, "binary.bin")})
 	if out["text"] != false || strOf(out, "content") != "" {
@@ -615,6 +621,166 @@ func TestFsDownloadAndRead(t *testing.T) {
 	if out["tooLarge"] != true || numOf(out, "size") != float64(maxReadBytes+1) || strOf(out, "content") != "" {
 		t.Fatalf("超限 read 结果 = %v", out)
 	}
+}
+
+// utf16Bytes 按指定字节序（可带 BOM）编出 UTF-16 字节串，给编码判定用例造数据。
+func utf16Bytes(t *testing.T, s string, bigEndian, bom bool) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if bom {
+		if bigEndian {
+			buf.Write([]byte{0xfe, 0xff})
+		} else {
+			buf.Write([]byte{0xff, 0xfe})
+		}
+	}
+	order := binary.ByteOrder(binary.LittleEndian)
+	if bigEndian {
+		order = binary.BigEndian
+	}
+	for _, unit := range utf16.Encode([]rune(s)) {
+		if err := binary.Write(&buf, order, unit); err != nil {
+			t.Fatalf("编 UTF-16 失败：%v", err)
+		}
+	}
+	return buf.Bytes()
+}
+
+// TestFsReadEncodings 覆盖文本判定的口径：UTF-8（含 BOM）、UTF-16（带/不带 BOM），
+// 以及三种「不是文本」（非法 UTF-8 的 GBK、NUL 分布不像 UTF-16 的二进制、目录）。
+//
+// 这一组用例是「配置文件能预览」的核心：Windows 上另存的 .ini/.reg 是 UTF-16，按二进制
+// 一律拒掉的话，用户看到的还是「不是文本文件」。
+func TestFsReadEncodings(t *testing.T) {
+	a, sid := fsTestApp(t)
+	root := a.sshRoot
+
+	writeBytes := func(name string, b []byte) string {
+		t.Helper()
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatalf("写 %s 失败：%v", name, err)
+		}
+		return p
+	}
+	read := func(name string) map[string]any {
+		t.Helper()
+		return a.ok(t, "/api/fs/read", map[string]any{"sid": sid, "path": filepath.Join(root, name)})
+	}
+
+	// 空文件是文本：打开一个空配置文件不该看到「不是文本文件」。
+	writeBytes("empty.conf", nil)
+	if out := read("empty.conf"); out["text"] != true || strOf(out, "content") != "" {
+		t.Errorf("空文件 = %v", out)
+	}
+
+	// UTF-8 BOM：剥掉（留着的话首行会多一个看不见的字符）。
+	writeBytes("bom.conf", append([]byte{0xef, 0xbb, 0xbf}, "key=value\n"...))
+	out := read("bom.conf")
+	if strOf(out, "content") != "key=value\n" || strOf(out, "encoding") != encodingUTF8 {
+		t.Errorf("UTF-8 BOM = %v", out)
+	}
+
+	// UTF-16 LE / BE 带 BOM（含非 ASCII，顺带覆盖代理项之外的常用汉字）。
+	const ini = "[core]\r\nname=值\r\n"
+	for _, tc := range []struct {
+		name      string
+		bigEndian bool
+		encoding  string
+	}{
+		{"utf16le.ini", false, encodingUTF16LE},
+		{"utf16be.ini", true, encodingUTF16BE},
+	} {
+		writeBytes(tc.name, utf16Bytes(t, ini, tc.bigEndian, true))
+		out := read(tc.name)
+		if out["text"] != true || strOf(out, "content") != ini || strOf(out, "encoding") != tc.encoding {
+			t.Errorf("%s = %v", tc.name, out)
+		}
+	}
+
+	// 无 BOM 的 UTF-16 LE（Windows 上并不少见）：按 NUL 分布猜出来。
+	writeBytes("utf16-nobom.ini", utf16Bytes(t, "[core]\nname=value\n", false, false))
+	out = read("utf16-nobom.ini")
+	if out["text"] != true || strOf(out, "content") != "[core]\nname=value\n" || strOf(out, "encoding") != encodingUTF16LE {
+		t.Errorf("无 BOM UTF-16LE = %v", out)
+	}
+
+	// 不是文本：非法 UTF-8（GBK 的「中文」）——本仓库不允许引 x/text，如实判非文本，
+	// 而不是按字节硬猜出乱码。
+	writeBytes("gbk.conf", []byte{0xd6, 0xd0, 0xce, 0xc4, '\n'})
+	if out := read("gbk.conf"); out["text"] != false || strOf(out, "content") != "" || strOf(out, "encoding") != "" {
+		t.Errorf("GBK 文件 = %v", out)
+	}
+
+	// 不是文本：NUL 在奇偶两种位置上都出现（不是 UTF-16 的形态）。
+	writeBytes("mixed.bin", []byte{0x00, 0x41, 0x42, 0x00, 0x43, 0x44, 0x45, 0x46})
+	if out := read("mixed.bin"); out["text"] != false {
+		t.Errorf("混合 NUL 的二进制 = %v", out)
+	}
+}
+
+// 1x1 的透明 PNG（真图片：浏览器与 http.DetectContentType 都认）。
+const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+
+// TestFsImagePreview 覆盖图片预览接口：白名单、原样字节、nosniff、上限与错误码。
+func TestFsImagePreview(t *testing.T) {
+	a, sid := fsTestApp(t)
+	root := a.sshRoot
+
+	png, err := base64.StdEncoding.DecodeString(tinyPNGBase64)
+	if err != nil {
+		t.Fatalf("解 PNG 失败：%v", err)
+	}
+	pngPath := filepath.Join(root, "shot.png")
+	if err := os.WriteFile(pngPath, png, 0o644); err != nil {
+		t.Fatalf("写 PNG 失败：%v", err)
+	}
+
+	// 正常图片：原始字节 + 嗅探出来的 Content-Type + nosniff（内容原样回，不让浏览器再猜）。
+	res, raw := a.do(t, http.MethodPost, "/api/fs/image", map[string]any{"sid": sid, "path": pngPath}, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("图片预览状态码 = %d（正文：%s）", res.StatusCode, snippetOf(raw))
+	}
+	if ct := res.Header.Get("Content-Type"); ct != "image/png" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if got := res.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q", got)
+	}
+	if res.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control = %q", res.Header.Get("Cache-Control"))
+	}
+	if !bytes.Equal(raw, png) {
+		t.Errorf("回的字节与文件不一致（%d 字节 vs %d 字节）", len(raw), len(png))
+	}
+
+	// 文本文件 / 目录 / 不存在 / 非法路径。
+	a.fail(t, "/api/fs/image", map[string]any{"sid": sid, "path": filepath.Join(root, "hello.txt")}, "invalid", http.StatusBadRequest)
+	a.fail(t, "/api/fs/image", map[string]any{"sid": sid, "path": filepath.Join(root, "docs")}, "invalid", http.StatusBadRequest)
+	a.fail(t, "/api/fs/image", map[string]any{"sid": sid, "path": filepath.Join(root, "nope.png")}, "not_found", http.StatusNotFound)
+	a.fail(t, "/api/fs/image", map[string]any{"sid": sid, "path": root + "/../x"}, "invalid", http.StatusBadRequest)
+
+	// 按**内容**判，不看扩展名：文本文件改名成 .png 不算图片。
+	liar := filepath.Join(root, "liar.png")
+	if err := os.WriteFile(liar, []byte("not an image at all"), 0o644); err != nil {
+		t.Fatalf("写文件失败：%v", err)
+	}
+	a.fail(t, "/api/fs/image", map[string]any{"sid": sid, "path": liar}, "invalid", http.StatusBadRequest)
+
+	// 上限：正好 maxImageBytes 能预览，多一个字节就 too_large（界面据此「不显示」预览）。
+	atLimit := append(append([]byte{}, png...), bytes.Repeat([]byte{0}, int(maxImageBytes)-len(png))...)
+	limitPath := filepath.Join(root, "at-limit.png")
+	if err := os.WriteFile(limitPath, atLimit, 0o644); err != nil {
+		t.Fatalf("写上限文件失败：%v", err)
+	}
+	if res, raw := a.do(t, http.MethodPost, "/api/fs/image", map[string]any{"sid": sid, "path": limitPath}, nil); res.StatusCode != http.StatusOK || int64(len(raw)) != maxImageBytes {
+		t.Fatalf("上限内的图片被拒：状态码 %d，正文 %d 字节", res.StatusCode, len(raw))
+	}
+	overPath := filepath.Join(root, "over-limit.png")
+	if err := os.WriteFile(overPath, append(atLimit, 0), 0o644); err != nil {
+		t.Fatalf("写超限文件失败：%v", err)
+	}
+	a.fail(t, "/api/fs/image", map[string]any{"sid": sid, "path": overPath}, "too_large", http.StatusRequestEntityTooLarge)
 }
 
 // TestFsUploadFromNas 覆盖「从飞牛（本机）上传」：本地读取 → SFTP 写入。

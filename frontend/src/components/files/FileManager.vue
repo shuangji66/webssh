@@ -382,6 +382,8 @@ function pasteHere() {
 
 const previewVisible = ref(false)
 const previewPath = ref('')
+/** 列表里已知的体积：图片超限时后端不回内容，预览弹窗要靠它把「多大」说清楚。 */
+const previewSize = ref(0)
 
 function onEntryClick(entry: FsEntry) {
   // 多选模式下点行 = 选中/取消选中（不打开：用户点第二下显然不是想打开两个文件）
@@ -406,6 +408,7 @@ function openEntry(entry: FsEntry) {
     return
   }
   previewPath.value = entry.path
+  previewSize.value = entry.size
   previewVisible.value = true
 }
 
@@ -1683,6 +1686,7 @@ onBeforeUnmount(hideMenu)
       :visible="previewVisible"
       :sid="sid"
       :path="previewPath"
+      :size="previewSize"
       @update:visible="previewVisible = $event"
     />
     <InfoDialog

@@ -457,6 +457,33 @@ function filenameFrom(path: string, disposition: string | null): string {
   return base || 'download'
 }
 
+/**
+ * 读取远程图片文件（文件管理器预览用）：成功回**原始字节**的 Blob。
+ *
+ * 失败（不是图片 / 超过 4 MiB / 不存在）后端回 JSON 错误 → ApiError，前端按 code 分别提示。
+ * 走 fetch 拿 blob 而不是 `<img src="/api/fs/image?path=…">`：本应用带参数的接口一律
+ * POST + JSON body（查询串在反代链路上不保证送达），而且 <img> 遇到错误响应会把整个文档
+ * 导航到那段 JSON 上，标签页与界面状态全丢。
+ *
+ * 调用方拿到 blob 后要 `URL.createObjectURL` 并**负责 revoke**（见 PreviewDialog）。
+ */
+export async function fetchImageBlob(sid: string, path: string): Promise<Blob> {
+  const res = await fetch(apiURL('/api/fs/image'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sid, path })
+  })
+  if (!res.ok) {
+    const body = (await parseBody(res)) as Record<string, unknown> | null
+    throw new ApiError(
+      res.status,
+      (body?.code as string) || `http_${res.status}`,
+      (body?.error as string) || `${res.status} ${res.statusText}`
+    )
+  }
+  return await res.blob()
+}
+
 // ===== API =====
 
 export const api = {
@@ -574,12 +601,21 @@ export const api = {
       json: { sid, path: dir, source, overwrite }
     }),
 
-  /** 读取远程文本文件（文件管理器预览用，超过上限时后端返回 tooLarge）。 */
+  /**
+   * 读取远程文本文件（文件管理器预览用，超过上限时后端返回 tooLarge）。
+   *
+   * `text` 为 false 表示后端判定这不是能展示的文本（二进制 / 认不出的编码），此时
+   * `content` 是空串；`encoding` 是认出来的编码（utf-8 / utf-16le / utf-16be，认不出为空）。
+   */
   fsRead: (sid: string, path: string) =>
-    request<{ ok: boolean; size: number; text: boolean; tooLarge: boolean; content: string }>(
-      '/api/fs/read',
-      { json: { sid, path } }
-    ),
+    request<{
+      ok: boolean
+      size: number
+      text: boolean
+      tooLarge: boolean
+      content: string
+      encoding: string
+    }>('/api/fs/read', { json: { sid, path } }),
 
   // 快捷指令：sid 为空 = 全局；否则是该会话的专属指令。
   quickCmds: (sid?: string) =>
