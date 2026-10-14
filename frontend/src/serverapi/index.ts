@@ -240,6 +240,26 @@ export interface FsInfo extends FsEntry {
   countError?: string
 }
 
+/**
+ * 编辑页打开时拿到的内容与元信息（契约 26.2 的 `/api/fs/edit-load`）。
+ *
+ * `encoding` / `bom` / `eol` 是「保存时怎么把文件写回去」的全部依据，前端只负责原样带回：
+ * 把 Windows 的 `.ini` 悄悄改成 UTF-8 + LF 是数据损坏，不是「顺手升级」。
+ */
+export interface FsEditContent {
+  /** 解析后的绝对路径（后端回填，前端用它做刷新与标题） */
+  path: string
+  size: number
+  /** 文本内容；换行一律是 LF（CRLF 由后端在保存时按 eol 换回去） */
+  content: string
+  /** 'utf-8' | 'utf-16le' | 'utf-16be' */
+  encoding: string
+  /** 原文件是否以 BOM 开头（保存时保持一致） */
+  bom: boolean
+  /** 'lf' | 'crlf' */
+  eol: string
+}
+
 /** 批量文件操作（复制/移动/粘贴）的结果。 */
 export interface FsOpResult {
   files: { path: string; size: number }[]
@@ -616,6 +636,28 @@ export const api = {
       content: string
       encoding: string
     }>('/api/fs/read', { json: { sid, path } }),
+
+  /**
+   * 打开编辑器（契约 26.2）：先验证**本会话的登录用户**能不能改这个文件，再回内容。
+   *
+   * 没有写权限时后端回 `permission`（403）且**一个字节的内容都不给**——调用方据此报错并
+   * 拒绝进入编辑页（用户要求）。`encoding` / `bom` / `eol` 是保存时要原样带回去的元信息：
+   * 编辑区里的内容一律是 LF（textarea 的 value 按 HTML 规范把 CRLF 规整成 LF），写回时由
+   * 后端按 `eol` 换回去，所以前端不自己动换行。
+   */
+  fsEditLoad: (sid: string, path: string) =>
+    request<FsEditContent & { ok: boolean }>('/api/fs/edit-load', { json: { sid, path } }),
+
+  /** 保存编辑内容（契约 26.2）：编码 / BOM / 换行按 `fsEditLoad` 给的原样写回。 */
+  fsEditSave: (
+    sid: string,
+    path: string,
+    content: string,
+    meta: { encoding: string; bom: boolean; eol: string }
+  ) =>
+    request<{ ok: boolean; size: number }>('/api/fs/edit-save', {
+      json: { sid, path, content, ...meta }
+    }),
 
   // 快捷指令：sid 为空 = 全局；否则是该会话的专属指令。
   quickCmds: (sid?: string) =>

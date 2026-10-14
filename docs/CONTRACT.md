@@ -210,6 +210,8 @@ data/
 | POST | `/api/fs/download` | `{sid, path}` | 文件流（`Content-Disposition`；目录打 zip） |
 | POST | `/api/fs/read` | `{sid, path}` | `{ok, size, text, tooLarge, content, encoding}`（文本预览，见 25.2） |
 | POST | `/api/fs/image` | `{sid, path}` | 图片**原始字节**（`Content-Type` = 按内容嗅探出的类型 + `nosniff`）；不是图片 → `invalid`，超过 4 MiB → `too_large`（见 25.2） |
+| POST | `/api/fs/edit-load` | `{sid, path}` | `{ok, path, size, content, encoding, bom, eol}`（打开编辑器：先验证登录用户可写，见 26.2） |
+| POST | `/api/fs/edit-save` | `{sid, path, content, encoding, bom, eol}` | `{ok, size}`（按原编码 / BOM / 换行写回；见 26.2） |
 | POST | `/api/quickcmds/list` | `{sid}`（空 = 全局） | `{ok, scope, commands:[QuickCmd]}` |
 | POST | `/api/quickcmds/save` | `{sid, commands:[QuickCmd]}` | `{ok, scope, commands}` |
 | GET | `/api/trim/status` | — | `{ok, trim:{available, message, app}}` |
@@ -240,6 +242,8 @@ SessionStats { available, reason?, cpuPercent?, memUsed?, memTotal?, diskPercent
 FsEntry      { name, path, dir, size, mode, mtime, symlink?, broken? }  // path 是绝对路径
 FsInfo       FsEntry + { uid, gid, owner?, group?, dirCount, fileCount, countError? }
              // 见 15.5 / 17.7：owner/group 是远端 `id` 查出来的名字，查不到就没有（界面显示数字）
+FsEditContent { path, size, content, encoding: "utf-8"|"utf-16le"|"utf-16be", bom, eol: "lf"|"crlf" }
+             // 编辑页打开时的内容与元信息（见 26.2）：encoding/bom/eol 保存时原样带回去
 QuickCmd     { id, name, content, auto }
 HostKeyRecord{ host, port, keyType, fingerprint, addedAt }
 AclEntry     { path, readable, writable, deletable }
@@ -749,6 +753,8 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 - **不显示路径**（没有「根目录 / vol1 / 1000 …」那串），只保留按钮条。
 - 目录树显示**完整**的远程目录树：以远程 `/` 为根，懒加载展开。
   首次进入会话时**自动展开到登录用户的家目录**并把该节点高亮/滚入视野。
+  → **第十六轮起树上也列文件**（每个目录只列前 20 个，超过 20 个时多一行「···更多文件」），
+  见 26.4；在此之前它刻意只列目录。
 - 「家目录」按钮：全部折叠，只展开登录用户家目录那一条链路。
   → 左栏宽度的拖动方式见 19.1（第九轮起用手柄，不再直接拖分隔线）。
   → **第八轮删了这个按钮，同样的行为改由 FileTree 在两个时机自动做（新开会话 / 重新展开面包屑），
@@ -773,6 +779,8 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   `复制 / 剪切 / 粘贴 / 压缩为 tar.gz / 解压 / 导出至飞牛 / 在此目录新建终端`。
   菜单顺序：粘贴（有剪贴板时）/ 重命名 / 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 /
   压缩为 tar.gz / 解压（可解压时）/ 复制完整路径 / 在此目录新建终端。
+  → **第十六轮**在「粘贴」与「重命名」之间插入「编辑」（只对按扩展名算文本的文件显示），
+  顺序变成：粘贴 / 编辑 / 重命名 / 复制 / …（见 26.3）。
 - **剪贴板**：`sftp` store 里**全局一份** `clipboard: { sid, op: 'copy'|'cut', paths: string[] } | null`
   （刻意不放进按 sid 分片的 `SftpState`：跨会话判定需要知道「这份剪贴板属于哪个会话」，
   放进分片里这件事在数据结构上就不存在了）。
@@ -2140,3 +2148,151 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   clientWidth 894`（确实能横向滚），`scrollLeft = 500` 之后行号列的 `left` 仍是 205（sticky
   钉住），两侧 `<pre>` 的 `line-height` 都是 `19.5px`（行对齐）。
 - 环境是 `.tmp/e2e-preview/`（临时目录，未提交，验完已删），端口 2222 / 18080 / 18081 已释放。
+
+---
+
+## 26. 第十六轮：文件编辑（文本文件 + 目录树列文件）
+
+### 26.1 需求
+
+用户原话：「复用文件管理预览的逻辑，为能预览的文件在预览上添加编辑图标按钮和更多菜单加上
+编辑功能（面包屑的更多菜单也加上编辑），要验证登录用户是否有权限修改，没权限直接报错拒绝修改
+不进入编辑页，修改时在文件管理标签页下进入编辑页，编辑页覆盖文件管理页面，有最上角退出按钮，
+右上角还原/保存按钮，退出编辑后回到文件管理进入编辑时的状态，如果是从面包屑来的，回到文件
+管理初始状态」。
+
+两处经确认的澄清（都影响实现，记在这里免得日后走样）：
+
+1. **「面包屑的更多菜单」= 左栏目录树（契约 11.3 的「面包屑区」）每行的「···」菜单**。
+   那棵树原本**只列目录**，菜单里没有可编辑的对象，所以本轮同时把树改成**也列文件**
+   （见 26.4）；用户另外定了两件事：每个目录**只读/显示前 20 个文件（按文件名）**、
+   **整棵树显示的文件总数不限**；某个目录的文件超过 20 个时，在它的文件后面加一行
+   **「···更多文件」**，点它在文件管理里打开那个目录。
+2. **「登录用户有权限修改」= 本会话的 SSH 登录用户**（不是飞牛网关用户的 ACL）。判据见 26.2。
+
+### 26.2 后端
+
+**新增 `POST /api/fs/edit-load`**（`backend/files_edit.go`）→
+`{ok, path, size, content, encoding, bom, eol}`：
+
+- **写权限探测**：在读内容**之前**，以本会话登录用户的身份把目标文件 `OpenFile(path, O_WRONLY)`
+  打开一次再立刻关掉（不带 `O_TRUNC` / `O_CREATE`，不碰内容也不碰 mtime）。
+  为什么不用 mode 位自己算：mode 位看不出 ACL、看不出 root、看不出组关系，而真正保存时走的
+  就是这条路——让 SFTP 服务端回答「能不能写」是唯一不会骗人的判据。拒绝时回 **`permission`（403）**，
+  且**一个字节的内容都不返回**（界面据此报错并拒绝进入编辑页）。
+- 只接受**普通文件**：目录回 `invalid`，设备 / FIFO / socket 回 `invalid`（`errEditNotRegular`）。
+  不只是文案问题：以 `O_WRONLY` 打开一个 FIFO 会阻塞到有读者出现，写 `/dev/zero` 这类节点更是
+  纯粹的破坏。
+- 上限与预览同一条（`maxReadBytes = 4 MiB`）：超过回 `too_large`。判非文本（二进制 / GBK 等）
+  回 `invalid`——编辑页只服务预览认得出的那些文件。
+- 编码元信息随内容一起回：`encoding`（`utf-8` / `utf-16le` / `utf-16be`）、`bom`（原文件是否以
+  BOM 开头）、`eol`（`lf` / `crlf`，按**多数票**判）。保存时前端原样带回来，服务端不猜。
+
+**新增 `POST /api/fs/edit-save`** `{sid, path, content, encoding, bom, eol}` → `{ok, size}`：
+
+- **按原来的样子写回**（用户要求）：UTF-16 还是 UTF-16、带 BOM 还是带 BOM、CRLF 还是 CRLF。
+  把 Windows 的 `.ini` / `.reg` 悄悄改成 UTF-8 + LF 是数据损坏，不是「顺手升级」。
+  编辑区里的内容一律是 LF（textarea 的 value 按 HTML 规范把 CRLF 规整成 LF），所以 `eol=crlf`
+  时后端先归一化再替换（不会写出 `\r\r\n`）。认不出的 `encoding` 回 `invalid`，
+  **绝不**当成 UTF-8 写下去。`encoding` 缺省（空串）按 UTF-8——老客户端只发 `content` 也能存。
+- 写法是**原地截断再写**（`O_WRONLY|O_TRUNC`），不是「写临时文件再 rename」：rename 会换掉
+  inode，把属主、mode、ACL、xattr 全丢掉——在 NAS 上 ACL 恰恰是最要紧的那一层，一个「改一行
+  配置」的操作不该顺带重写这些。代价是写入中途失败会留下半截文件，所以先读一份原内容做善后：
+  写失败时尽力写回（best-effort，失败只记日志——调用方已经有更重要的错误要报给用户）。
+- 目标必须**已经存在**（编辑期间被删掉回 `not_found`，不静默新建）；保存内容超过 `maxReadBytes`
+  回 `too_large`；权限不足回 `permission`。
+
+**错误映射**（`editError`）：在 `fsError` 之上补两条——`looksLikePermission`（SFTP 服务端把
+「只读文件系统」这类拒绝回成 `SSH_FX_FAILURE`，pkg/sftp 不会归一成 `os.ErrPermission`，只剩
+消息可认）与 `errEditNotRegular`（不是普通文件 → `invalid`）。真正的权限拒绝由 pkg/sftp 归一成
+`os.ErrPermission`，`fsError` 本来就翻成 `permission`。
+
+### 26.3 前端：编辑页
+
+- **新增 `src/stores/fileEditor.ts`**（按 sid 分片）+ **新增 `src/components/files/FileEditor.vue`**。
+  编辑页由 **`FileManager.vue` 以 `absolute inset-0` 覆盖层**渲染（文件管理器保持挂载，退出后
+  目录、视图、滚动位置都在）——契约第 5 节「面板一律保持挂载」的规则不因为多了一个页面而改。
+- 三个入口都走同一个 store 方法 `fileEditor.open(sid, path)`，它**先**加载（`edit-load`）、
+  **成功之后**才把激活子标签切到 `FILES_TAB`（编辑页一定在文件管理标签页下）；
+  失败就抛错，由调用方 toast——**不切标签页、不进编辑页**：
+  1. 预览弹窗右上角的**编辑图标按钮**（只在文本模式、且内容读出来之后出现；图片没有编辑按钮）；
+  2. 文件管理行菜单的**「编辑」**（只对「按扩展名算文本」的文件显示，见 `fileKind.ts`）；
+  3. 左栏目录树文件行的菜单（见 26.4）。
+- 编辑页形态（用户要求）：**左上角「退出」**、**右上角「还原 / 保存」**，中间一行是文件名 +
+  体积 · 行数 · 编码（非 UTF-8 时）· CRLF（原文件是 CRLF 时）+「未保存」标记，正文是一个
+  铺满剩余高度的 `<textarea>`（等宽、`spellcheck=false`）。Ctrl/Cmd+S 也保存。
+- **退出**：有未保存修改时先确认（`ConfirmDialog`），然后 `close()`——**不动文件管理器的任何
+  状态**（不导航、不换视图）。这就是「回到进入编辑时的状态」：进入编辑时没有碰它，退出时也不碰。
+  从面包屑（左栏）进来时同理——用户要的是「回到文件管理初始状态」，即**别**把文件管理切到
+  被编辑文件所在的那个目录去；左栏是从终端视图进来的，编辑页退出后停在文件管理标签页
+  （用户原话「退出编辑后回到文件管理…」）。
+- **还原**：重新调 `edit-load`（= 丢弃本地修改、回到磁盘上的当前内容），有未保存修改时先确认。
+- **保存**：`edit-save` 成功后把 `original` 对齐、更新体积，并刷新文件所在目录
+  （`sftp.refreshTree(sid, parentPath(path))`：文件管理列表与树里展开过的节点都会更新）；
+  失败保留编辑区内容并 toast 原因。
+- 会话关闭时 `home.forgetSession` 一并 `fileEditor.forget(sid)`。
+
+### 26.4 前端：目录树列文件（「面包屑的更多菜单」的前提）
+
+- `stores/sftp.ts`：`treeChildren` 从「只有目录」改成「**全部目录 + 按名字排序的前 20 个文件**」
+  （`TREE_FILE_LIMIT = 20`），并新增 `treeFileTotal: Record<path, number>`（该目录下的文件总数，
+  用来判断要不要渲染「更多文件」行）。三处写入点（`ensure` / `loadTreeChildren` / `loadDir` 的同步）
+  都过同一个 `treeRows()`，免得某一处漏掉。
+- `FileTree.vue`：
+  - 文件行与目录行同一个外观（图标不同），点文件行 = **预览**（与文件管理器里点一行一致），
+    点目录行照旧只更新共享的当前目录并展开（契约 11.3 的语义不变）；
+  - `treeFileTotal > 20` 时在该目录的文件后面加一行 **「···更多文件」**，点击 = 导航到该目录 +
+    把激活子标签切到 `FILES_TAB`（「在文件管理打开该目录」）；
+  - 文件行的菜单补齐**完整的文件菜单**：预览 / 编辑 / 重命名 / 复制 / 剪切 / 删除 / 下载 /
+    导出至飞牛 / 压缩为 tar.gz / 压缩为 zip / 解压（可解压时）/ 信息 / 复制完整路径；
+    目录行的菜单保持原样（新建 / 上传 / 粘贴 / 重命名 / 删除 / 压缩 / 导出 / 复制路径 / 刷新 /
+    在此目录新建终端）。
+- **整棵树的文件数不设上限**（用户明确要求）：每个目录各显示前 20 个，展开多少层就有多少行；
+  上限只按「单个目录」算。
+
+### 26.5 冻结文件（本轮）
+
+`frontend/src/serverapi/index.ts`（新增 `fsEditLoad` / `fsEditSave` 与 `FsEditContent`）、
+`frontend/src/i18n/{zh,en}.ts`、`docs/CONTRACT.md`。后端只新增 `backend/files_edit.go` 与
+两条路由（`admin_routes.go`）。
+
+### 26.6 本轮的验证
+
+**后端**：`make test` 全绿，新增 `backend/files_edit_test.go`：
+
+- `TestFsEditRoundTrip`：UTF-8（无 BOM / 带 BOM）与 CRLF 文件「打开 → 改 → 保存」的字节保真；
+- `TestFsEditUTF16`：UTF-16LE / BE（带 BOM）与**无 BOM** 的 UTF-16LE 往返（含汉字）；
+- `TestFsEditCRLFNormalisation`：编辑区里 LF 与 CRLF 混着时，写回不会出现 `\r\r\n`；
+- `TestFsEditPermissionDenied`（**本轮的核心断言**）：0444 的文件 `edit-load` 回 `permission`
+  （403）且不返回内容、`edit-save` 同样被拒且文件一个字节都没变；
+- `TestFsEditRejects`：目录 / 不存在 / `..` 逃逸 / 二进制 / **FIFO**（不是普通文件）/ 超过 4 MiB
+  各自的错误码；保存侧的超限、坏编码（`gb18030`）、目标不存在、缺 path、会话不存在；
+- `TestEncodeForSave` / `TestDetectEOL` / `TestEditErrorMapping`：编码器与错误映射的单测。
+
+⚠️ 权限用例**不是**「随便 chmod 一下就断言」：项目工作卷会按自己的 ACL 重写 mode
+（实测 `WriteFile(…, 0o444)` 落地成 0705、属主照样能写），所以用例先探一个「真的执行权限位」的
+目录（`permEnforcingDir`：写文件 → chmod 0444 → 以 `O_WRONLY` 打开确认被拒），并把 SSH 根目录
+换到那里；以 root 跑、或所有候选都不执行权限位时 `t.Skip` 并写明原因（**不假装通过**）。
+
+**前端**：`make check`（vue-tsc + i18n 双向）无错误，`make` 构建通过。
+
+**端到端手测**（真二进制 + `testsshd` + socat 桥到 18080，baseurl=`/webssh`，环境
+`/tmp/webssh-e2e-edit/`，验完已删）：
+
+| # | 操作 | 结果 |
+| --- | --- | --- |
+| 1 | 文件管理里点 `notes.conf` → 预览 | 预览弹窗，标题栏多出「编辑此文件」按钮 |
+| 2 | 点「编辑此文件」 | 预览关闭、切到文件管理子标签、编辑页覆盖文件管理页：左上角「退出」、右上角「还原 / 保存（未改动时禁用）」、标题行 `39 B · 4 行`，textarea 自动聚焦 ✓ |
+| 3 | 改内容 → 保存 | 落盘 `key=edited/third=1/added_by_editor=yes`；保存按钮转灰、meta 变成 `39 B · 4 行` |
+| 4 | 点「退出」 | 回到文件管理，仍是进入编辑时的那个目录（`root`），列表已刷新出新体积 |
+| 5 | 再进编辑页改内容 → 退出 | 弹「有未保存的修改，退出会丢弃这些修改。」；确定后退出，**磁盘内容未变** ✓ |
+| 6 | `readonly.conf` → 预览 → 编辑 | toast「打开编辑器失败：权限不足」，**不进编辑页**、子标签页不动、预览留着（用户还在读） ✓ |
+| 7 | 左栏目录树 | 目录与文件都列出来了（`main.go / notes.conf / plain.txt / readonly.conf / win.ini …`），目录在前、按名字排 |
+| 8 | 展开 `many`（25 个文件） | 20 个文件 + 一行「···更多文件」（title：还有 5 个文件未显示…）；另一处 318 个文件的目录同样只渲染 20 行 |
+| 9 | 点「···更多文件」 | 切到文件管理子标签并打开 `many`（26 项）✓ |
+| 10 | 树里点文件行 | 打开预览（与文件管理器点一行一致） |
+| 11 | 树里文件行的「···」菜单 | 预览 / 编辑 / 重命名 / 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 / 压缩为 tar.gz / 压缩为 zip / 信息 / 复制完整路径 |
+| 12 | 树里 `win.ini` → 预览 → 编辑 | 编辑页 meta = `36 B · 3 行 · UTF-16LE · CRLF 换行`；加一行保存后落盘仍是 `\xff\xfe` + UTF-16LE + CRLF ✓ |
+| 13 | 从树里进编辑页 → 退出 | 停在文件管理子标签，且**没有**被带到被编辑文件所在目录（回到文件管理自己的状态）✓ |
+| 14 | `shot.png`（图片）的行菜单 | **没有**「编辑」项（图片没有编辑器），其余菜单项不变 |
+| 15 | 目录行菜单 | 同样没有「编辑」项 |

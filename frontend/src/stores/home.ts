@@ -23,6 +23,7 @@ import { t } from '@/i18n'
 import { sessionLabel } from '@/utils/format'
 import { useAppTabsStore } from '@/stores/appTabs'
 import { useSessionUiStore } from '@/stores/sessionUi'
+import { useFileEditorStore } from '@/stores/fileEditor'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
@@ -214,13 +215,14 @@ export const useHomeStore = defineStore('home', () => {
    * 把一个会话从前端状态里彻底摘掉：应用标签 + 终端标签 + 文件管理 + 会话内界面状态。
    *
    * 只清前端状态，**不**动后端（是否要 close 由调用方决定：关标签要 close，后端已重启就不能
-   * 再 close）。四个 store 的清理必须一起做且顺序无关，所以收在一个地方——漏掉一个的表现是
-   * 「会话关了，但重新打开还看到上次的终端标签/文件列表」。
+   * 再 close）。各个 store 的清理必须一起做且顺序无关，所以收在一个地方——漏掉一个的表现是
+   * 「会话关了，但重新打开还看到上次的终端标签/文件列表/半开的编辑页」。
    */
   function forgetSession(sid: string): void {
     useAppTabsStore().close(sid)
     useTerminalsStore().forget(sid)
     useSftpStore().forget(sid)
+    useFileEditorStore().forget(sid)
     useSessionUiStore().forget(sid)
     delete openStates.value[sid]
   }

@@ -1,9 +1,18 @@
 <script setup lang="ts">
-// FileTree — 左栏文件树（以远程 `/` 为根、懒加载、只列目录）。
+// FileTree — 左栏文件树（以远程 `/` 为根、懒加载；第十六轮起目录与文件都列）。
 //
-// 只列目录：左栏的用途就是「快速跳到某个目录」（会话提示语写的就是「在文件树里点选目录即可
-// 浏览」），把文件也铺进来会让树变得又长又难找，而且点文件的语义（预览？下载？）在 11rem 宽
-// 的栏里也说不清。文件操作一律在文件管理面板里做。
+// 第十六轮起**也列文件**（用户要求：能在树里直接找到配置文件去编辑）：
+//   - 每个目录只列**前 TREE_FILE_LIMIT（20）个文件**（按文件名），多出来的在目录末尾给一行
+//     「···更多文件」，点它去文件管理里打开那个目录——整棵树的文件总数不设上限，
+//     上限按「单个目录」算（契约 26.4）；
+//   - 点**目录**仍然只更新共享的当前目录并展开（不切主区域，见下）；点**文件**打开预览
+//     （与文件管理器里点一行一致）；
+//   - 文件行的菜单补齐完整的文件菜单：预览 / 编辑 / 重命名 / 复制 / 剪切 / 删除 / 下载 /
+//     导出至飞牛 / 压缩为 tar.gz / 压缩为 zip / 解压（可解压时）/ 信息 / 复制完整路径。
+//
+// 在此之前它刻意只列目录：左栏的用途是「快速跳到某个目录」，而点文件的语义在 11rem 宽的栏里
+// 说不清。用户确认要列文件之后，语义就按「与文件管理一致」定下来（预览/编辑走同一套接口与
+// 同一份判据，见 fileKind.ts）。
 //
 // 第二轮的行为（契约 11.3）：
 //   - 根是**远程 `/`**（不是家目录）：树上要能看到 /home /var /tmp 这些同级的目录，
@@ -19,15 +28,19 @@
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, describeError, type ArchiveFormat } from '@/serverapi'
+import { useFileEditorStore } from '@/stores/fileEditor'
 import { usePaneControlsStore } from '@/stores/paneControls'
-import { useSessionUiStore } from '@/stores/sessionUi'
-import { useSftpStore } from '@/stores/sftp'
+import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
+import { TREE_FILE_LIMIT, useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
 import { baseName, joinPath, parentPath } from '@/utils/format'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import PromptDialog from '@/components/PromptDialog.vue'
+import InfoDialog from './InfoDialog.vue'
+import PreviewDialog from './PreviewDialog.vue'
 import UploadDialog from './UploadDialog.vue'
+import { canEditPath, isArchivePath } from './fileKind'
 
 const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
 
@@ -37,31 +50,63 @@ const sftp = useSftpStore()
 const ui = useSessionUiStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
+const editor = useFileEditorStore()
 const toastStore = useToastStore()
 
 const state = computed(() => sftp.stateOf(sid))
 
+/**
+ * 树里的一行：目录、文件，或者「···更多文件」（它代表**它所属的那个目录**里没显示出来的文件，
+ * 点一下去文件管理打开该目录）。
+ *
+ * `more` 行的 `path` 就是它所属目录的路径——所以模板里的 key 必须带上 kind，
+ * 否则它和那个目录自己的行撞 key。
+ */
 interface TreeRow {
+  kind: 'dir' | 'file' | 'more'
   path: string
   name: string
   depth: number
+  /** 文件行的大小（预览弹窗要用它把「图片超过 4 MB」之类的数字说清楚） */
+  size?: number
 }
 
 /** 展开状态下的可见行（扁平化，模板里只渲染一层 v-for）。根永远是第一行。 */
 const rows = computed<TreeRow[]>(() => {
   const st = state.value
-  const out: TreeRow[] = [{ path: '/', name: t('files_root'), depth: 0 }]
+  const out: TreeRow[] = [{ kind: 'dir', path: '/', name: t('files_root'), depth: 0 }]
   const walk = (parent: string, depth: number) => {
     // 没展开就不列子项：懒加载的全部意义就在这里（大目录不要一次性铺开）
     if (!st.expanded.includes(parent)) return
     for (const entry of st.treeChildren[parent] ?? []) {
-      out.push({ path: entry.path, name: entry.name, depth })
-      walk(entry.path, depth + 1)
+      out.push({
+        kind: entry.dir ? 'dir' : 'file',
+        path: entry.path,
+        name: entry.name,
+        depth,
+        size: entry.size
+      })
+      // 只有目录才往下走：文件没有子项
+      if (entry.dir) walk(entry.path, depth + 1)
+    }
+    // 文件被截断的目录：末尾补一行「···更多文件」（去文件管理看全部）
+    if (fileTotalOf(parent) > TREE_FILE_LIMIT) {
+      out.push({ kind: 'more', path: parent, name: t('files_tree_more_files'), depth })
     }
   }
   walk('/', 1)
   return out
 })
+
+/** 某个目录里一共有多少个文件（store 记的是总数，树里只显示前 TREE_FILE_LIMIT 个）。 */
+function fileTotalOf(path: string): number {
+  return state.value.treeFileTotal[path] ?? 0
+}
+
+/** 「···更多文件」那一行的提示：还有多少个没显示（数字来自 store，不是猜的）。 */
+function moreFilesHint(path: string): string {
+  return t('files_tree_more_files_hint', { n: Math.max(0, fileTotalOf(path) - TREE_FILE_LIMIT) })
+}
 
 const isExpanded = (path: string) => state.value.expanded.includes(path)
 const isLoading = (path: string) => state.value.treeLoading[path] === true
@@ -72,6 +117,35 @@ function toast(msg: string, type: 'success' | 'error' | 'info' = 'error') {
 }
 
 // ---- 点击 / 展开 ----
+
+/**
+ * 行点击：目录 = 导航 + 展开（原语义，不切主区域）；文件 = 预览；「···更多文件」= 在文件管理里
+ * 打开那个目录（用户要求）。
+ */
+function onRowClick(row: TreeRow) {
+  if (row.kind === 'file') {
+    previewPath.value = row.path
+    previewSize.value = row.size ?? 0
+    previewVisible.value = true
+    return
+  }
+  if (row.kind === 'more') {
+    openDirInFiles(row.path)
+    return
+  }
+  void openDir(row.path)
+}
+
+/**
+ * 「···更多文件」：跳到那个目录并切到文件管理子标签。
+ *
+ * 用 `ui.setActiveSub(FILES_TAB)` 而不是别的开关：主区域显示什么只有这一个判据（契约 13.1），
+ * 切过去之后左栏自己会收起（`showLeft` = 宽屏 && 不在文件管理 && 用户没手动收起）。
+ */
+function openDirInFiles(path: string) {
+  void sftp.navigate(sid, path)
+  ui.setActiveSub(sid, FILES_TAB)
+}
 
 async function openDir(path: string) {
   // 顺序有讲究：先 navigate（当前目录立刻切过去，高亮跟着动），再展开。
@@ -161,15 +235,21 @@ watch(
 
 // ---- 菜单（右键 / 「…」都走它） ----
 
-const menu = reactive({ show: false, x: 0, y: 0, path: '' })
+const menu = reactive({ show: false, x: 0, y: 0, path: '', file: false })
 const menuEl = ref<HTMLElement | null>(null)
 const MENU_MARGIN = 8
 
-function openMenu(path: string, event: MouseEvent) {
+/**
+ * 打开菜单。`file` 决定这一份是**文件菜单**还是**目录菜单**（第十六轮起树里有文件了）——
+ * 菜单状态里必须记住这一点：渲染时再回 `treeChildren` 里翻是查不到的（比如菜单开在某个
+ * 文件上、用户接着把父目录收起来了，菜单还开着却查不到目标）。
+ */
+function openMenu(path: string, event: MouseEvent, file = false) {
   menu.show = true
   menu.x = event.clientX
   menu.y = event.clientY
   menu.path = path
+  menu.file = file
   // 菜单里「导出至飞牛」是否可点取决于运行信息，点开菜单时确保它已经拿到
   void sftp.ensureRuntime()
   void nextTick(clampMenu)
@@ -191,6 +271,13 @@ function hideMenu() {
 /** 在空白处右键 = 对根节点操作。 */
 function openRootMenu(event: MouseEvent) {
   openMenu('/', event)
+}
+
+/** 行右键：目录菜单 / 文件菜单。 */
+function onRowContext(row: TreeRow, event: MouseEvent) {
+  // 「···更多文件」不是一个文件系统对象，没有可操作的菜单——它自己的点击就是唯一动作
+  if (row.kind === 'more') return
+  openMenu(row.path, event, row.kind === 'file')
 }
 
 // ---- 菜单动作 ----
@@ -448,6 +535,81 @@ async function refreshHere() {
   }
 }
 
+// ---- 预览 / 编辑 / 下载 / 信息（文件行，第十六轮） ----
+
+const previewVisible = ref(false)
+const previewPath = ref('')
+/** 列表里已知的体积：图片超限时后端不回内容，预览弹窗要靠它把「多大」说清楚。 */
+const previewSize = ref(0)
+
+const infoVisible = ref(false)
+const infoPath = ref('')
+
+function openInfo(path: string) {
+  hideMenu()
+  if (!path) return
+  infoPath.value = path
+  infoVisible.value = true
+}
+
+/**
+ * 进入编辑页。加载成功之后 store 会把激活子标签切到文件管理（编辑页在那儿覆盖文件管理器）；
+ * 失败（最常见的是 `permission`：这个文件登录用户改不了）**只报错**，不切标签页、不进编辑页。
+ *
+ * 提示文案用 `files_editor_load_failed`：`describeError` 会把 `permission` 翻成
+ * 「权限不足…」，用户看到的是「为什么改不了」而不是一句「操作失败」。
+ */
+async function enterEdit(path: string) {
+  hideMenu()
+  try {
+    await editor.open(sid, path)
+  } catch (e) {
+    toast(t('files_editor_load_failed', { error: describeError(e) }))
+  }
+}
+
+/**
+ * 预览弹窗里点了「编辑」：**进了编辑页才**关掉预览（弹窗层级比编辑页高，不关会盖住它；
+ * 但失败时留着——用户还在读这个文件）。
+ */
+async function onPreviewEdit(path: string) {
+  await enterEdit(path)
+  if (editor.isOpen(sid)) previewVisible.value = false
+}
+
+async function downloadFile(path: string) {
+  hideMenu()
+  try {
+    await sftp.download(sid, path)
+    toast(t('files_download_started', { name: baseName(path) }), 'success')
+  } catch (e) {
+    toast(t('files_download_failed', { error: describeError(e) }))
+  }
+}
+
+/** 复制 / 剪切：走与文件管理器**同一个**剪贴板（store 里全局一份），所以树里复制、列表里粘贴。 */
+function copyFile(path: string) {
+  hideMenu()
+  sftp.copyToClipboard(sid, [path])
+  toast(t('files_copied_items', { n: 1 }), 'success')
+}
+
+function cutFile(path: string) {
+  hideMenu()
+  sftp.cutToClipboard(sid, [path])
+  toast(t('files_cut_items', { n: 1 }), 'success')
+}
+
+async function extractFile(path: string) {
+  hideMenu()
+  try {
+    const dir = await sftp.extract(sid, path)
+    toast(t('files_extract_done', { dir }), 'success')
+  } catch (e) {
+    toast(t('files_op_failed', { error: describeError(e) }))
+  }
+}
+
 type MenuItem = { label: string; run: () => void; danger?: boolean; dim?: boolean }
 
 /**
@@ -479,10 +641,8 @@ function exportItem(path: string): MenuItem {
   return { label: t('files_export_nas'), run: () => void exportHere(path, false) }
 }
 
-/** 菜单项顺序按契约 11.3；根目录下把「不存在父目录/不能改」的几项去掉。 */
-const menuItems = computed<MenuItem[]>(() => {
-  const path = menu.path
-  if (!path) return []
+/** 目录菜单：顺序按契约 11.3；根目录下把「不存在父目录/不能改」的几项去掉。 */
+function dirMenuItems(path: string): MenuItem[] {
   const root = path === '/'
   const items: MenuItem[] = [{ label: t('files_new_dir'), run: () => newHere(true) }]
   items.push({ label: t('files_new_file'), run: () => newHere(false) })
@@ -500,6 +660,58 @@ const menuItems = computed<MenuItem[]>(() => {
   items.push({ label: t('files_copy_path'), run: () => void copyPath() })
   items.push({ label: t('files_refresh'), run: () => void refreshHere() })
   return items
+}
+
+/**
+ * 文件菜单（第十六轮）：与文件管理器行菜单同一套动作与顺序（预览 / 编辑 / 重命名 / 复制 /
+ * 剪切 / 删除 / 下载 / 导出至飞牛 / 压缩为 tar.gz / 压缩为 zip / 解压（可解压时）/ 信息 /
+ * 复制完整路径）——「树里看到的文件」与「列表里看到的文件」是同一个对象，动作不该有差别。
+ *
+ * 「编辑」只对按扩展名算文本的文件显示（图片没有编辑器；真正的可写性由后端判定，
+ * 见契约 26.2）；「解压」只对归档后缀显示。
+ */
+function fileMenuItems(path: string): MenuItem[] {
+  const items: MenuItem[] = [
+    {
+      label: t('files_preview'),
+      run: () => {
+        hideMenu()
+        previewPath.value = path
+        previewSize.value = fileSizeOf(path)
+        previewVisible.value = true
+      }
+    }
+  ]
+  if (canEditPath(path)) items.push({ label: t('common_edit'), run: () => void enterEdit(path) })
+  items.push({ label: t('files_rename'), run: renameHere })
+  items.push({ label: t('files_copy'), run: () => copyFile(path) })
+  items.push({ label: t('files_cut'), run: () => cutFile(path) })
+  items.push({ label: t('common_delete'), danger: true, run: askDelete })
+  items.push({ label: t('files_download'), run: () => void downloadFile(path) })
+  items.push(exportItem(path))
+  items.push({ label: t('files_compress'), run: () => void compressHere('tar.gz') })
+  items.push({ label: t('files_compress_zip'), run: () => void compressHere('zip') })
+  if (isArchivePath(baseName(path))) {
+    items.push({ label: t('files_extract'), run: () => void extractFile(path) })
+  }
+  items.push({ label: t('files_info'), run: () => openInfo(path) })
+  items.push({ label: t('files_copy_path'), run: () => void copyPath() })
+  return items
+}
+
+/** 文件行的大小：从树缓存里查（菜单里点「预览」时用）。 */
+function fileSizeOf(path: string): number {
+  for (const list of Object.values(state.value.treeChildren)) {
+    const hit = list.find((entry) => entry.path === path)
+    if (hit) return hit.size
+  }
+  return 0
+}
+
+const menuItems = computed<MenuItem[]>(() => {
+  const path = menu.path
+  if (!path) return []
+  return menu.file ? fileMenuItems(path) : dirMenuItems(path)
 })
 </script>
 
@@ -514,22 +726,27 @@ const menuItems = computed<MenuItem[]>(() => {
         {{ t('common_loading') }}
       </div>
 
-      <template v-for="row in rows" :key="row.path">
+      <!-- key 必须带上 kind：「···更多文件」那一行的 path 就是它所属目录的 path，
+           只用 path 会和目录自己的行撞 key（Vue 会复用错节点，表现为高亮跳到别处） -->
+      <template v-for="row in rows" :key="`${row.kind}:${row.path}`">
         <div
           class="group flex cursor-pointer items-center gap-1 rounded px-1.5"
           :class="[
             mobile ? 'py-2' : 'py-1',
-            state.dir === row.path
+            row.kind !== 'more' && state.dir === row.path
               ? 'bg-brand-soft font-medium text-ink dark:text-ink-dark'
-              : 'text-ink-soft hover:bg-black/5 dark:text-ink-soft-dark dark:hover:bg-white/5'
+              : 'text-ink-soft hover:bg-black/5 dark:text-ink-soft-dark dark:hover:bg-white/5',
+            row.kind === 'more' ? 'italic' : ''
           ]"
-          :data-tree-path="row.path"
-          :title="row.path"
-          @click="openDir(row.path)"
-          @contextmenu.prevent="openMenu(row.path, $event)"
+          :data-tree-path="row.kind === 'more' ? undefined : row.path"
+          :title="row.kind === 'more' ? moreFilesHint(row.path) : row.path"
+          @click="onRowClick(row)"
+          @contextmenu.prevent="onRowContext(row, $event)"
         >
           <span class="shrink-0" :style="{ width: `${row.depth * 12}px` }" />
+          <!-- 展开箭头只属于目录；文件与「更多文件」用等宽占位，图标才会上下对齐 -->
           <button
+            v-if="row.kind === 'dir'"
             type="button"
             class="shrink-0 rounded p-0.5 text-ink-faint hover:text-ink dark:hover:text-white"
             :title="row.path"
@@ -550,7 +767,10 @@ const menuItems = computed<MenuItem[]>(() => {
               <path d="m9 6 6 6-6 6" />
             </svg>
           </button>
+          <span v-else class="h-4.5 w-4.5 shrink-0" />
+
           <svg
+            v-if="row.kind === 'dir'"
             class="h-4 w-4 shrink-0 text-warning"
             viewBox="0 0 24 24"
             fill="none"
@@ -561,10 +781,27 @@ const menuItems = computed<MenuItem[]>(() => {
           >
             <path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2z" />
           </svg>
-          <span class="min-w-0 flex-1 truncate" :title="row.path">{{ row.name }}</span>
+          <svg
+            v-else-if="row.kind === 'file'"
+            class="h-4 w-4 shrink-0 text-ink-faint"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+            <path d="M14 3v5h5" />
+          </svg>
+
+          <span class="min-w-0 flex-1 truncate" :title="row.kind === 'more' ? '' : row.path">
+            {{ row.name }}
+          </span>
+
           <!-- 家目录标一下：树是以 / 为根的，用户得能一眼看到自己「家」在哪 -->
           <svg
-            v-if="isHome(row.path)"
+            v-if="row.kind === 'dir' && isHome(row.path)"
             class="h-3.5 w-3.5 shrink-0 text-brand"
             viewBox="0 0 24 24"
             fill="none"
@@ -577,12 +814,15 @@ const menuItems = computed<MenuItem[]>(() => {
             <path d="m3 10 9-7 9 7v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
             <path d="M9 22V12h6v10" />
           </svg>
+
+          <!-- 「···更多文件」没有菜单（它不是一个文件系统对象）：它的点击就是唯一动作 -->
           <button
+            v-if="row.kind !== 'more'"
             type="button"
             class="tree-tool hover-reveal h-6 w-6 shrink-0"
             :title="t('files_more')"
             :aria-label="t('files_more')"
-            @click.stop="openMenu(row.path, $event)"
+            @click.stop="openMenu(row.path, $event, row.kind === 'file')"
           >
             <svg
               class="h-4 w-4"
@@ -599,7 +839,7 @@ const menuItems = computed<MenuItem[]>(() => {
         </div>
 
         <div
-          v-if="isLoading(row.path)"
+          v-if="row.kind === 'dir' && isLoading(row.path)"
           class="py-1 text-[11px] text-ink-faint"
           :style="{ paddingLeft: `${(row.depth + 1) * 12 + 34}px` }"
         >
@@ -630,6 +870,22 @@ const menuItems = computed<MenuItem[]>(() => {
       </button>
     </div>
 
+    <!-- 预览（文件行点击 / 文件菜单）：与文件管理器同一个弹窗、同一套接口；
+         弹窗里那个「编辑」按钮回到这里的 enterEdit，走的也是同一条路 -->
+    <PreviewDialog
+      :visible="previewVisible"
+      :sid="sid"
+      :path="previewPath"
+      :size="previewSize"
+      @update:visible="previewVisible = $event"
+      @edit="onPreviewEdit"
+    />
+    <InfoDialog
+      :visible="infoVisible"
+      :sid="sid"
+      :path="infoPath"
+      @update:visible="infoVisible = $event"
+    />
     <UploadDialog
       :visible="uploadVisible"
       :sid="sid"

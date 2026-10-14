@@ -97,6 +97,10 @@ func (m *AdminMux) buildHandler() http.Handler {
 			m.route(m.handleFsRead)(w, r)
 		case p == "/api/fs/image":
 			m.route(m.handleFsImage)(w, r)
+		case p == "/api/fs/edit-load":
+			m.route(m.handleFsEditLoad)(w, r)
+		case p == "/api/fs/edit-save":
+			m.route(m.handleFsEditSave)(w, r)
 		case p == "/api/quickcmds/list":
 			m.route(m.handleQuickCmdsList)(w, r)
 		case p == "/api/quickcmds/save":

@@ -8,39 +8,35 @@
 //
 // 文本绝不把二进制塞进 <pre> 显示成乱码——乱码会让人以为文件已经损坏，宁可说一句
 // 「不是文本」再引导去下载。
+//
+// 第十六轮：文本预览成功之后，标题栏出现**编辑**按钮（emit `edit`，由调用方进入编辑页）。
+// 图片没有编辑按钮——图片编辑器不在本仓库的范围内；能编辑的判据与文件管理器/目录树的
+// 「编辑」菜单项共用 `fileKind.ts`（按扩展名算文本），真正的结论由后端给（没写权限回 permission）。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, api, describeError, fetchImageBlob } from '@/serverapi'
 import { useSftpStore } from '@/stores/sftp'
 import { useToastStore } from '@/stores/toast'
 import { baseName, humanSize } from '@/utils/format'
+import { previewKindOf } from './fileKind'
 
 const props = defineProps<{ visible: boolean; sid: string; path: string; size?: number }>()
-const emit = defineEmits<{ 'update:visible': [v: boolean] }>()
+const emit = defineEmits<{
+  'update:visible': [v: boolean]
+  /** 用户点了「编辑」：由调用方决定怎么进编辑页（状态在 stores/fileEditor.ts 里） */
+  edit: [path: string]
+}>()
 
 const sftp = useSftpStore()
 const toastStore = useToastStore()
 
-/**
- * 能预览的图片扩展名。**与后端 files_preview.go 的 imageTypes 白名单一致**，两边都改才算
- * 支持一种新格式：这里决定「用哪种预览」，后端决定「内容真的是不是图片」。
- *
- * 不含 svg：它是能带脚本的 XML，后端刻意不当图片回（见 imageTypes 的注释），前端也就按
- * 文本预览它——XML 源码本来也适合在 <pre> 里读。
- */
-const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'jpe', 'gif', 'webp', 'bmp', 'ico', 'avif'])
 /** 图片预览上限，**与后端 maxImageBytes 一致**；只用于文案里的数字。 */
 const IMAGE_MAX_BYTES = 4 << 20
 /** 行号最多给这么多行：再多就是几十万个字符的 gutter，纯属给浏览器添堵（内容照常显示）。 */
 const MAX_GUTTER_LINES = 20000
 
-const kind = computed<'image' | 'text'>(() => (IMAGE_EXTS.has(extOf(props.path)) ? 'image' : 'text'))
-
-function extOf(path: string): string {
-  const base = baseName(path)
-  const at = base.lastIndexOf('.')
-  return at <= 0 ? '' : base.slice(at + 1).toLowerCase()
-}
+/** 预览形态按扩展名选（后端再按内容确认），判据与文件管理器/目录树的「编辑」共用一份。 */
+const kind = computed<'image' | 'text'>(() => previewKindOf(props.path))
 
 // ---- 文本态 ----
 const loading = ref(false)
@@ -230,6 +226,31 @@ function close() {
               >
                 {{ meta }}
               </span>
+              <!-- 编辑（第十六轮）：只在**文本读出来了**之后出现——图片没有编辑按钮，
+                   不是文本 / 太大 / 读失败时也不该给一个点下去只会报错的入口。
+                   权限检查在调用方那一侧（/api/fs/edit-load 先验证登录用户可写，
+                   没权限直接报错、不进编辑页，见契约 26.2）。 -->
+              <button
+                v-if="kind === 'text' && !loading && !error && !tooLarge && !binary"
+                type="button"
+                class="tree-tool"
+                :title="t('files_preview_edit')"
+                :aria-label="t('files_preview_edit')"
+                @click="emit('edit', path)"
+              >
+                <svg
+                  class="h-4 w-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d="M12 20h9" />
+                  <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
+                </svg>
+              </button>
               <!-- 换行开关（只对文本有意义）：关 = 不换行 + 显示行号，开 = 长行折回来。
                    按钮名字说的是「这个开关管什么」，开/关由 aria-pressed 表达。 -->
               <button

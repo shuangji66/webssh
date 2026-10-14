@@ -23,6 +23,14 @@
 //      第十一轮起**剪切是例外**：粘完就清、那一行随之消失（不管从哪个入口粘的），
 //      因为剪切是「搬走」，搬完这次就该结束（见 sftp.paste 的说明）。
 //
+// 第十六轮新增两件事：
+//   1) 行菜单里的**「编辑」**（只对按扩展名算文本的文件显示）：进入编辑页，编辑页由本组件以
+//      `absolute inset-0` **覆盖**在文件管理页面上（文件管理器保持挂载，退出后目录、视图、
+//      滚动位置都还在）。三个入口（预览弹窗的编辑按钮 / 行菜单 / 左栏目录树）共用
+//      stores/fileEditor.ts 的状态与「先验证权限、再进编辑页」的顺序，见契约 26.3；
+//   2) 预览弹窗里点了「编辑」也走同一条路（进了编辑页才关弹窗：它 Teleport 到 body、层级在
+//      编辑页之上，不关会盖住编辑页；失败时留着，用户还在读那个文件）。
+//
 // 切回终端由工具栏最左侧的「返回终端」按钮负责（第四轮新增）：它只把 sessionUi 的激活子标签
 // 改回**上一次激活的终端**，左栏（面包屑 + 目录树）随之回来——与左栏那条按钮条里的「切换到
 // 文件管理」互为一对，两处共用同一个状态（契约 13.1 的「二选一」判据没变，也没有第二套开关）。
@@ -38,6 +46,7 @@ import {
   type UploadEntry,
   type UploadResult
 } from '@/serverapi'
+import { useFileEditorStore } from '@/stores/fileEditor'
 import { usePaneControlsStore } from '@/stores/paneControls'
 import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
@@ -56,9 +65,11 @@ import {
 import { revealActive, wheelToHorizontal } from '@/utils/scroll'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import PromptDialog from '@/components/PromptDialog.vue'
+import FileEditor from './FileEditor.vue'
 import InfoDialog from './InfoDialog.vue'
 import PreviewDialog from './PreviewDialog.vue'
 import UploadDialog from './UploadDialog.vue'
+import { canEditEntry, isArchivePath } from './fileKind'
 
 // Vue 3.5 的响应式 props 解构：sid 在组件生命周期内不变，但解构写法让模板里少一层 props.。
 const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
@@ -67,6 +78,7 @@ const sftp = useSftpStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 const sessionUi = useSessionUiStore()
+const editor = useFileEditorStore()
 const toastStore = useToastStore()
 
 /** 统一的提示出口：文案一律走 i18n，失败必须说清原因（不能「点了没反应」）。 */
@@ -384,6 +396,33 @@ const previewVisible = ref(false)
 const previewPath = ref('')
 /** 列表里已知的体积：图片超限时后端不回内容，预览弹窗要靠它把「多大」说清楚。 */
 const previewSize = ref(0)
+
+/**
+ * 进入编辑页（契约 26.3）。`fileEditor.open` 先让后端验证**本会话的登录用户**能不能写这个
+ * 文件，成功之后才把激活子标签切到文件管理并打开编辑页；失败（最常见的是 `permission`）
+ * 只报错——不切标签页、不进编辑页，用户看到的是「为什么改不了」。
+ */
+async function enterEdit(path: string) {
+  hideMenu()
+  if (!path) return
+  try {
+    await editor.open(sid, path)
+  } catch (e) {
+    toast(t('files_editor_load_failed', { error: describeError(e) }))
+  }
+}
+
+/**
+ * 预览弹窗里点了「编辑」：**进了编辑页才**关掉预览。
+ *
+ * 顺序不能反：预览弹窗 Teleport 到 body、层级（z-50）比编辑页（面板内的 z-30）高，不关它
+ * 会盖在编辑页上面。但失败时（最常见的是 `permission`）必须留着——用户还在读这个文件，
+ * 把弹窗一起关掉等于顺手扔掉他的阅读位置，而这次点击什么都没做成。
+ */
+async function onPreviewEdit(path: string) {
+  await enterEdit(path)
+  if (editor.isOpen(sid)) previewVisible.value = false
+}
 
 function onEntryClick(entry: FsEntry) {
   // 多选模式下点行 = 选中/取消选中（不打开：用户点第二下显然不是想打开两个文件）
@@ -757,13 +796,6 @@ async function pasteInto(toDir: string, keepClipboard = false) {
 
 // ---- 压缩 / 解压 / 导出至飞牛 ----
 
-/** 可解压判据：tar 家族 + zip。后缀表与后端 archive.go 的 tarExts 逐字对应。 */
-const ARCHIVE_RE = /\.(tar|tar\.gz|tgz|tar\.bz2|tbz|tbz2|tar\.xz|txz|tar\.zst|tzst|zip)$/i
-
-function isArchive(name: string): boolean {
-  return ARCHIVE_RE.test(name)
-}
-
 /**
  * 压缩（tar.gz / zip）。
  *
@@ -1006,11 +1038,17 @@ const menuItems = computed<MenuItem[]>(() => {
   if (!entry) return []
   const targets = targetPaths(entry)
   const items: MenuItem[] = []
-  // 顺序按契约 11.4（13.4 加了「压缩为 zip」紧跟 tar.gz）：粘贴（有剪贴板时）/ 重命名 /
+  // 顺序按契约 11.4（13.4 加了「压缩为 zip」紧跟 tar.gz；第十六轮在「粘贴」与「重命名」
+  // 之间插入「编辑」）：粘贴（有剪贴板时）/ 编辑（文本文件）/ 重命名 /
   // 复制 / 剪切 / 删除 / 下载 / 导出至飞牛 / 压缩为 tar.gz / 压缩为 zip / 解压 /
   // 复制完整路径 / 在此目录新建终端
   const paste = pasteItem(entry.dir ? entry.path : state.value.dir)
   if (paste) items.push(paste)
+  // 编辑（第十六轮）：只对**按扩展名算文本**的文件出现——图片没有编辑器，目录更不能编辑。
+  // 真正的可写性由后端在 edit-load 里判定（没权限回 permission，界面拒绝进编辑页）。
+  if (canEditEntry(entry)) {
+    items.push({ label: t('common_edit'), run: () => void enterEdit(entry.path) })
+  }
   items.push({ label: t('files_rename'), run: renameEntry })
   items.push({ label: t('files_copy'), run: () => copyEntries(targets) })
   items.push({ label: t('files_cut'), run: () => cutEntries(targets) })
@@ -1028,7 +1066,7 @@ const menuItems = computed<MenuItem[]>(() => {
     label: t('files_compress_zip'),
     run: () => void compressEntries(targets, 'zip')
   })
-  if (!entry.dir && isArchive(entry.name)) {
+  if (!entry.dir && isArchivePath(entry.name)) {
     items.push({ label: t('files_extract'), run: () => void extractEntry(entry) })
   }
   items.push({ label: t('files_info'), run: () => openInfo(entry.path) })
@@ -1044,7 +1082,8 @@ onBeforeUnmount(hideMenu)
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col">
+  <!-- relative：编辑页是它的 absolute 覆盖层（见文件末尾的 FileEditor） -->
+  <div class="relative flex h-full min-h-0 flex-col">
     <!-- 工具栏：窄面板放不下时自己折行，按钮只有图标（说明挂原生 title，触屏上点完就消失） -->
     <div
       class="flex shrink-0 flex-wrap items-center gap-0 border-b border-line px-1 py-1 dark:border-line-dark"
@@ -1688,6 +1727,7 @@ onBeforeUnmount(hideMenu)
       :path="previewPath"
       :size="previewSize"
       @update:visible="previewVisible = $event"
+      @edit="onPreviewEdit"
     />
     <InfoDialog
       :visible="infoVisible"
@@ -1713,5 +1753,10 @@ onBeforeUnmount(hideMenu)
       @confirm="onConfirmOk"
       @cancel="confirm.show = false"
     />
+
+    <!-- 编辑页（第十六轮）：覆盖在**文件管理页面**上（用户要求「编辑页覆盖文件管理页面」）。
+         用 v-if 而不是常驻挂载是安全的：它里面没有 xterm / WebSocket 那类「重挂载要重新握手」
+         的东西，内容全在 store 里（契约第 5 节禁 v-if 只针对面板）。 -->
+    <FileEditor v-if="editor.isOpen(sid)" :sid="sid" />
   </div>
 </template>

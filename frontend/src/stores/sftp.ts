@@ -23,6 +23,9 @@
 //   paste / compress / extract / exportToNas
 //                                          批量/远程操作（compress 支持 tar.gz 与 zip 两种格式）
 //   expandPath / refreshTree               树：展开到某条链路（家目录）、刷新某个节点
+//   state.treeFileTotal / TREE_FILE_LIMIT  树里每个目录的文件总数（第十六轮起树也列文件：
+//                                          每个目录只显示前 TREE_FILE_LIMIT 个，多出来的靠
+//                                          「···更多文件」那一行去文件管理里看，见契约 26.4）
 //   runtime / ensureRuntime / exportRoot / archiveDir
 //                                          运行信息（导出目标目录、压缩包输出目录）
 import { ref } from 'vue'
@@ -88,6 +91,13 @@ export interface SftpState {
   /** 列表排序（全局偏好） */
   sort: SortState
   treeChildren: Record<string, FsEntry[]>
+  /**
+   * 目录树里每个目录的**文件总数**（第十六轮）。
+   *
+   * 与 `treeChildren` 分开记：树里只显示前 TREE_FILE_LIMIT 个文件，而「还有多少个没显示」
+   * 决定要不要渲染「···更多文件」那一行——只看 treeChildren 是数不出来的。
+   */
+  treeFileTotal: Record<string, number>
   expanded: string[]
   treeLoading: Record<string, boolean>
   selected: string[]
@@ -101,6 +111,14 @@ export interface SftpState {
    */
   multi: boolean
 }
+
+/**
+ * 目录树里**每个目录**最多显示多少个文件（用户要求 20，按文件名）。
+ *
+ * 上限按「单个目录」算，整棵树没有总数上限（展开多少层就有多少行）；超过这个数的目录在树里
+ * 多一行「···更多文件」，点它去文件管理打开该目录（契约 26.4）。
+ */
+export const TREE_FILE_LIMIT = 20
 
 /** 视图偏好（列表 / 网格）的持久化键。纯界面偏好：跟随浏览器，不落后端、不随会话走。 */
 const VIEW_KEY = 'webssh-files-view'
@@ -167,6 +185,7 @@ function blankState(): SftpState {
     mode: readStoredMode(),
     sort: readStoredSort(),
     treeChildren: {},
+    treeFileTotal: {},
     expanded: [],
     treeLoading: {},
     selected: [],
@@ -224,12 +243,25 @@ export const useSftpStore = defineStore('sftp', () => {
   }
 
   /**
-   * 树节点只保留目录：文件树的语义是「跳到某个目录」，文件一律在文件管理面板里操作。
+   * 树里一个目录要显示的子项：**全部目录 + 按名字排序的前 TREE_FILE_LIMIT 个文件**。
+   *
+   * 第十六轮起树也列文件（用户要求：能直接在树里找到配置文件去编辑），但每个目录只列前
+   * TREE_FILE_LIMIT 个——一个 `node_modules` 或 `/usr/bin` 铺进树里会把整栏变成几千行的列表，
+   * 而树是「快速跳转」用的。多出来的部分由树里的「···更多文件」那一行引导到文件管理去看
+   * （契约 26.4）。**整棵树显示的文件总数不设上限**：每个目录各算各的。
+   *
    * 三个写入点（ensure / loadTreeChildren / loadDir 的同步）都过这里，免得某一处漏过滤，
-   * 表现是「逛过一圈之后文件树里冒出文件」。
+   * 表现是「树里有、列表里没有」或者文件总数对不上、该出现的「更多文件」行不出现。
    */
-  function dirsOnly(entries: FsEntry[]): FsEntry[] {
-    return entries.filter((entry) => entry.dir)
+  function treeRows(st: SftpState, path: string, entries: FsEntry[]): FsEntry[] {
+    const dirs = entries.filter((entry) => entry.dir)
+    // 后端已经按名字排好，这里再排一次是为了不依赖「调用方给的是哪一份列表」（loadDir 的同步
+    // 用的是文件管理器那一份，它可能来自排序后的视图）
+    const files = entries
+      .filter((entry) => !entry.dir)
+      .sort((a, b) => compareEntries(a, b, 'name', 'asc'))
+    st.treeFileTotal[path] = files.length
+    return [...dirs, ...files.slice(0, TREE_FILE_LIMIT)]
   }
 
   /**
@@ -277,7 +309,7 @@ export const useSftpStore = defineStore('sftp', () => {
       loadedDirs.add(dirKey(sid, st.dir))
       // 树和列表是同一份数据：这个目录在树里已经展开过的话，一并换掉它的缓存，
       // 免得「列表里删掉的文件，树里还挂在那儿」。
-      if (st.treeChildren[st.dir]) st.treeChildren[st.dir] = dirsOnly(res.entries)
+      if (st.treeChildren[st.dir]) st.treeChildren[st.dir] = treeRows(st, st.dir, res.entries)
     } catch (e) {
       st.error = describeError(e)
     } finally {
@@ -292,7 +324,7 @@ export const useSftpStore = defineStore('sftp', () => {
     st.treeLoading[path] = true
     try {
       const res = await api.fsList(sid, path)
-      st.treeChildren[path] = dirsOnly(res.entries)
+      st.treeChildren[path] = treeRows(st, path, res.entries)
     } finally {
       delete st.treeLoading[path]
     }
@@ -323,6 +355,11 @@ export const useSftpStore = defineStore('sftp', () => {
     for (const key of Object.keys(st.treeLoading)) {
       if (key === path || key.startsWith(childPrefix)) delete st.treeLoading[key]
     }
+    // 文件总数与 treeChildren 同生命周期：留着它，「更多文件」那一行会在缓存已经丢掉之后
+    // 还挂在那儿（点进去才发现目录早就收起/删掉了）
+    for (const key of Object.keys(st.treeFileTotal)) {
+      if (key === path || key.startsWith(childPrefix)) delete st.treeFileTotal[key]
+    }
     st.expanded = st.expanded.filter((key) => key !== path && !key.startsWith(childPrefix))
   }
 
@@ -333,6 +370,11 @@ export const useSftpStore = defineStore('sftp', () => {
       if (key !== from && !key.startsWith(childPrefix)) continue
       st.treeChildren[`${to}${key.slice(from.length)}`] = st.treeChildren[key]
       delete st.treeChildren[key]
+    }
+    for (const key of Object.keys(st.treeFileTotal)) {
+      if (key !== from && !key.startsWith(childPrefix)) continue
+      st.treeFileTotal[`${to}${key.slice(from.length)}`] = st.treeFileTotal[key]
+      delete st.treeFileTotal[key]
     }
     st.expanded = st.expanded.map((key) =>
       key === from || key.startsWith(childPrefix) ? `${to}${key.slice(from.length)}` : key
@@ -355,7 +397,7 @@ export const useSftpStore = defineStore('sftp', () => {
     //
     // 树的根 `/` 不在这里拉：`ensure` 只回答「登录用户的家在哪」，而 `/` 那一层由
     // expandPath（首次定位到家目录时）按需拉——移动端根本没有树，不该替它多发一次 listing。
-    st.treeChildren[st.home || st.dir] = dirsOnly(st.entries)
+    st.treeChildren[st.home || st.dir] = treeRows(st, st.home || st.dir, st.entries)
   }
 
   /**
