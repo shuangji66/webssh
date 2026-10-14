@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"unicode/utf16"
+
+	"webssh/backend/internal/testssh"
 )
 
 // fsTestApp 起一个后端 + SSH 服务器，并在远端根目录里准备好几个文件。
@@ -909,5 +911,140 @@ func TestRemotePathKeepsSurroundingSpaces(t *testing.T) {
 	// 删除时也不能裁
 	if res, out := a.post(t, "/api/fs/remove", map[string]any{"sid": sid, "path": weird, "dir": true}); res.StatusCode != 200 {
 		t.Fatalf("删除带尾空格的目录失败：%d %v", res.StatusCode, out)
+	}
+}
+
+// TestFsRejectsNonRegularFiles 钉住「预览 / 读取 / 下载 / 编辑都只接受普通文件」。
+//
+// 为什么这不是文案问题：**读**打开一个 FIFO 会阻塞到有写者出现（POSIX 语义），而
+// withSFTP 整段持有 sftpMu——在没有这一道判断时，用户对 FIFO 点一次预览，这条会话的
+// 全部文件操作（列表 / 上传 / 下载 / 编辑）都会一起挂住，直到客户端断开连接。
+// io.LimitReader 只作用于 Read 阶段，救不了 Open。
+func TestFsRejectsNonRegularFiles(t *testing.T) {
+	a, sid := fsTestApp(t)
+	root := a.sshRoot
+	fifo := filepath.Join(root, "pipe.fifo")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Skipf("建 FIFO 失败（跳过）：%v", err)
+	}
+
+	// 四条路径都必须**立刻**回 invalid（没有这一道时它们会挂到客户端超时）
+	a.fail(t, "/api/fs/read", map[string]any{"sid": sid, "path": fifo}, "invalid", http.StatusBadRequest)
+	a.fail(t, "/api/fs/image", map[string]any{"sid": sid, "path": fifo}, "invalid", http.StatusBadRequest)
+	a.fail(t, "/api/fs/download", map[string]any{"sid": sid, "path": fifo}, "invalid", http.StatusBadRequest)
+	a.fail(t, "/api/fs/edit-load", map[string]any{"sid": sid, "path": fifo}, "invalid", http.StatusBadRequest)
+
+	// 这一道不能把正常文件与目录一起挡掉
+	if res, out := a.post(t, "/api/fs/read", map[string]any{"sid": sid, "path": filepath.Join(root, "hello.txt")}); res.StatusCode != http.StatusOK {
+		t.Fatalf("普通文件的预览被误挡：%d %v", res.StatusCode, out)
+	}
+	if res, raw := a.do(t, http.MethodPost, "/api/fs/download", map[string]any{"sid": sid, "path": filepath.Join(root, "docs")}, nil); res.StatusCode != http.StatusOK {
+		t.Fatalf("目录下载被误挡：%d %s", res.StatusCode, snippetOf(raw))
+	}
+
+	// 会话仍然可用：这一次卡死过的 SFTP 通道必须还能干活（既验证没被锁死，也验证没留下坏连接）
+	if res, out := a.post(t, "/api/fs/list", map[string]any{"sid": sid, "path": root}); res.StatusCode != http.StatusOK {
+		t.Fatalf("这一轮之后文件列表不可用：%d %v", res.StatusCode, out)
+	}
+}
+
+// TestFsUploadOverwriteKeepsMode 钉住「覆盖上传不改目标的权限位、也不绕过它的写保护」。
+//
+// 背景：overwrite=true 走的是「同目录临时文件 + rename」，而 rename 会换掉 inode——
+// 老实现（直接 O_TRUNC 写目标）虽然会在失败时毁掉原文件，但至少保留了 mode / 属主 / ACL。
+// 两者都要：mode 靠「覆盖前记下、rename 前设回临时文件」，写保护靠「覆盖前以 O_WRONLY
+// 打开一次」（判据与 edit-load 的写权限探测一致，因为 rename 只要求目录可写）。
+func TestFsUploadOverwriteKeepsMode(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("以 root 运行：权限位挡不住写入，跳过")
+	}
+	dir := permEnforcingDir(t)
+	if dir == "" {
+		t.Skip("找不到会执行权限位的文件系统：无法验证 mode 保持，跳过")
+	}
+	root, err := os.MkdirTemp(dir, "webssh-upload-mode-")
+	if err != nil {
+		t.Fatalf("建临时目录失败：%v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	a := newTestApp(t, appOptions{sshOptions: &testssh.Options{User: "demo", Password: "demo", Root: root}})
+	sid := a.newSSHSession(t)
+
+	// 一个带执行位的脚本：覆盖上传后必须还是 0755（否则脚本就废了）
+	script := filepath.Join(root, "run.sh")
+	writeLocal(t, script, "#!/bin/sh\necho old\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatalf("chmod 失败：%v", err)
+	}
+	if fi, err := os.Stat(script); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Skipf("这个文件系统不保留 mode（%v %v），跳过", fi, err)
+	}
+
+	if res, out := a.doUpload(t, sid, root, true, map[string]string{"run.sh": "#!/bin/sh\necho new\n"}); res.StatusCode != http.StatusOK {
+		t.Fatalf("覆盖上传失败：%d %v", res.StatusCode, out)
+	}
+	if got := readLocal(t, script); got != "#!/bin/sh\necho new\n" {
+		t.Fatalf("覆盖上传的内容不对：%q", got)
+	}
+	if fi, err := os.Stat(script); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Errorf("覆盖上传把执行位改掉了：%v %v（临时文件 + rename 会换 inode，必须在 rename 前把 mode 设回去）", fi.Mode().Perm(), err)
+	}
+	// 目录里不留临时文件
+	if entries, err := os.ReadDir(root); err == nil {
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".webssh-upload-") {
+				t.Errorf("覆盖上传后残留了临时文件：%s", e.Name())
+			}
+		}
+	}
+
+	// 只读文件（0444，目录可写）：覆盖上传必须被拒——rename 只要求目录可写，不探一次
+	// 目标文件的写权限就等于绕过了它自己的权限位。
+	locked := filepath.Join(root, "locked.conf")
+	writeLocal(t, locked, "original\n")
+	if err := os.Chmod(locked, 0o444); err != nil {
+		t.Fatalf("chmod 失败：%v", err)
+	}
+	// 错误码必须是 permission（不是 internal）：界面上要能说清「没有权限」，而不是一句内部错误
+	if res, out := a.doUpload(t, sid, root, true, map[string]string{"locked.conf": "hacked\n"}); res.StatusCode != http.StatusForbidden || out["code"] != "permission" {
+		t.Errorf("覆盖只读文件的响应 = %d %v，期望 403 permission", res.StatusCode, out)
+	}
+	if got := readLocal(t, locked); got != "original\n" {
+		t.Errorf("被拒绝的覆盖上传改了文件内容：%q", got)
+	}
+}
+
+// TestSniffImageTypeAVIFCompatibleBrands 钉住 AVIF 的识别口径：`avif` 出现在
+// compatible_brands 里（major brand 是别的）、以及 ftyp 盒自述长度不可信（0）的形态都要认。
+func TestSniffImageTypeAVIFCompatibleBrands(t *testing.T) {
+	build := func(major string, brands ...string) []byte {
+		out := []byte{0, 0, 0, 0, 'f', 't', 'y', 'p'}
+		out = append(out, major...)
+		out = append(out, 0, 0, 0, 0) // minor_version
+		for _, b := range brands {
+			out = append(out, b...)
+		}
+		size := uint32(len(out))
+		out[0], out[1], out[2], out[3] = byte(size>>24), byte(size>>16), byte(size>>8), byte(size)
+		return out
+	}
+
+	cases := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"major brand = avif", build("avif"), true},
+		{"avif 只在 compatible_brands", build("mif1", "avif"), true},
+		{"avis 序列（compatible_brands）", build("msf1", "avis"), true},
+		{"heic 不是 avif", build("heic", "heic", "mif1"), false},
+		{"长度自述为 0（到文件尾）", func() []byte { b := build("mif1", "avif"); b[0], b[1], b[2], b[3] = 0, 0, 0, 0; return b }(), true},
+		{"太短", []byte{0, 0, 0, 12, 'f', 't', 'y', 'p'}, false},
+	}
+	for _, tc := range cases {
+		if got := isAVIF(tc.data); got != tc.want {
+			t.Errorf("%s：isAVIF = %v，期望 %v", tc.name, got, tc.want)
+		}
 	}
 }

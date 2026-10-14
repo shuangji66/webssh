@@ -367,3 +367,48 @@ func TestDetectEOL(t *testing.T) {
 		}
 	}
 }
+
+// TestFsEditLargeSaveRoundTrip 钉住「能打开的就能保存」：1–4 MiB 的文件必须能改完存回去。
+//
+// 为什么要有这条：「编辑保存」的 body 里装的是编辑区**文本**（JSON 字符串），换行/引号会被
+// 转义成两个字节，而它以前和别的接口共用 1 MiB 的 body 上限（maxJSONBytes）——于是
+// 2 MiB 的文件能打开、却永远存不回去（用户只看到一句「请求体超过上限」，
+// 而 files_edit.go 里那条「保存的内容超过 maxReadBytes」的判断根本没机会执行）。
+// 下面这条用例同时还钉住了「超限的错误是从保存内容那一道报出来的」。
+func TestFsEditLargeSaveRoundTrip(t *testing.T) {
+	a, sid := fsTestApp(t)
+	root := a.sshRoot
+
+	// 2 MiB 的「每行都有内容」文本：既超过旧的 1 MiB body 上限，又远小于 4 MiB 的编辑上限，
+	// 而且换行密集（JSON 转义会把它放大到 ~2.1 MB），正是旧实现在第一行就拒绝的形态。
+	var sb strings.Builder
+	for i := 0; sb.Len() < 2<<20; i++ {
+		fmt.Fprintf(&sb, "key%05d=value\n", i)
+	}
+	content := sb.String()
+	big := filepath.Join(root, "large.conf")
+	if err := os.WriteFile(big, []byte(content), 0o644); err != nil {
+		t.Fatalf("写大文件失败：%v", err)
+	}
+
+	loaded := editLoad(t, a, sid, big)
+	if strOf(loaded, "content") != content {
+		t.Fatalf("大文件读回来的内容不完整：%d 字节 vs %d 字节", len(strOf(loaded, "content")), len(content))
+	}
+	// 改一行再存：a.ok 内部在失败时直接 Fail，所以这条断言就是「保存真的成功了」
+	edited := strings.Replace(content, "key00000=value", "key00000=edited", 1)
+	editSave(t, a, sid, loaded, edited)
+	if got := string(readLocalBytes(t, big)); got != edited {
+		t.Fatalf("大文件保存后的内容不对（长度 %d vs %d）", len(got), len(edited))
+	}
+
+	// 超过编辑上限（4 MiB）仍然回 too_large，而且必须是从「保存的内容」这一道报出来的
+	// （body 上限已经放到 8 MiB+，所以这次真的走得到那条判断）。
+	out := a.fail(t, "/api/fs/edit-save", map[string]any{
+		"sid": sid, "path": big, "content": strings.Repeat("a", int(maxReadBytes)+1),
+		"encoding": encodingUTF8, "eol": eolLF,
+	}, "too_large", http.StatusRequestEntityTooLarge)
+	if msg := strOf(out, "error"); !strings.Contains(msg, "保存的内容") {
+		t.Errorf("超限错误不是从「保存的内容」这一道报出来的：%q", msg)
+	}
+}

@@ -11,7 +11,7 @@
 //
 // 「不保存凭据」的会话会在这里收到 `credential_required`（契约 11.1.3）：那不是失败，
 // 而是「请先输入凭据」，所以转成 CredentialPromptDialog，填完带凭据重试一次。
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, describeError, type SessionView } from '@/serverapi'
 import { HOME_TAB_ID, useAppTabsStore } from '@/stores/appTabs'
@@ -83,6 +83,10 @@ watch(
   ([ids, visible]) => sessionStats.sync(ids, visible),
   { immediate: true }
 )
+
+// 卸载即停表：这一页当前是常驻挂载（`v-show`），但定时器不该依赖「组件永不卸载」这个前提——
+// 一旦将来改成 `v-if`，没有这一句就是后台每 5 秒一条远程命令。
+onBeforeUnmount(() => sessionStats.dispose())
 
 // ---------- 打开 / 关闭 ----------
 
@@ -389,7 +393,7 @@ async function onDelete(session: SessionView) {
       :visible="pending !== null"
       :title="confirmTitle"
       :message="confirmMessage"
-      :danger="pending?.kind === 'delete'"
+      :danger="true"
       :confirm-text="pending?.kind === 'delete' ? t('common_delete') : t('home_close')"
       :cancel-text="t('common_cancel')"
       @confirm="onConfirmPending"

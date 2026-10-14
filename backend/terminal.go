@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -487,6 +488,59 @@ type terminalHandler struct {
 	mux *AdminMux
 }
 
+// originAllowed 判断一次 WebSocket 握手的 Origin 能不能放行（挡 CSWSH）。
+//
+// 判据是「Origin 的 host:port 与本次请求的 Host 一致」：
+//   - 浏览器发起的 WebSocket 一定会带 Origin，而**跨站页面改不了它**（也不给 WebSocket 加
+//     自定义请求头），所以恶意页面拿不到一条「Origin 看起来像本站」的连接；
+//   - 反代改写 Host（nginx 的 `proxy_set_header Host` 不保证原样转发）时，再看它带过来的
+//     `X-Forwarded-Host`——那个头只有代理能加，浏览器里的脚本加不了。
+//
+// **没有 Origin 时直接放行**（调用方只在 Origin 非空时问这里）：curl / websocat 这类客户端
+// 不带它，而本服务的入口只有 unix socket + 网关，能连上它的进程本来就在同一台机器上
+// （AGENTS 第 1 节）。CSWSH 一定发生在浏览器里，所以这条例外不构成绕过。
+func originAllowed(origin string, r *http.Request) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	oHost, oPort := hostPortOf(u.Host, u.Scheme)
+	if oHost == "" {
+		return false
+	}
+	if h, p := hostPortOf(r.Host, u.Scheme); h == oHost && p == oPort {
+		return true
+	}
+	// X-Forwarded-Host 可能是 "a, b" 这种列表形式（多级代理）。
+	for _, raw := range r.Header.Values("X-Forwarded-Host") {
+		for _, part := range strings.Split(raw, ",") {
+			if h, p := hostPortOf(part, u.Scheme); h == oHost && p == oPort && h != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hostPortOf 把 "host[:port]" 归一成 (host, port)：大小写不敏感、IPv6 方括号去掉，
+// 缺端口时按 scheme 补默认端口（否则 `https://nas` 与 `Host: nas` 会被判成不一致）。
+func hostPortOf(authority, scheme string) (string, string) {
+	h := strings.ToLower(strings.TrimSpace(authority))
+	host, port, err := net.SplitHostPort(h)
+	if err != nil {
+		host, port = h, ""
+	}
+	if port == "" {
+		switch strings.ToLower(scheme) {
+		case "https", "wss":
+			port = "443"
+		case "http", "ws":
+			port = "80"
+		}
+	}
+	return strings.Trim(host, "[]"), port
+}
+
 func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -502,6 +556,13 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// 任意字符串并照它算 Accept，非标准客户端可以完成握手（真实客户端永远满足这条）。
 	if raw, err := base64.StdEncoding.DecodeString(key); err != nil || len(raw) != 16 {
 		http.Error(w, "Sec-WebSocket-Key 不是 16 字节的 base64", http.StatusBadRequest)
+		return
+	}
+	// Origin 校验（挡 CSWSH：恶意页面借受害者的浏览器直连本服务开终端）。见 originAllowed。
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !originAllowed(origin, r) {
+		logx.Warnf("拒绝来源不明的 WebSocket 握手：Origin=%q Host=%q X-Forwarded-Host=%q",
+			origin, r.Host, r.Header.Get("X-Forwarded-Host"))
+		http.Error(w, "Origin 与本次请求的主机不一致", http.StatusForbidden)
 		return
 	}
 

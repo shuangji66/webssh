@@ -11,6 +11,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { describeError } from '@/serverapi'
 import { useAppTabsStore, type AppTab } from '@/stores/appTabs'
+import { useFileEditorStore } from '@/stores/fileEditor'
 import { useHomeStore } from '@/stores/home'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
@@ -22,6 +23,7 @@ import PromptDialog from './PromptDialog.vue'
 const tabs = useAppTabsStore()
 const home = useHomeStore()
 const terminals = useTerminalsStore()
+const fileEditor = useFileEditorStore()
 const toast = useToastStore()
 
 function labelOf(sid: string): string {
@@ -144,9 +146,15 @@ const confirmMessage = ref('')
 function askClose(sids: string[]) {
   if (!sids.length) return
   pendingSids.value = sids
-  confirmMessage.value = t('home_close_confirm_msg', {
+  let message = t('home_close_confirm_msg', {
     name: sids.map(labelOf).join(' / ')
   })
+  // 编辑页里未保存的内容也会在这一下被丢掉（home.forgetSession → fileEditor.forget）：
+  // 只说「终端子标签与 SFTP 连接会被终止」的话，用户不会想到那份还没保存的正文。
+  if (sids.some((sid) => fileEditor.isDirty(sid))) {
+    message += '\n' + t('files_editor_close_warning')
+  }
+  confirmMessage.value = message
   confirmVisible.value = true
 }
 

@@ -105,6 +105,12 @@ func (m *AdminMux) handleFsDownload(w http.ResponseWriter, r *http.Request) *api
 			return err
 		}
 		// 普通文件：流式发正文（Content-Length 已知，中途断开浏览器会发现文件不完整）。
+		//
+		// 「普通文件」是字面意思：FIFO / 设备节点不能 Open（读打开一个 FIFO 会阻塞到有写者
+		// 出现，而这条请求整段持着 sftpMu，会把整个文件管理一起卡住，见 errNotRegularFile）。
+		if !fi.Mode().IsRegular() {
+			return errNotRegularFile
+		}
 		file, err = sess.client.Open(target)
 		if err != nil {
 			return err
@@ -180,6 +186,12 @@ func zipRemoteTree(ctx context.Context, c *sftp.Client, root string, w io.Writer
 			}
 			if info.Mode()&os.ModeSymlink != 0 {
 				logx.Warnf("打包下载：跳过符号链接 %s", full)
+				continue
+			}
+			// 设备节点 / 管道 / socket 同样跳过：读打开一个 FIFO 会阻塞到有写者出现，
+			// 而整段打包持着 sftpMu（见 errNotRegularFile）。
+			if !info.Mode().IsRegular() {
+				logx.Warnf("打包下载：跳过非普通文件 %s（设备 / 管道 / socket）", full)
 				continue
 			}
 			src, err := c.Open(full)

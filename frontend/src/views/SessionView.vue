@@ -288,6 +288,22 @@ function confirmCloseTerm() {
   closeUid.value = null
   // closeTab 内部会发 /api/terminals/close（远程 shell 就此终止）并把激活项挪到邻近标签
   if (uid) terminals.closeTab(props.sid, uid)
+  // 确认框的按钮是刚被卸载的那个：焦点会掉回 body，用户接着敲的键全丢。
+  // 关闭后激活项会挪到邻近标签（面板自己会聚焦），这一句是给它兜底。
+  const next = terminals.activeOf(props.sid)?.uid
+  if (next) focusTermSoon(next)
+}
+
+/**
+ * 取消 / 点遮罩：什么都没关，焦点必须还给原来那个终端。
+ *
+ * 与 confirmCloseTerm 同一条 AGENTS 约束（第 5 节）：焦点留在按钮上时，用户接着敲的空格/回车
+ * 会去「再按一次按钮」——这里是「再关一次终端」，比多点一次「+」更让人摸不着头脑。
+ */
+function cancelCloseTerm() {
+  const uid = closeUid.value
+  closeUid.value = null
+  if (uid) focusTermSoon(uid)
 }
 
 const closeTitle = computed(() => {
@@ -757,7 +773,7 @@ function onRenamed(value: string) {
       :confirm-text="t('common_close')"
       :cancel-text="t('common_cancel')"
       @confirm="confirmCloseTerm"
-      @cancel="closeUid = null"
+      @cancel="cancelCloseTerm"
     />
 
     <PromptDialog

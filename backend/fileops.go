@@ -12,6 +12,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/logx"
 )
 
 // ---------------------------------------------------------------------------
@@ -245,6 +246,13 @@ func copyRemoteEntry(ctx context.Context, c *sftp.Client, src, dest string, budg
 		return 0, c.Symlink(target, dest)
 	}
 	if !fi.IsDir() {
+		// 设备节点 / 管道 / socket **跳过**（与软链接同一个口径，理由不同）：读打开一个 FIFO
+		// 会阻塞到有写者出现，而整条操作持着 sftpMu——复制一棵含 FIFO 的目录会把整个文件管理
+		// 一起卡住（见 errNotRegularFile）。跳过 + 记日志，让复制把其余部分做完。
+		if !fi.Mode().IsRegular() {
+			logx.Warnf("复制：跳过非普通文件 %s（设备 / 管道 / socket）", src)
+			return 0, nil
+		}
 		return copyRemoteFile(ctx, c, src, dest, fi, budget)
 	}
 

@@ -104,6 +104,10 @@
   4 MiB、`resize` 行列 1–1000。客户端给的长度字段直接决定内存分配，没有上限就是一个
   客户端打爆进程（进程承载全部会话）的入口。
 - 控制帧不走 PTY：`\x1b]resize;<cols>;<rows>\x07`、`\x1b]ping\x07`。
+- 握手要校验 `Origin`（`originAllowed`）：跨站页面借受害者浏览器直连本服务开终端（CSWSH）是
+  真实存在的攻击面，而浏览器**改不了** `Origin`、也加不了自定义头。判据是 Origin 的
+  `host:port` 等于本次请求的 `Host`；反代改写 Host 时接受 `X-Forwarded-Host`（只有代理能加）。
+  没有 Origin 的请求放行（curl / websocat；入口只有 unix socket + 网关）。
 - 「会话/终端不存在」要附 `\x1b]gone\x07` 控制帧，前端**只认这个**——
   用人类可读文本（如 `session not found`）判定会被终端里 `echo` 出来的同样文本误判。
 
@@ -117,8 +121,25 @@
   在目标目录下按相对路径建目录。**不要**直接取 `path.Base`（目录上传会被拍平）。
 - 目录下载：先打成临时 zip 再发正文——响应头一旦发出就没法再报错，半截 zip 会让用户以为
   下载成功（参考项目的注释里记着这个坑）。
+- 覆盖上传（`overwrite=true`）走「同目录临时文件 + rename」：它保住了「写失败不毁原文件」，
+  但 rename 换 inode，所以**必须**在 rename 前把原 mode 设回临时文件（`restoreRemoteMode`），
+  并且覆盖前以 `O_WRONLY` 探一次目标的写权限（`writableTargetMode`，判据同 `edit-load`）——
+  否则只要求目录可写，等于绕过目标文件自己的权限（0444 也能被替换）。属主 / ACL / xattr
+  用 SFTP v3 恢复不了，是这条路径的已知取舍，见 CONTRACT 28.1。
+- **只接受普通文件**：预览（`fs/read`）、图片（`fs/image`）、下载的单文件分支在 `Stat` 之后
+  必须显式拒绝设备节点 / 管道 / socket（`errNotRegularFile` → `invalid`）；**读**打开一个 FIFO
+  会阻塞到有写者出现，而 `withSFTP` 整段持 `sftpMu`——点一次预览就能把整个文件管理卡住。
+  zip / 复制 / 导出这三条「整棵树」的路径对这类条目是跳过 + 记日志（与软链接同一个口径）。
 - `upload-from-nas` 的 `source` 是本机路径，来自前端用 `@trimjs/web-app` 选中的**已授权**文件；
   读之前尽量用 `trim.file.checkUserACL` 判读权限（飞牛不可用时跳过并记日志）。
+
+**系统信息轮询（`backend/stats.go`）**
+
+- `execOn` 返回的 `remoteResult`：**`Code < 0` 表示对端没回 exit-status**（连接在命令执行中断开），
+  输出可能是半截的——`stats()` 必须按失败处理并 `dropStatsClient`（`statsUsable()`），
+  否则会回一份「只有一半字段但 `available=true`」的读数，而且死连接留在缓存里。
+  **正的非零退出码照常解析**：非 Linux 远端 `cat /proc/stat` 失败就是 1，那份输出里的 df 段仍有用。
+- `/proc/stat` 的聚合行只累加**前 8 个字段**：`guest` / `guest_nice` 已含在 `user` / `nice` 里。
 
 **凭据与远程命令（`credentials.go` / `remote_exec.go` / `fileops.go` / `archive.go` / `exportnas.go`）**
 
@@ -312,6 +333,11 @@
     **先** `POST /api/fs/edit-load`（后端以本会话的**登录用户**身份 `O_WRONLY` 打开一次做写权限
     探测），成功之后才切到文件管理子标签并打开编辑页；失败只 toast、**不切标签页、不进编辑页**。
     没有权限时的表现必须是「拒绝修改」（`permission`），不是一句 internal。
+  - ⚠️ **store 里的编辑内容一律是 LF**（`toEditorText`，载入 / 还原时归一化）：`<textarea>` 的
+    `value` 按 HTML 规范会把 CRLF 换成 LF，store 里留着 `\r` 就是两个坐标系——命中表的下标、
+    `setSelectionRange` 的选区、`selectionStart` 与命中表的比较全都差「前面出现过多少个 CRLF」。
+    症状是「查找」高亮每行左偏一个字符（第 100 行偏 100 个），最严重的是在错位的选区上打字
+    会改到**另一处字符**。写回时的 CRLF 由后端的 `encodeForSave` 按 `eol` 还原。
   - 编辑页由 `FileManager` 以 `absolute inset-0` **覆盖**在文件管理页面上（文件管理器保持挂载）；
     进入与退出**都不动文件管理器的状态**（不导航、不换视图）——「退出后回到进入时的状态」
     靠的就是「从头到尾没碰它」，从目录树进来时也不会被带到被编辑文件所在的目录去。

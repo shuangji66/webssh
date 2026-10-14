@@ -333,6 +333,7 @@ export const zh: Record<string, string> = {
   files_editor_load_failed: '打开编辑器失败：{error}',
   files_editor_exit_confirm: '有未保存的修改，退出会丢弃这些修改。',
   files_editor_revert_confirm: '还原会丢弃未保存的修改，并重新从远程读取文件内容。',
+  files_editor_close_warning: '编辑页里有未保存的修改，关闭会话会一并丢弃。',
   files_tree_more_files: '···更多文件',
   files_tree_more_files_hint: '还有 {n} 个文件未显示，点击在文件管理里打开这个目录',
   files_symlink: '符号链接',

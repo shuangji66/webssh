@@ -487,11 +487,14 @@ function filenameFrom(path: string, disposition: string | null): string {
  *
  * 调用方拿到 blob 后要 `URL.createObjectURL` 并**负责 revoke**（见 PreviewDialog）。
  */
-export async function fetchImageBlob(sid: string, path: string): Promise<Blob> {
+export async function fetchImageBlob(sid: string, path: string, signal?: AbortSignal): Promise<Blob> {
   const res = await fetch(apiURL('/api/fs/image'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sid, path })
+    body: JSON.stringify({ sid, path }),
+    // 可选取消：弹窗关掉 / 换文件时把还在飞的请求掐掉（一张 4 MiB 的图不必白传完，
+    // 后端的 SFTP 也会因为 ctx 结束立刻收手）。
+    signal
   })
   if (!res.ok) {
     const body = (await parseBody(res)) as Record<string, unknown> | null
@@ -627,7 +630,7 @@ export const api = {
    * `text` 为 false 表示后端判定这不是能展示的文本（二进制 / 认不出的编码），此时
    * `content` 是空串；`encoding` 是认出来的编码（utf-8 / utf-16le / utf-16be，认不出为空）。
    */
-  fsRead: (sid: string, path: string) =>
+  fsRead: (sid: string, path: string, signal?: AbortSignal) =>
     request<{
       ok: boolean
       size: number
@@ -635,7 +638,7 @@ export const api = {
       tooLarge: boolean
       content: string
       encoding: string
-    }>('/api/fs/read', { json: { sid, path } }),
+    }>('/api/fs/read', { json: { sid, path }, signal }),
 
   /**
    * 打开编辑器（契约 26.2）：先验证**本会话的登录用户**能不能改这个文件，再回内容。

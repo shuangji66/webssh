@@ -39,8 +39,9 @@
 | `WEBSSH_TRIM_SOCKET` | `/var/run/trim_open_gateway_apiscope.socket` | 飞牛开放 API 网关 |
 | `WEBSSH_TRIM_APP` | `WebSSH` | 调开放 API 时带的 appName |
 
-- 进程启动顺序（照 terminal 的教训）：准备数据目录 → 检查 socket 是否已被占用（是则退出）
-  → **先绑定 socket 成功再进信号等待**（绑定失败即退出，不要「活着但没有 socket」）→ 收到
+- 进程启动顺序（照 terminal 的教训）：**先检查 socket 是否已被占用**（是则直接退出，且这一步刻意
+  排在准备数据目录之前：`newAdminMux` 会建 master.key、读写会话配置，让一个注定要退出的实例先碰
+  一遍数据目录纯属多余）→ 准备数据目录 → **先绑定 socket 成功再进信号等待**（绑定失败即退出，不要「活着但没有 socket」）→ 收到
   SIGTERM/SIGINT/SIGQUIT 后：先 `srv.Close()` 停入口 → 终止所有终端与 SFTP → 删除 socket
   **但保留数据目录**（会话配置必须活过重启）。
 - `bootID`：每次进程启动生成一个随机 id，经 `/api/info` 的 `bootId` 下发。前端据此判断
@@ -69,10 +70,12 @@
 | `admin_routes.go` | 路由表（路径 → handler）与 WebSocket 升级判定 |
 | `static.go` | SPA 回退、缓存头三分类、base href 注入、unix socket 绑定、网关身份 |
 | `sftp.go` | SFTP 会话生命周期、远程路径校验、SFTP 错误映射 |
-| `files.go` | 文件列表与信息（list / info） |
+| `files.go` | 文件列表与信息（list / info，含属主名字的会话内缓存） |
 | `files_write.go` | 新建文件 / 新建目录 / 重命名 / 删除 |
 | `files_upload.go` | 上传（本地文件、目录、飞牛文件） |
-| `files_download.go` | 下载（含目录打包 zip）与文本读取 |
+| `files_download.go` | 下载（单文件流 / 目录打包 zip） |
+| `files_preview.go` | 预览：`/api/fs/read` 的文本判定（UTF-8 / UTF-16）与 `/api/fs/image` 的图片白名单 |
+| `files_edit.go` | 编辑：`/api/fs/edit-load`（写权限探测）与 `/api/fs/edit-save`（按原编码 / BOM / 换行写回） |
 | `fileops.go` | 复制 / 移动 |
 | `archive.go` | 压缩 / 解压 |
 | `exportnas.go` | 导出至飞牛共享目录 |
@@ -98,8 +101,10 @@
 
 - **不要引入除 `golang.org/x/crypto`、`github.com/pkg/sftp` 之外的第三方依赖**（testify 只允许出现在测试里且需 `go mod tidy` 认可）。
 - 单文件大小/请求体/帧大小上限必须有（进程承载全部会话，一个客户端就能打爆内存）：
-  上传整体上限 1 GiB（`http.MaxBytesReader`）、JSON 体 1 MiB、WS 单帧 1 MiB / 单消息 4 MiB、
-  `resize` 行列 ≤ 1000、历史读取上限 4 MiB。
+  上传整体上限 1 GiB（`http.MaxBytesReader`）、JSON 体 1 MiB（**唯一例外**：`/api/fs/edit-save` 走
+  `maxEditBodyBytes = 2×maxReadBytes + 64 KiB`，因为 body 里装的是要写回文件的文本，见 26.2）、
+  WS 单帧 1 MiB / 单消息 4 MiB、`resize` 行列 ≤ 1000、历史读取上限 4 MiB、文本/图片预览 4 MiB、
+  `upload-from-nas` 单文件 1 GiB、服务端搬运（复制 / 导出）4 GiB、压缩条目数 2000。
 - 所有远程调用都要带超时或上下文取消（用户关页面/点取消时 `r.Context()` 会结束）。
 
 ---
@@ -202,7 +207,7 @@ data/
 | POST | `/api/fs/remove` | `{sid, path, dir}` | `{ok}`（dir 必须与真实类型一致，防止误删整棵树） |
 | POST | `/api/fs/copy` | `{sid, paths:[], toDir}` | `{ok, files:[{path,size}], skipped}`（同名**跳过**，不覆盖） |
 | POST | `/api/fs/move` | `{sid, paths:[], toDir}` | 同上（跨设备无法 rename → `conflict`，绝不静默降级成复制+删除） |
-| POST | `/api/fs/compress` | `{sid, paths:[], name?}` | `{ok, archive:{path,size,dir}}`（tar.gz / zip，产物在**远程**归档目录） |
+| POST | `/api/fs/compress` | `{sid, paths:[], name?, format?}`（`format` = `tar.gz`(默认) / `zip`） | `{ok, archive:{path,size,dir}}`（产物在**远程**归档目录） |
 | POST | `/api/fs/extract` | `{sid, path}` | `{ok, dir}` |
 | POST | `/api/fs/export-to-nas` | `{sid, path, overwrite?}` | `{ok, export:{path,size,files}}` |
 | POST | `/api/fs/upload` | multipart：`sid`、`path`(目标目录)、`overwrite`、`files[]` | `{ok, files:[{path,size}], skipped}` |
@@ -214,7 +219,7 @@ data/
 | POST | `/api/fs/edit-save` | `{sid, path, content, encoding, bom, eol}` | `{ok, size}`（按原编码 / BOM / 换行写回；见 26.2） |
 | POST | `/api/quickcmds/list` | `{sid}`（空 = 全局） | `{ok, scope, commands:[QuickCmd]}` |
 | POST | `/api/quickcmds/save` | `{sid, commands:[QuickCmd]}` | `{ok, scope, commands}` |
-| GET | `/api/trim/status` | — | `{ok, trim:{available, message, app}}` |
+| GET | `/api/trim/status` | — | `{ok, trim:{available, message, app}}`（handler 里也校验了方法） |
 | POST | `/api/trim/acl` | `{paths:[...]}` | `{ok, list:[AclEntry]}` |
 
 任何未命中的路径回退到 `index.html`（SPA 前端路由），但 `/api/*` 未命中要回 404 JSON。
@@ -238,7 +243,7 @@ SessionStats { available, reason?, cpuPercent?, memUsed?, memTotal?, diskPercent
              // 卡片上的系统信息，见 23。available=false = 远端读不出来（不是 Linux），
              // 各字段互相独立（没有 /proc 的机器可能只给 diskPercent）；
              // 单位：内存是字节，两个 percent 是 0–100 的数（不是字符串）；
-             // cpuCount = 在线核数（负载的颜色按 load1 ÷ cpuCount 判，见 23.6）
+             // cpuCount = 在线核数（负载的颜色按 load1 ÷ cpuCount 判，见 24.1）
 FsEntry      { name, path, dir, size, mode, mtime, symlink?, broken? }  // path 是绝对路径
 FsInfo       FsEntry + { uid, gid, owner?, group?, dirCount, fileCount, countError? }
              // 见 15.5 / 17.7：owner/group 是远端 `id` 查出来的名字，查不到就没有（界面显示数字）
@@ -354,7 +359,9 @@ frontend/src/
 │   ├── toast.ts                [D]    轻提示
 │   ├── terminals.ts            [B]    会话内终端子标签
 │   ├── paneControls.ts         [B]    终端命令出口（按 sid+uid 登记）
-│   └── sftp.ts                 [C]    SFTP 文件浏览状态
+│   ├── sftp.ts                 [C]    SFTP 文件浏览状态（含目录树的文件截断与总数）
+│   ├── sessionStats.ts         [D]    卡片上的系统信息（5 秒轮询，见 23）
+│   └── fileEditor.ts           [C]    文件编辑页状态（按 sid 分片，见 26.3）
 ├── trim/sdk.ts                 [C]    @trimjs/web-app 薄封装（选飞牛文件）
 ├── components/
 │   ├── AppTabBar.vue           [D]    顶栏标签条（首页固定 + 会话标签）
@@ -374,7 +381,10 @@ frontend/src/
 │   ├── files/BreadcrumbBar.vue    [C] 左栏面包屑（只有「刷新」与「隐藏面包屑」两个按钮）
 │   ├── files/InfoDialog.vue       [C] 「信息」弹窗（/api/fs/info，见 15.5）
 │   ├── files/UploadDialog.vue     [C] 上传弹窗（本地文件 / 本地目录 / 飞牛文件）
-│   └── files/PreviewDialog.vue    [C] 文本预览（可选，用 /api/fs/read）
+│   ├── files/PreviewDialog.vue    [C] 预览：图片走 /api/fs/image、文本走 /api/fs/read（见 25）
+│   ├── files/FileEditor.vue       [C] 编辑页（覆盖在文件管理面板上，见 26.3 / 27）
+│   ├── files/fileKind.ts          [C] 按扩展名判「预览用哪种界面 / 能不能编辑 / 能不能解压」
+│   └── home/SessionCard.vue       [D] 大号会话卡片（含两行系统信息）
 └── views/
     ├── HomeView.vue            [D]    会话卡片网格（只平铺）
     └── SessionView.vue         [D]    左栏（面包屑 + 文件树）+ 子标签栏 + 面板
@@ -410,6 +420,10 @@ useHomeStore(): {
   openSession(id: string): Promise<SessionState>
   closeSession(id: string): Promise<void>
   loadInfo(): Promise<void>
+  runtime: RuntimeInfo | null             // 运行信息（归档目录 / 导出目标）
+  renameSession(id: string, name: string): Promise<SessionView>   // **唯一**改名入口（只发 {id,name}）
+  forgetSession(sid: string): void        // 摘掉前端状态（appTabs/terminals/sftp/fileEditor/sessionUi）
+  handleTerminalGone(sid: string, uid: string): void   // 后端说这个终端没了（\x1b]gone\x07）
   watchBackendRestart(): void             // WS 掉线后探测后端是否换了进程
   restore(): Promise<string[]>            // 启动时：把后端仍在运行的会话恢复成应用标签，返回 sid 列表
 }
@@ -429,6 +443,8 @@ useTerminalsStore(): {
   setStatus(sid: string, uid: string, status: TermStatus): void
   setTitle(sid: string, uid: string, title: string): void
   titleOf(sid: string, tab: TermTab): string
+  setActive(sid: string, uid: string): void       // **切子标签只走它**（同时写 sessionUi，见 15.4）
+  lastActiveOf(sid: string): TermTab | null       // 导航目标（切回哪个终端）；不是「指令发给谁」
   closeTab(sid: string, uid: string): void
   forget(sid: string): void
 }
@@ -446,10 +462,12 @@ interface PaneControls { paste(): void; clear(): void; reconnect(): void; search
 export interface SftpState { dir: string; home: string; entries: FsEntry[]; loading: boolean;
                              error: string; back: string[]; forward: string[]; view: 'list'|'grid';
                              mode: PermMode; sort: SortState; multi: boolean;
-                             treeChildren: Record<string, FsEntry[]>; expanded: string[];
+                             treeChildren: Record<string, FsEntry[]>;
+                             treeFileTotal: Record<string, number>;   // 每个目录的文件总数（树只列前 20 个）
+                             expanded: string[];
                              treeLoading: Record<string, boolean>; selected: string[] }
-// PermMode = 'symbolic'|'numeric'（权限列显示模式，点表头「权限」切换）
-// SortState = { key: 'name'|'size'|'mtime'|'mode'; asc: boolean }
+// PermMode = 'symbolic'|'octal'（权限列显示模式，点表头「权限」切换；localStorage 里存的也是 'octal'）
+// SortState = { key: 'name'|'size'|'mtime'|null; dir: 'asc'|'desc' }（null = 不排序，回到服务端顺序）
 useSftpStore(): {
   stateOf(sid: string): SftpState
   ensure(sid: string): Promise<void>            // 首次进入：定位家目录并加载
@@ -481,7 +499,7 @@ useSftpStore(): {
   compress(sid: string, paths: string[], format: 'tar.gz'|'zip', name?: string): Promise<ArchiveInfo>
   extract(sid: string, path: string): Promise<string>
   exportToNas(sid: string, path: string, overwrite: boolean): Promise<ExportInfo>
-  // 树 / 运行信息
+  // 树 / 运行信息（TREE_FILE_LIMIT = 20：每个目录只列前 20 个文件，见 26.4）
   expandPath(sid: string, path: string): Promise<void>
   refreshTree(sid: string, path: string): Promise<void>
   runtime(sid: string): RuntimeInfo | null; ensureRuntime(sid: string): Promise<void>
@@ -535,9 +553,10 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 | `TerminalPane.vue` [B] | `{ sid: string; tab: TermTab; active: boolean }` | — | 自己登记 paneControls、自己管 WS 与 xterm；**不负责**子标签栏 |
 | `KeypadBar.vue` [B] | `{ ctrl: boolean; alt: boolean; shift: boolean }` | `key(data)`, `toggle('ctrl'\|'alt'\|'shift')` | 与 terminal 项目一致 |
 | `FileManager.vue` [C] | `{ sid: string; mobile?: boolean }` | — | 完整文件管理面板；内部自己发起上传/下载/删除等 |
-| `FileTree.vue` [C] | `{ sid: string; mobile?: boolean }` | — | 左栏文件树；点目录 = 导航（**不切**文件管理子标签，见 11.3）。动作全部直接落 store |
+| `FileTree.vue` [C] | `{ sid: string }` | — | 左栏文件树（目录 + 每个目录前 20 个文件）；点目录 = 只更新当前目录并展开（**不切**子标签，见 11.3），点文件 = 预览。只有一个调用方且只在宽屏渲染，所以没有 `mobile` prop |
 | `BreadcrumbBar.vue` [C] | `{ sid: string }` | — | 左栏面包屑；只有「刷新」「隐藏面包屑」两个按钮（18.1 删掉了「完整文件管理」） |
 | `UploadDialog.vue` [C] | `{ visible: boolean; sid: string; dir: string }` | `update:visible(v)`, `done(UploadResult)` | 三个分组：本地文件 / 本地目录 / 飞牛文件 |
+| `PreviewDialog.vue` [C] | `{ visible: boolean; sid: string; path: string; size?: number }` | `update:visible(v)`, `edit(path)` | 图片 / 文本两种模式；`size` 是列表里已知的体积（图片超限时用它把话说清楚）；`edit` 由调用方决定怎么进编辑页 |
 | `ConfirmDialog.vue` [D] | `{ visible, title, message, confirmText?, cancelText?, danger? }` | `confirm()`, `cancel()`, `update:visible(v)` | 通用确认框 |
 | `PromptDialog.vue` [D] | `{ visible, title, label?, placeholder?, initialValue?, confirmText?, cancelText? }` | `confirm(value: string)`, `cancel()`, `update:visible(v)` | 通用输入框（重命名 / 新建） |
 | `SessionFormDialog.vue` [D] | `{ visible: boolean; session?: SessionView \| null }` | `update:visible(v)`, `saved(s: SessionView)` | 新增/编辑 + 测试连接 + 首次信任指纹 |
@@ -547,8 +566,10 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 
 - **应用级标签**：`首页`固定不可关；每个「已打开」的会话一个标签。标签标题默认 `user@host`，
   双击可重命名（本地持久化到 store；会话标签标题同时写入 `appTabs`）。关闭会话标签 =
-  `home.closeSession(id)`（终止该会话全部终端 + SFTP）→ 关标签 → `terminals.forget(sid)`、
-  `sftp.forget(sid)`、`sessionUi.forget(sid)`。**带会话的标签关闭前必须确认**。
+  `home.closeSession(id)`（终止该会话全部终端 + SFTP）→ 关标签 → `home.forgetSession(sid)`
+  （内部依次 `appTabs.close` / `terminals.forget` / `sftp.forget` / `fileEditor.forget` /
+  `sessionUi.forget`）。**带会话的标签关闭前必须确认**；编辑页里有未保存的内容时，确认文案
+  会追加一句提醒（第十八轮）。
 - **打开会话**：`home.openSession(id)` → 无条件 `appTabs.openSession(id, label)` →
   `terminals.ensure(sid, state)` → 没有任何终端标签就自动建 1 个：`terminals.add(sid)`。
   **桌面与窄屏一致**（第五轮改的，见 15.3：手机上新开会话也直接落在「终端 1」）。
@@ -576,7 +597,8 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   卡片显示：会话名 / `user@host:port` / 备注 / 「不保存凭据」提醒 / **内联的子终端列表**
   （点一行 = 快捷打开）。**不再有**认证方式徽标、打开状态灯、打开时间与最近使用时间
   （15.2/16.2 删的，见 16.2）。操作：打开（或关闭）、编辑、删除。已打开时「关闭」按钮要显眼。
-- **终端面板工具栏**（桌面端在子标签栏右侧，移动端第二行）：搜索 / 粘贴 / 清屏 / 重连 /
+- **终端面板工具栏**（桌面端在子标签栏右侧，移动端第二行；**没有设置按钮**，设置只在首页工具条上）：
+  搜索 / 粘贴 / 清屏 / 重连 /
   快捷指令 / 设置 + 折叠功能名按钮（沿用 terminal 的 `labelsOn` 行为）。
 - 移动端：底部辅助键条（`KeypadBar`，仅移动端布局渲染）；虚拟键盘跟随（`--vvh/--vvt`）；
   弹窗用 `.region-center` 定位带。
@@ -611,7 +633,7 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   时要顺带看一眼 skip 数，别把「没跑」当成「跑过了」。
 - 前端：`make check`（= `vue-tsc` + `check:i18n`）无错误；`make dev` 能成功产出 `./webssh`。
   **完整门禁是 `make test check`**。
-- i18n key 数：**以 `npm run check:i18n` 的实际输出为准（当前 zh/en 各 399）**。下面各轮小节
+- i18n key 数：**以 `npm run check:i18n` 的实际输出为准（当前 zh/en 各 438）**。下面各轮小节
   括号里的 key 数是**那一轮当时的快照**，有增有删、不保证单调，不要拿它当基准（历史上有
   396/397/398/400/402 几个数字并存）。
 - 端到端（Lead 负责）：用 `testssh` 起一个本地 SSH/SFTP 服务，走完整流程——建会话 → 测试连接
@@ -682,7 +704,8 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 未在本次验证中覆盖（无对应环境，不是未实现）：移动端键盘/辅助键条（浏览器工具无法模拟窄视口
 与触屏）、模型化输入法（IME）路径、飞牛宿主内的「选飞牛文件」上传（需要飞牛宿主桥）、
 `Shift` 上档锁定等纯前端触屏交互。
-`files_open_terminal_here`（在此目录打开终端）**按可选项未实现**（i18n 文案保留未用）。
+`files_open_terminal_here`（在此目录打开终端）**后续轮次已实现**（`sftp.openTerminalAt` +
+`terminals.openTerminalAt`，文件管理与目录树的菜单里都在用）。
 
 ### 10.4 已知的小瑕疵（不影响使用）
 
@@ -739,7 +762,9 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   左栏（面包屑区 + 目录树）常驻（去掉原来的显隐按钮）。左栏顶部是**按钮条**而不是路径：
   `[家目录] [完整文件管理（图标，切换双模式）] [在此目录新建终端] [刷新]`。
   「完整文件管理」把主区域切换成文件管理器；再点一次（或点子标签栏里的终端标签）切回终端。
-  状态放在 `sessionUi.mainMode(sid)`：`'terminal' | 'files'`。
+  ~~状态放在 `sessionUi.mainMode(sid)`：`'terminal' | 'files'`。~~
+  → **这套 `mainMode` 已被删除**（见 13.1、14.3）：主区域显示什么**只有**
+  `sessionUi.activeSubOf(sid)` 一个判据，文件管理子标签常驻第一个。下面这段只作历史记录。
 - **移动（窄屏）**：子标签栏保留「文件管理」固定子标签 + 终端子标签（没有左栏可用）；
   打开会话默认落在**终端**；面包屑/目录树**不渲染**。
 - `sessionUi` 变更：新增 `mainModeOf/setMainMode/toggleMainMode`；**删除** `leftVisible`
@@ -907,7 +932,8 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 | 导出至飞牛 | 成功且落在 `exportRoot` 下、文件数与内容正确；同名 → `duplicate`；`overwrite=true` 覆盖成功；单文件导出；病态名字导出成功 |
 | 路径校验 | `../` 逃逸被拒；压缩不存在的路径报错 |
 
-`make test`：**84 个用例全过 0 失败**（含 PTY 用例）；`go test -race ./...` 干净；`gofmt -l` / `go vet` 干净。
+`make test`：**84 个用例全过 0 失败**（含 PTY 用例；⚠️ 这是第二轮的快照，当前 119 个 `Test` 函数，
+无 PTY 的环境会 skip 11 个，见第 7 节）；`go test -race ./...` 干净；`gofmt -l` / `go vet` 干净。
 
 ### 12.4 前端未做「点击级」验证的部分（如实记录）
 
@@ -1512,7 +1538,7 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 `frontend/src/stores/sftp.ts`（`stateOf` 返回代理——这**不只是**给左栏用的，任何组件都可能在
 「第一个调用方」的位置上，写新代码时别退回旧写法）。`stores/sessionUi.ts` 未改。
 
-### 18.5 本轮的验证
+### 18.6 本轮的验证
 
 - `npm run type-check` + `npm run check:i18n`（396 key）+ `make` + `make test` 全绿。
 - 浏览器只读实测（harness 开关摆状态、验完已删，`grep HARNESS-R8 frontend/src` 为空）：
@@ -2411,3 +2437,118 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 | 14 | 构建产物 | `max-md:text-[16px]` 生成 `@media not all and (width >= 48rem)`，与 `style.css` 的 `<768px` 规则同一个断点 |
 
 **门禁**：`make test` 全绿（后端未改动）；`make check`（vue-tsc + i18n 双向）无错误；`make` 构建通过。
+
+---
+
+## 28. 第十八轮：审查问题的修复（27 条）
+
+**来源**：第十五轮审查（只读复核）发现的 1 条严重 + 3 条高 + 6 条中 + 17 条低/记录项，
+以及上一轮遗留未处理的两条（`Origin` 校验、`X-Trim-*` 信任边界）。本轮逐条修复，
+每条都补了能复现原问题的测试或说明。**没有改任何对外契约的字段名/接口名**，
+只有三处口径变化需要记在这里（编辑区内容一律 LF、覆盖上传的 mode/写权限、
+预览/下载只接受普通文件）。
+
+### 28.1 严重 / 高（4 条）
+
+1. **编辑页在 CRLF 文件上坐标系错位（严重）** —— `stores/fileEditor.ts` 新增 `toEditorText()`，
+   `open()` / `revert()` 载入时把 `\r\n` 与**孤立的 `\r`** 一并归一成 LF 再进 store。
+   原因：`<textarea>` 的 `value` 按 HTML 规范会把 CRLF 换成 LF，而 store 里留着 `\r` 就是
+   两个坐标系 —— 命中表（`scan()`）的下标、`setSelectionRange` 的选区、`selectionStart`
+   与命中表的比较全都差「前面出现过多少个 CRLF」。症状：CRLF 文件里「查找」的高亮每行左偏
+   一个字符（第 100 行偏 100 个），最严重的是在错位的选区上打字会改到**另一处字符**，
+   保存后文件内容损坏。后端只在保存时按 `eol` 把 LF 换回 CRLF（`encodeForSave`），
+   所以「编辑区里一律是 LF」这条口径（26.2/26.3）必须由前端真正做出来。
+   **实测**（真二进制 + `testsshd` + 无头 Chromium，CRLF 文件 `flag=1\r\nname=value\r\nflag=2\r\n`）：
+   点「查找」定位 `flag=2` → 选区 `18–24`、选中文本 `"flag=2"`（修复前是 `20–26`、选中 `"ag=2\n"`）；
+   镜像层与 textarea 的 `scrollHeight` 相等（585 = 585）；改一个字符保存后落盘仍是 CRLF。
+2. **目录树里删除文件必定失败（高，第十七轮的回归）** —— `FileTree.vue` 的 `doRemove` 把
+   `dir` 参数硬编码成 `true`，而后端按真实类型校验（`isDir != req.Dir` → `invalid`）。
+   修法：新增 `entryIsDir(path)`（先查树缓存里这一项的真实类型，查不到再退回菜单记下的 kind），
+   `askDelete` 把它算好后一路传到 `sftp.remove`。对照 `FileManager.vue` 用的是 `entry.dir`。
+3. **编辑保存被 1 MiB 的 JSON 体上限挡死（高）** —— 新增 `maxEditBodyBytes = 2×maxReadBytes + 64 KiB`
+   与 `decodeJSONLimit()`，`/api/fs/edit-save` 单独用它。原因：body 里装的是要写回文件的**文本**，
+   换行/引号会被 JSON 转义成两个字节，而 `edit-load` 允许打开到 4 MiB —— 两边共用 1 MiB 的 body
+   上限时，**1 MiB 以上的文件能打开却永远存不回去**，而 `files_edit.go` 里那条
+   「保存的内容超过 `maxReadBytes`」的判断根本没机会执行（既不可达、也没被测到）。
+   现在「能打开」与「能保存」是同一个数。**测试**：`TestFsEditLargeSaveRoundTrip`（2 MiB 往返 +
+   4 MiB 超限必须由「保存的内容」那一道报出来）。
+4. **覆盖上传：mode 丢失 + 绕过目标文件的写权限（高，本轮回归）** —— `writeRemote` 的
+   override 分支现在会：① rename 之前先 `Stat` 目标记下 mode，把临时文件 `Chmod` 成同一个值
+   （失败只记日志——宁可保住内容，也不为一次 chmod 让整次上传失败）；② 覆盖前以 `O_WRONLY`
+   打开目标一次探写权限（判据与 `edit-load` 的写权限探测一致），没权限就回 `permission`。
+   原因：临时文件 + rename 只要求**目录**可写，等于绕过了目标文件自己的权限（0444 也能被替换），
+   而且 rename 换 inode 会把 mode / 属主 / ACL / xattr 全丢掉 —— 后者正是 `files_edit.go` 明确
+   拒绝 rename 的理由。**属主与 ACL 用 SFTP v3 恢复不了**，这是这条路径的已知取舍（建议以
+   非 root 运行本服务，见 README 的安全边界）。**测试**：`TestFsUploadOverwriteKeepsMode`
+   （0755 保持 + 0444 被拒且内容未变）。
+
+### 28.2 中（6 条）
+
+5. **预览 / 读取 / 下载 / 复制 / 导出都只接受普通文件** —— 新增哨兵错误 `errNotRegularFile`
+   （→ `invalid`）。`fs/read`、`fs/image`、`fs/download` 的单文件分支在 `Stat` 之后显式拒绝
+   设备节点 / 管道 / socket；`zipRemoteTree`、`copyRemoteEntry`、`exportRemoteEntry` 对这类条目
+   **跳过并记日志**（与软链接同一个口径）。原因：读打开一个 FIFO 会阻塞到有写者出现，
+   而 `withSFTP` 整段持 `sftpMu` —— 点一次预览就能让这个会话的文件管理整个卡住。
+   **测试**：`TestFsRejectsNonRegularFiles`（四条路径都必须立刻回 `invalid`，且之后列表仍可用）。
+6. **保存期间继续输入不再丢改动** —— `fileEditor.save()` 先把待写内容固化成 `payload`，
+   请求用它、`original` 也用它；`await` 之后再读 `st.content` 会把 `original` 指向一份
+   **没写进磁盘**的内容（界面显示「已保存」，磁盘是旧的，接着点「退出」连确认都不弹）。
+7. **`stats()` 不看 `remoteResult.Code`** —— 新增 `statsUsable(res)`：`Code < 0`（对端没回
+   exit-status，连接在命令执行中断开、stdout 是半截的）按失败处理并 `dropStatsClient`；
+   **正的非零退出码照常解析**（非 Linux 远端 `cat /proc/stat` 失败就是 1，而那份输出里的 df
+   段仍然有用）。**测试**：`TestStatsUsable`。
+8. **预览的加载可以作废/取消** —— `PreviewDialog` 每次加载自增 `seq` 并建 `AbortController`
+   （`reset()` / 卸载 / 换文件即 abort + seq 自增），响应回来先比对 `seq` 再写任何状态。
+   原因：迟到的响应会写进**新文件**的状态（标题是新文件名、图是上一个文件的），Blob URL 也会
+   拖到下次 reset 才 revoke。`serverapi` 的 `fsRead` / `fetchImageBlob` 增加**可选** `signal?`
+   参数（只增不改）。
+9. **编辑页顶栏允许折行** —— `flex-wrap` + 文件名/meta 可收缩。原因：窄屏上
+   「退出 + 文件名 + 编码/换行 + 未保存 + 查找 + 还原 + 保存」一行放不下，而 meta 恰好只在
+   UTF-16 / CRLF 这类文件上出现 —— 不折行时「保存」会被推出可视区（触屏也没有 Ctrl+S）。
+   **实测**：360px 宽的面板上 meta + 脏标记 + 查找区同时打开时，`header.scrollWidth == clientWidth == 360`、
+   「保存」完整可见（修复前溢出 50–118px）。
+10. **关会话时在飞的轮询不再把数字写回** —— `pollOne` 写回前检查 `wanted.includes(sid)`，
+    `SessionCard` 的判据叠加 `isOpen`；`sessionStats` 新增 `stop()` / `dispose()` 并在
+    `HomeView` 的 `onBeforeUnmount` 里调用（不再把定时器的生死托付给「组件永不卸载」）。
+
+### 28.3 低 / 记录（17 条）
+
+| # | 改动 |
+| --- | --- |
+| 11 | `statsClientFor` 的两处 `Close()` 移到锁外（与 `sessionRuntime.close` 同一条锁纪律） |
+| 12 | `parseCPUSample` **只累加前 8 个字段**：`guest` / `guest_nice` 已含在 `user` / `nice` 里，重复计入会让跑虚拟机的机器上 CPU 占有率系统性偏低（procps 的 vmstat 同样取前 8 个）。`TestParseCPUSampleExcludesGuestTime` 钉住 |
+| 13 | 属主名缓存只在命令**真的跑成**（`res.ok()`）时写：非 0 退出时按「查不到」处理并保留重试机会 |
+| 14 | 「还原」与「保存」互斥：按钮 `disabled` 与 store 守卫都看 `loading` / `saving`（两个请求并发时，回来的先后会决定「屏幕干净、磁盘是旧正文」） |
+| 15 | Ctrl/Cmd+S 的拦截从 textarea 提到**面板根元素**：查找 / 替换输入框里按 Ctrl+S 也会触发浏览器「保存网页」 |
+| 16 | 关闭子终端的确认框：**取消 / 点遮罩**后把焦点还给终端（`cancelCloseTerm`）；确认后给邻近标签兜一次（AGENTS 第 5 节的焦点约束） |
+| 17 | 首页卡片三个确认框统一 `danger`（关闭会话 / 关闭子终端 / 删除都是破坏性动作，同一个动作在会话视图里本来就是红按钮） |
+| 18 | 目录树菜单的「点别处关闭」改用 `pointerdown` + 捕获阶段（与 `FileManager` 一致），并在 `hideMenu` / 卸载时摘掉监听 |
+| 19 | 孤立 `\r` 一并归一成 LF（同第 1 条）：镜像层与 textarea 的行数从此一致，行号不再整列下移 |
+| 20 | `scan()` 的大小写回退改成**查询词与正文一起退回**区分大小写：只退一半时 `needle` 与查询词长度不同，会把内容切坏 |
+| 21 | `FileTree` 去掉从未被传进来的 `mobile` prop（唯一调用方只传 `sid`，值恒为 false） |
+| 22 | 「读的过程中变大」的超限文案不再报一个恒等于上限的体积（原来会显示「4.0 MB 超过上限 4.0 MB」），`/api/fs/read` 与 `/api/fs/image` 同改 |
+| 23 | AVIF 识别改为解析 ftyp 盒的 **compatible_brands**（`avif` 只出现在那里、major brand 是别的，是合法且常见的形态），并容错盒长自述为 0 的情况。`TestSniffImageTypeAVIFCompatibleBrands` 钉住 |
+| 24 | 关会话的确认文案在**编辑页有未保存内容**时追加一句（`files_editor_close_warning`，`fileEditor.isDirty` 由此从死代码变成在用） |
+| 25 | 编辑区行号幽灵块加 `v-memo="[i, line]"`：打字时只重新打补丁改动过的那一行。**实测**（无头 Chromium，20000 行）：每键 87.1ms → **9.2ms** |
+| 26 | `/api/trim/status` 补 `requireMethod(GET)`（文档早就写的是 GET，实现没校验） |
+| 27 | WebSocket 握手补 **`Origin` 校验**（防 CSWSH）：Origin 的 `host:port` 必须等于本次请求的 `Host`（缺端口按 scheme 补默认端口），反代改写 Host 时接受 `X-Forwarded-Host`；**没有 Origin 的请求放行**（curl / websocat，入口只有 unix socket + 网关）。`TestOriginAllowed` + `TestTerminalWSRejectsForeignOrigin` |
+
+**同时**：`X-Trim-Userid` / `X-Trim-Username` / `X-Trim-Isadmin` 是**信任头**这件事写进了
+README 的安全边界（必须由反代覆写、客户端可伪造；`upload-from-nas` 的 `source` 是以登录用户
+身份读的本机路径，ACL 预检是 best-effort，**进程自身的 OS 权限是唯一硬边界**——建议非 root 运行）。
+「`source` 必须落在共享目录内」这条**刻意没做**：飞牛文件选择器本来就允许选共享目录之外的
+文件，硬加约束会让正常用法直接失败，而真正的边界是 ACL + 进程 uid（记录在此，需要时再议）。
+
+### 28.4 本轮的验证
+
+- `go vet ./...` 干净；`go test ./...`：主包 **109 PASS / 10 SKIP / 0 FAIL**（119 个 Test 函数；
+  skip 全部由 `requirePTY` 触发，见第 7 节）、`internal/secret` 与 `internal/testssh` 全过。
+- `npm run type-check` 0 错误；`npm run check:i18n`：zh/en 各 **438** key 双向一致（+1 条新文案）。
+- `make` 构建通过（`./webssh`）。
+- 真二进制 + `testsshd` + 无头 Chromium（baseurl `/webssh`）实测了第 1、3、9 条（见各条里的「实测」）。
+- 新增/更新的测试：`TestFsEditLargeSaveRoundTrip`、`TestFsUploadOverwriteKeepsMode`、
+  `TestFsRejectsNonRegularFiles`、`TestSniffImageTypeAVIFCompatibleBrands`、
+  `TestParseCPUSampleExcludesGuestTime`、`TestStatsUsable`、`TestOriginAllowed`、
+  `TestTerminalWSRejectsForeignOrigin`。
+- 未做：第 1 条的 Firefox / WebKit 复跑（只在 Chromium 上验过）、FIFO 卡死在真 OpenSSH 上的复跑
+  （测试环境用的是进程内 SFTP 服务器）。

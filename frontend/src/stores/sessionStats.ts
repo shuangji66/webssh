@@ -94,6 +94,10 @@ export const useSessionStatsStore = defineStore('sessionStats', () => {
     inFlight.add(sid)
     try {
       const out = await api.sessionStats(sid)
+      // ⚠️ 写回前先确认「这个会话还在被问」：请求从发出到回来之间，用户可能已经把会话关了
+      // （sync 会把它的条目删掉，定时器也会停）。那时再写回去，卡片上就会挂着一份**不再更新**
+      // 的旧数字（而卡片已经显示「未打开」）——因为它已经不在 wanted 里，没人会再清它。
+      if (!wanted.includes(sid)) return
       if (out.stats?.available) byId.value[sid] = out.stats
       // 远端读不出来（不是 Linux / 连接断了 / 会话刚被关掉）：整块不显示，**不保留上一次的数字**
       // ——卡片上挂一份不知道多久以前的占用率比不显示更容易误导人。
@@ -101,6 +105,7 @@ export const useSessionStatsStore = defineStore('sessionStats', () => {
     } catch {
       // 同上：接口失败（409 会话已关、网络抖动、超时）一律当作「没有数据」。
       // 不弹 toast：这是每 5 秒一次的后台轮询，为它弹提示会淹没真正的错误。
+      // （会话已经被关掉的情况条目早就被 sync 删了，这一句只是把它按住不让它回来。）
       delete byId.value[sid]
     } finally {
       inFlight.delete(sid)
@@ -116,6 +121,19 @@ export const useSessionStatsStore = defineStore('sessionStats', () => {
       window.clearInterval(timer)
       timer = null
     }
+  }
+
+  /**
+   * 停表并把「该问谁」清空（组件卸载时调）。
+   *
+   * `stop()` 单独导出是为了不再把定时器的生死托付给「HomeView 永不卸载」：
+   * 现在它确实是常驻挂载（`v-show`），但将来谁把它改成 `v-if`（或者再加一个首页入口），
+   * 定时器就会在后台一直每 5 秒问一次远端——而那时没人会注意到。
+   */
+  function dispose(): void {
+    stop()
+    wanted = []
+    byId.value = {}
   }
 
   /**
@@ -142,5 +160,5 @@ export const useSessionStatsStore = defineStore('sessionStats', () => {
     if (changed) pollAll()
   }
 
-  return { statsOf, sync }
+  return { statsOf, sync, stop, dispose }
 })

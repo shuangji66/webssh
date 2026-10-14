@@ -53,6 +53,24 @@ function blankState(): FileEditorState {
   }
 }
 
+/**
+ * 把远程文本规整成**编辑区**用的那一份：CRLF 与孤立的 CR 一律变成 LF。
+ *
+ * 为什么必须归一化（这是编辑页最容易踩空的一处）：`<textarea>` 的 `value` 按 HTML 规范会
+ * 把 CRLF / 单个 CR 换成 LF，而 store 里的字符串如果把 `\r` 原样留着，两边就成了**两个
+ * 坐标系**——命中表（`scan()`）算出的下标、`setSelectionRange` 的选区、以及
+ * `selectionStart` 与命中表之间的比较，全都差「前面出现过多少个 CRLF」（每行累积 1）。
+ * 用户看到的症状：CRLF 文件里「查找」的高亮每行**左偏一个字符**（第 100 行偏 100 个），
+ * 「从光标处往后找」会跳过一个本应命中的位置；最严重的是在错位的选区上直接打字会改到
+ * **另一处字符**，保存后文件内容损坏。
+ *
+ * 后端只在保存时按 `eol` 把 LF 换回 CRLF（见 `encodeForSave`），所以「编辑区里一律是 LF」
+ * 这条口径（契约 26.2 / 26.3）必须由这里真正做出来——只写在注释里就会出上面那些症状。
+ */
+function toEditorText(text: string): string {
+  return text.replace(/\r\n?/g, '\n')
+}
+
 export const useFileEditorStore = defineStore('fileEditor', () => {
   const states = ref<Record<string, FileEditorState>>({})
 
@@ -91,10 +109,12 @@ export const useFileEditorStore = defineStore('fileEditor', () => {
     st.loading = true
     try {
       const res = await api.fsEditLoad(sid, path)
+      // 归一成 LF 再进 store：与 textarea 的 value 同一坐标系（见 toEditorText）
+      const text = toEditorText(res.content)
       st.open = true
       st.path = res.path
-      st.content = res.content
-      st.original = res.content
+      st.content = text
+      st.original = text
       st.encoding = res.encoding
       st.bom = res.bom
       st.eol = res.eol
@@ -113,12 +133,16 @@ export const useFileEditorStore = defineStore('fileEditor', () => {
    */
   async function revert(sid: string): Promise<void> {
     const st = stateOf(sid)
-    if (!st.open || st.loading) return
+    // saving 期间也不许还原：两个请求同时在飞时，回来的先后会决定 content/original 的最终值
+    // （可能变成「屏幕显示干净、磁盘是旧正文」，见 save 的说明）。
+    if (!st.open || st.loading || st.saving) return
     st.loading = true
     try {
       const res = await api.fsEditLoad(sid, st.path)
-      st.content = res.content
-      st.original = res.content
+      // 与 open() 同一个口径：归一成 LF，否则「还原」之后查找/选区又开始错位
+      const text = toEditorText(res.content)
+      st.content = text
+      st.original = text
       st.encoding = res.encoding
       st.bom = res.bom
       st.eol = res.eol
@@ -133,19 +157,27 @@ export const useFileEditorStore = defineStore('fileEditor', () => {
    *
    * 成功后刷新**文件所在的那一层**（`refreshTree` 会同时更新文件管理器的列表与树里展开过的
    * 节点，见契约 26.3）：文件大小 / 修改时间要立刻变，否则用户会以为没保存上。
+   *
+   * ⚠️ 把要写的内容**先固化成 payload**：保存期间 textarea 并没有被禁用（只有按钮禁用），
+   * 用户完全可能接着敲字；如果 `await` 之后再读 `st.content` 赋给 `original`，那个
+   * `original` 指的是一份**没写进磁盘**的内容——界面显示「已保存」、脏标记消失，而磁盘上是
+   * 旧的一版，用户接着点「退出」连确认都不会弹，后来的输入就无声丢了。
+   * 固化之后若用户又改了内容，`content !== original` 自然为真，脏标记保持。
    */
   async function save(sid: string): Promise<void> {
     const st = stateOf(sid)
-    if (!st.open || st.saving || st.content === st.original) return
+    // loading 期间不许保存：还原在飞时点保存，写的是一份马上要被覆盖的旧正文
+    if (!st.open || st.saving || st.loading || st.content === st.original) return
+    const payload = st.content
     st.saving = true
     try {
       // 回执里的 size 不再用了（第十七轮起编辑页不显示体积）：要的是「写成功」这件事本身。
-      await api.fsEditSave(sid, st.path, st.content, {
+      await api.fsEditSave(sid, st.path, payload, {
         encoding: st.encoding,
         bom: st.bom,
         eol: st.eol
       })
-      st.original = st.content
+      st.original = payload
       try {
         await useSftpStore().refreshTree(sid, parentPath(st.path))
       } catch {

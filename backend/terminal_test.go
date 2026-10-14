@@ -504,3 +504,65 @@ func TestTerminalReplayTimeoutFreesHistMu(t *testing.T) {
 		t.Fatal("回放超时后 histMu 没有释放，history() 被堵住")
 	}
 }
+
+// TestOriginAllowed 钉住 WebSocket 握手的 Origin 判据（防 CSWSH）。
+//
+// 规则只有一条：**Origin 的 host:port 必须等于本次请求的 Host**（或缺端口时按 scheme 补默认
+// 端口）；反代改写 Host 时接受它带过来的 X-Forwarded-Host。没有 Origin 的请求走的是另一条
+// 分支（调用方只在 Origin 非空时问这里，curl/websocat 不带它）。
+func TestOriginAllowed(t *testing.T) {
+	cases := []struct {
+		name    string
+		origin  string
+		host    string
+		fwdHost string
+		want    bool
+	}{
+		{"同主机同端口", "http://nas:8080", "nas:8080", "", true},
+		{"https 缺端口 = 443", "https://nas", "nas", "", true},
+		{"http 缺端口 = 80", "http://nas", "nas:80", "", true},
+		{"大小写不敏感", "http://NAS:8080", "nas:8080", "", true},
+		{"端口不同", "http://nas:8080", "nas:9090", "", false},
+		{"主机不同", "http://evil.example", "nas:8080", "", false},
+		{"反代改写了 Host，但转发了原 Host", "https://nas", "webssh-internal:80", "nas", true},
+		{"X-Forwarded-Host 是列表", "https://nas", "internal", "a.example, nas", true},
+		{"X-Forwarded-Host 也不匹配", "https://evil.example", "internal", "nas", false},
+		{"Origin 不是合法 URL", "null", "nas", "", false},
+		{"Origin 没有主机", "file:///etc/passwd", "nas", "", false},
+	}
+	for _, tc := range cases {
+		r := &http.Request{Host: tc.host, Header: http.Header{}}
+		if tc.fwdHost != "" {
+			r.Header.Set("X-Forwarded-Host", tc.fwdHost)
+		}
+		if got := originAllowed(tc.origin, r); got != tc.want {
+			t.Errorf("%s：originAllowed(%q, Host=%q, XFH=%q) = %v，期望 %v",
+				tc.name, tc.origin, tc.host, tc.fwdHost, got, tc.want)
+		}
+	}
+}
+
+// TestTerminalWSRejectsForeignOrigin 覆盖端到端那一条：跨站 Origin 的握手必须被拒（403），
+// 而且是在 hijack **之前**就拒掉（不建立 WebSocket 连接、不碰任何会话状态）；
+// 同一份请求把 Origin 换成自己的 Host 时不该被这一道挡住（走的是后面「会话不存在」那条路）。
+func TestTerminalWSRejectsForeignOrigin(t *testing.T) {
+	a := newTestApp(t, appOptions{noSSH: true})
+	headers := func(origin string) map[string]string {
+		return map[string]string{
+			"Connection":            "Upgrade",
+			"Upgrade":               "websocket",
+			"Sec-WebSocket-Key":     "dGhlIHNhbXBsZSBub25jZQ==",
+			"Sec-WebSocket-Version": "13",
+			"Origin":                origin,
+		}
+	}
+	// 客户端连的是 http://webssh/...（见 harness 的 a.do），所以 Host = webssh
+	res, raw := a.do(t, http.MethodGet, "/api/terminal/ws?sid=whatever&tid=whatever", nil, headers("http://evil.example"))
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("跨站 Origin 的握手状态码 = %d，期望 403（%s）", res.StatusCode, snippetOf(raw))
+	}
+	res2, raw2 := a.do(t, http.MethodGet, "/api/terminal/ws?sid=whatever&tid=whatever", nil, headers("http://webssh"))
+	if res2.StatusCode == http.StatusForbidden {
+		t.Fatalf("同源 Origin 的握手被误拒：%d（%s）", res2.StatusCode, snippetOf(raw2))
+	}
+}

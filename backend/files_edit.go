@@ -115,7 +115,10 @@ func (m *AdminMux) handleFsEditLoad(w http.ResponseWriter, r *http.Request) *api
 		content, err = io.ReadAll(io.LimitReader(f, maxReadBytes+1))
 		if int64(len(content)) > maxReadBytes {
 			// 读了之后才变大（正在被写入的文件）：按超限处理。
-			return apierr.TooLarge("文件 %s 超过编辑上限 %s", humanSize(int64(len(content))), humanSize(maxReadBytes))
+			//
+			// 这里**不报具体体积**：读到的长度恒等于「上限 + 1 字节」（LimitReader 卡住了），
+			// 报出来就是一句「文件 4.0 MB 超过上限 4.0 MB」，用户只会以为提示是坏的。
+			return apierr.TooLarge("文件在读取过程中变大，已超过编辑上限 %s", humanSize(maxReadBytes))
 		}
 		return err
 	})
@@ -145,7 +148,9 @@ func (m *AdminMux) handleFsEditLoad(w http.ResponseWriter, r *http.Request) *api
 // 失败会留下半截文件，所以下面先读一份原内容做善后（见 backup）。
 func (m *AdminMux) handleFsEditSave(w http.ResponseWriter, r *http.Request) *apierr.Error {
 	var req fsEditSaveReq
-	if apiErr := m.decodeJSON(w, r, &req); apiErr != nil {
+	// body 上限单列一档（maxEditBodyBytes）：编辑区的内容进了 JSON 会被转义，4 MiB 的文本
+	// 最坏膨胀到 8 MiB，用默认的 1 MiB 会让「能打开的文件存不回去」。
+	if apiErr := m.decodeJSONLimit(w, r, &req, maxEditBodyBytes); apiErr != nil {
 		return apiErr
 	}
 	rt, apiErr := m.sessions.runtimeFor(req.SID)

@@ -180,6 +180,15 @@ func (r *sessionRuntime) resolveOwnerNames(ctx context.Context, uid, gid uint32)
 		logx.Warnf("会话 %s 查属主名字失败（uid=%d gid=%d）：%v", r.id, uid, gid, err)
 		return "", ""
 	}
+	// 命令**没跑成**（非 0 退出：远端没有 id、sh 起不来、连接半死）时不能写缓存：
+	// runRemote 只在「基础设施失败」上给 error，命令自己失败是 Code != 0，而那份 stdout
+	// 是空的——按「查不到」处理（界面退回数字），但下次还要重试。缓存里记下一次瞬时失败，
+	// 这个会话就永远只显示数字了（与文件头「只有查成功才写缓存」的承诺不符）。
+	if !res.ok() {
+		logx.Warnf("会话 %s 查属主名字的命令退出码 %d（uid=%d gid=%d），本次按查不到处理（不缓存）",
+			r.id, res.Code, uid, gid)
+		return "", ""
+	}
 	lines := strings.Split(strings.TrimRight(res.Stdout, "\n"), "\n")
 	owner, group := "", ""
 	if len(lines) > 0 {

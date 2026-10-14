@@ -53,8 +53,14 @@ const sessionStats = useSessionStatsStore()
 const label = computed(() => sessionLabel(props.session))
 const target = computed(() => `${props.session.user}@${sessionTarget(props.session)}`)
 const isOpen = computed(() => props.state?.open === true)
-/** 已连接时的系统信息（undefined = 这一块不显示：没打开、或远端读不出来）。 */
-const stats = computed(() => sessionStats.statsOf(props.session.id))
+/**
+ * 已连接时的系统信息（undefined = 这一块不显示：没打开、或远端读不出来）。
+ *
+ * 判据叠加 `isOpen`，不只看 store 里有没有条目：条目可能比「打开状态」多活一拍
+ * （一轮轮询恰在关会话那一刻在飞、响应迟一点回来），那时卡片已经写着「未打开」，
+ * 却还挂着一份**不再更新**的旧数字。store 侧也加了写回守卫，这里再兜一层。
+ */
+const stats = computed(() => (isOpen.value ? sessionStats.statsOf(props.session.id) : undefined))
 </script>
 
 <template>

@@ -25,7 +25,7 @@
 //
 // 菜单里对 `/` 隐藏了重命名 / 删除 / 压缩 / 导出：根目录没有父目录可压缩、也不能被改名或
 // 删除（后端会拒），藏起来比给一个点了报错的项好。
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, describeError, type ArchiveFormat } from '@/serverapi'
 import { useFileEditorStore } from '@/stores/fileEditor'
@@ -42,7 +42,7 @@ import PreviewDialog from './PreviewDialog.vue'
 import UploadDialog from './UploadDialog.vue'
 import { canEditPath, isArchivePath } from './fileKind'
 
-const { sid, mobile = false } = defineProps<{ sid: string; mobile?: boolean }>()
+const { sid } = defineProps<{ sid: string }>()
 
 // 本组件**不 emit**：点目录只更新共享的当前目录（sftp store）与展开状态；主区域显示什么由
 // 子标签栏决定（`sessionUi.activeSubOf`），从树里点一下就切走会打断正在终端里干活的人。
@@ -253,7 +253,34 @@ function openMenu(path: string, event: MouseEvent, file = false) {
   // 菜单里「导出至飞牛」是否可点取决于运行信息，点开菜单时确保它已经拿到
   void sftp.ensureRuntime()
   void nextTick(clampMenu)
-  window.setTimeout(() => window.addEventListener('click', hideMenu, { once: true }), 0)
+  armDismiss()
+}
+
+/**
+ * window 上的「点别处就关」。
+ *
+ * 用 **pointerdown + 捕获阶段**，不用 click（AGENTS 第 5 节，FileManager 里也踩过同一个坑）：
+ * 触屏上 tap 出来的 click 未必会到达 window——滚动判定的手指微动、别处处理器的
+ * stopPropagation 都会吃掉它，用户看到的是「点别处菜单不消失」。落在菜单自己身上的那一击
+ * 不算「别处」（那一击留给菜单项，动作里会 hideMenu）。
+ */
+function onDocPointerDown(event: PointerEvent) {
+  const el = menuEl.value
+  if (el && event.target instanceof Node && el.contains(event.target)) return
+  hideMenu()
+}
+
+/**
+ * 武装「点别处关闭」。
+ *
+ * setTimeout 0 是为了**放过打开菜单的那一击**；挂之前先摘一次，避免每开一次菜单就往
+ * window 上多塞一个监听器。
+ */
+function armDismiss() {
+  window.setTimeout(() => {
+    window.removeEventListener('pointerdown', onDocPointerDown, true)
+    window.addEventListener('pointerdown', onDocPointerDown, true)
+  }, 0)
 }
 
 function clampMenu() {
@@ -266,6 +293,8 @@ function clampMenu() {
 
 function hideMenu() {
   menu.show = false
+  // 顺手摘掉 window 上的监听（点别处 / 动作做完 / 组件卸载都走这里）
+  window.removeEventListener('pointerdown', onDocPointerDown, true)
 }
 
 /** 在空白处右键 = 对根节点操作。 */
@@ -408,17 +437,34 @@ async function doRename(path: string, name: string) {
   }
 }
 
+/**
+ * 树里某一项的**真实类型**（删除接口的 `dir` 参数必须与它一致）。
+ *
+ * 为什么不能只信 `menu.file`：菜单开着的时候父目录可能已经被收起或删掉（缓存里就查不到了），
+ * 那种情况退回菜单记下的 kind。为什么必须传对：后端对 `dir` 与真实类型不一致是**拒绝**
+ * （invalid），不是猜——文件行硬写 `true` 会让「在树里删文件」永远失败，而用户看到的只是一句
+ * 「参数不合法」（第十七轮的真 bug）。
+ */
+function entryIsDir(path: string): boolean {
+  for (const list of Object.values(state.value.treeChildren)) {
+    const hit = list.find((entry) => entry.path === path)
+    if (hit) return hit.dir
+  }
+  return !menu.file
+}
+
 function askDelete() {
   const path = menu.path
   if (path === '/') return
   const name = baseName(path) || path
+  const dir = entryIsDir(path)
   hideMenu()
-  askConfirm(t('common_tip'), t('files_delete_confirm', { name }), () => void doRemove(path, name))
+  askConfirm(t('common_tip'), t('files_delete_confirm', { name }), () => void doRemove(path, name, dir))
 }
 
-async function doRemove(path: string, name: string) {
+async function doRemove(path: string, name: string, dir: boolean) {
   try {
-    await sftp.remove(sid, path, true)
+    await sftp.remove(sid, path, dir)
     toast(t('files_deleted', { name }), 'success')
     // 删掉的正好是当前目录：往上退一层，否则列表停在一个已经不存在的路径上
     if (state.value.dir === path) await sftp.navigate(sid, parentPath(path))
@@ -713,6 +759,10 @@ const menuItems = computed<MenuItem[]>(() => {
   if (!path) return []
   return menu.file ? fileMenuItems(path) : dirMenuItems(path)
 })
+
+// 组件卸载时摘掉 window 上的「点别处关闭」监听（hideMenu 里会摘，这里兜住「菜单开着就卸载」
+// 的情况——例如会话被关掉时整个左栏一起消失）。
+onBeforeUnmount(hideMenu)
 </script>
 
 <template>
@@ -732,7 +782,7 @@ const menuItems = computed<MenuItem[]>(() => {
         <div
           class="group flex cursor-pointer items-center gap-1 rounded px-1.5"
           :class="[
-            mobile ? 'py-2' : 'py-1',
+            'py-1',
             row.kind !== 'more' && state.dir === row.path
               ? 'bg-brand-soft font-medium text-ink dark:text-ink-dark'
               : 'text-ink-soft hover:bg-black/5 dark:text-ink-soft-dark dark:hover:bg-white/5',

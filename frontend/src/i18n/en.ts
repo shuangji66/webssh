@@ -338,6 +338,7 @@ export const en: Record<string, string> = {
   files_editor_exit_confirm: 'There are unsaved changes; exiting discards them.',
   files_editor_revert_confirm:
     'Reverting discards unsaved changes and re-reads the file from the remote host.',
+  files_editor_close_warning: 'The editor has unsaved changes; closing the session discards them.',
   files_tree_more_files: '··· more files',
   files_tree_more_files_hint:
     '{n} more file(s) not shown — click to open this folder in the file manager',

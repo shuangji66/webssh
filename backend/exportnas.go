@@ -142,6 +142,12 @@ func exportRemoteEntry(ctx context.Context, c *sftp.Client, remote, local string
 		logx.Warnf("导出至飞牛：跳过软链接 %s", remote)
 		return 0, 0, nil
 
+	case !fi.Mode().IsRegular() && !fi.IsDir():
+		// 设备节点 / 管道 / socket：与软链接同一个口径——跳过并记日志。读打开一个 FIFO 会
+		// 阻塞到有写者出现，而整段导出持着 sftpMu（见 errNotRegularFile）。
+		logx.Warnf("导出至飞牛：跳过非普通文件 %s（设备 / 管道 / socket）", remote)
+		return 0, 0, nil
+
 	case fi.IsDir():
 		// 本机目录用固定模式位（0o755）而不是照搬远端的：共享目录上的读写权限由飞牛的 ACL
 		// 管，把远端某个用户/组的特殊权限位搬过来只会出现「自己都进不去」的目录。

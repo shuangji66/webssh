@@ -71,13 +71,22 @@ var maxTransferBytes int64 = 4 << 30
 // 单独定义而不是复用 errTooLarge：它要能被 errors.Is 认出来，才能翻成 too_large 的 413。
 var errTransferBudget = errors.New("传输内容超过大小上限")
 
-// 下面两个哨兵错误都是「参数问题」（400），不是服务端故障：
+// 下面几个哨兵错误都是「参数问题」（400），不是服务端故障：
 //   - errTargetIsDir：界面上点错了入口（比如对着目录点「预览」）；
-//   - errKindMismatch：目录删除的 dir 参数与真实类型不一致（此时报错比删掉更安全）。
+//   - errKindMismatch：目录删除的 dir 参数与真实类型不一致（此时报错比删掉更安全）；
+//   - errNotRegularFile：目标是设备节点 / 管道 / socket，不是普通文件。
 var (
 	errTargetIsDir  = errors.New("目标是目录")
 	errKindMismatch = errors.New("dir 参数与真实类型不一致")
 	errRefuseRoot   = errors.New("拒绝删除根目录")
+	// errNotRegularFile 是「目标存在、但不是普通文件」。
+	//
+	// 必须在 Open 之前拦住，而不是打开之后再说：**读**打开一个 FIFO 会阻塞到有写者出现，
+	// **写**打开会阻塞到有读者出现（POSIX 语义），而 withSFTP 整段持有 sftpMu——
+	// 一次「对 FIFO 点预览」就能把这条会话的全部文件操作卡住，直到客户端断开
+	// （前端 fetch 没有超时，用户看到的是文件管理整个卡死）。io.LimitReader 只作用于
+	// Read 阶段，救不了 Open。
+	errNotRegularFile = errors.New("不是普通文件（设备节点 / 管道 / socket 不能这样打开）")
 )
 
 // sftpFxFileAlreadyExists 是 SFTP 协议的 SSH_FX_FILE_ALREADY_EXISTS。
@@ -391,7 +400,8 @@ func fsError(action string, err error) *apierr.Error {
 	case errors.Is(err, os.ErrExist):
 		return apierr.Duplicate("%s：%s", action, msg)
 	case errors.Is(err, errTargetIsDir), errors.Is(err, errKindMismatch), errors.Is(err, errRefuseRoot),
-		errors.Is(err, errNesting), errors.Is(err, errRootOp), errors.Is(err, errInvalidLocalName):
+		errors.Is(err, errNesting), errors.Is(err, errRootOp), errors.Is(err, errInvalidLocalName),
+		errors.Is(err, errNotRegularFile):
 		return apierr.Invalid("%s：%s", action, msg)
 	case strings.Contains(msg, "不允许包含 .."), strings.Contains(msg, "缺少 path"),
 		strings.Contains(msg, "上传路径"), strings.Contains(msg, "上传项"):

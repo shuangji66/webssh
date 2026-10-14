@@ -318,3 +318,62 @@ func numOK(m map[string]any, key string) (float64, bool) {
 	f, ok := v.(float64)
 	return f, ok
 }
+
+// TestParseCPUSampleExcludesGuestTime 钉住 CPU 的分母口径：**不把 guest / guest_nice 计入**。
+//
+// 内核把 guest 时间已经算进 user、guest_nice 算进 nice（proc(5)），再加一遍等于把分母放大——
+// 一台跑着虚拟机的 NAS 上，CPU 占用率会系统性偏低（procps 的 vmstat 同样只取前 8 个字段）。
+func TestParseCPUSampleExcludesGuestTime(t *testing.T) {
+	// 第 9、10 个字段（guest=700、guest_nice=800）刻意给成非 0：样本里它们是 0 的话，
+	// 这条口径根本测不出来。
+	block := "cpu  1000 20 300 8000 500 30 10 5 700 800\n" +
+		"cpu0 500 10 150 4000 250 15 5 2 350 400\n"
+
+	s, ok := parseCPUSample(block)
+	if !ok {
+		t.Fatal("聚合行应当能解析出来")
+	}
+	if want := uint64(1000 + 20 + 300 + 8000 + 500 + 30 + 10 + 5); s.total != want {
+		t.Errorf("total = %d，期望 %d（guest / guest_nice 不能计入分母）", s.total, want)
+	}
+	if want := uint64(8000 + 500); s.idle != want {
+		t.Errorf("idle = %d，期望 %d（idle + iowait）", s.idle, want)
+	}
+
+	// 两次采样之间 guest 大幅变化时，占用率仍然只由前 8 个字段决定
+	after, ok := parseCPUSample("cpu  1400 20 400 9000 600 30 10 5 900 800\n")
+	if !ok {
+		t.Fatal("第二份采样应当能解析出来")
+	}
+	pct, ok := cpuPercent(s, after)
+	if !ok {
+		t.Fatal("计数器动了，应当算出占用率")
+	}
+	// Δtotal = 400+0+100+1000+100 = 1600，Δidle = 1000+100 = 1100 → 忙 500/1600 = 31.25%
+	if pct < 31.2 || pct > 31.3 {
+		t.Errorf("占用率 = %v，期望 31.25（guest 不计入分母）", pct)
+	}
+}
+
+// TestStatsUsable 钉住「半截输出」的判据。
+//
+// Code 为负表示对端没回 exit-status（连接在命令执行中断开），stdout 可能是半截的：拿它当
+// 一次正常读数会给出「只有一半字段但 available=true」的系统信息，比不显示更容易骗人。
+// 正的非零退出码说明命令跑完了（非 Linux 远端上 `cat /proc/stat` 失败就是 1，
+// 而那份输出里的 df 段仍然有用），必须照常解析。
+func TestStatsUsable(t *testing.T) {
+	cases := []struct {
+		code int
+		want bool
+	}{
+		{-1, false}, // 对端没回 exit-status：半截输出，不能当读数
+		{0, true},
+		{1, true},   // 非 Linux：cat /proc/stat 失败，但 df 段可用
+		{127, true}, // 命令不存在（例如远端连 sh 都没有）
+	}
+	for _, tc := range cases {
+		if got := statsUsable(remoteResult{Code: tc.code}); got != tc.want {
+			t.Errorf("statsUsable(Code=%d) = %v，期望 %v", tc.code, got, tc.want)
+		}
+	}
+}

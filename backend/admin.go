@@ -18,21 +18,39 @@ import (
 // 1 MiB 足够，而没有上限时一个客户端就能用超大 body 把进程内存打爆。
 const maxJSONBytes = 1 << 20
 
-// decodeJSON 读一个 POST 的 JSON body。
+// maxEditBodyBytes 是「编辑保存」（`/api/fs/edit-save`）的 JSON 请求体上限。
+//
+// 为什么要比 maxJSONBytes 大一档：body 里装的是编辑区的**文本**（JSON 字符串），换行、
+// 引号、反斜杠都会被转义成两个字节 —— 4 MiB 的内容最坏膨胀到 8 MiB；而 `/api/fs/edit-load`
+// 允许打开到 maxReadBytes（4 MiB）。两边共用一个 1 MiB 的 body 上限，表现就是
+// **1 MiB 以上的文件能打开、却永远存不回去**（用户只看到一句「请求体超过上限」，
+// 而 files_edit.go 里那条「保存的内容超过 maxReadBytes」的判断根本没机会执行）。
+// 放宽到 2×maxReadBytes + 64 KiB 之后，「能打开」与「能保存」是同一个数。
+const maxEditBodyBytes = 2*maxReadBytes + 64<<10
+
+// decodeJSON 读一个 POST 的 JSON body（上限 maxJSONBytes）。
 //
 // 刻意**不**用 DisallowUnknownFields：前端将来多带一个字段（例如新增的开关）不该让
 // 老后端直接返回 400——那会把一次向前兼容的升级变成一次线上故障。
 func (m *AdminMux) decodeJSON(w http.ResponseWriter, r *http.Request, out any) *apierr.Error {
+	return m.decodeJSONLimit(w, r, out, maxJSONBytes)
+}
+
+// decodeJSONLimit 与 decodeJSON 相同，由调用方给 body 上限。
+//
+// 只有「body 里装的是用户内容」的接口才放宽（目前只有编辑保存，见 maxEditBodyBytes）：
+// 按内容大小放宽上限的接口每多一个，能被一个客户端拿去放大内存的面就多一块。
+func (m *AdminMux) decodeJSONLimit(w http.ResponseWriter, r *http.Request, out any, limit int64) *apierr.Error {
 	if r.Method != http.MethodPost {
 		return apierr.Method("该接口只支持 POST（带参数的接口一律 POST + JSON body）")
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	err := json.NewDecoder(r.Body).Decode(out)
 	switch {
 	case err == nil:
 		return nil
 	case tooLargeBody(err):
-		return apierr.TooLarge("请求体超过上限 %s", humanSize(maxJSONBytes))
+		return apierr.TooLarge("请求体超过上限 %s", humanSize(limit))
 	case errors.Is(err, io.EOF):
 		return apierr.Invalid("缺少请求体（需要 JSON）")
 	default:

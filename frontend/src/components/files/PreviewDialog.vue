@@ -66,6 +66,23 @@ const imgDims = ref('')
 
 const downloading = ref(false)
 
+/**
+ * 一次加载的「代号」与它对应的取消句柄。
+ *
+ * 为什么必须有：请求是异步的，而弹窗可以被关掉、也可以换一个文件再打开。没有作废机制时，
+ * 迟到的响应会写进**新文件**的状态里 —— 标题是新文件名、图却是上一个文件的，`size` 也是错的；
+ * 更糟的是那个 Blob URL 只挂在组件上一次的 `imgUrl` 上，直到下次 reset 才被 revoke（≤4 MiB
+ * 常驻）。批量切换文件时这是必然发生的，不是理论问题。
+ *
+ * 两个手段一起用：
+ *  - `seq`：响应回来时比对「还是不是我这一次」，不是就整个丢弃（不写任何状态）；
+ *  - `AbortController`：把还在飞的请求真的取消掉（4 MiB 的图片不必白传完；后端也会因为
+ *    ctx 结束而立刻收手——对 FIFO 那类会让 SFTP 卡住的路径尤其重要）。
+ * 刻意**不**放进响应式状态：它只用于控制流，写进 ref 只会让每次加载都触发一次无谓渲染。
+ */
+let seq = 0
+let controller: AbortController | null = null
+
 function revokeImage() {
   if (imgUrl.value) {
     URL.revokeObjectURL(imgUrl.value)
@@ -73,7 +90,15 @@ function revokeImage() {
   }
 }
 
+/** 作废「当前这一次加载」：取消在飞请求 + 让迟到的响应认不出自己。 */
+function invalidate() {
+  seq += 1
+  controller?.abort()
+  controller = null
+}
+
 function reset() {
+  invalidate()
   loading.value = false
   error.value = ''
   content.value = ''
@@ -90,41 +115,47 @@ function reset() {
   revokeImage()
 }
 
-async function loadText() {
+async function loadText(my: number, signal: AbortSignal) {
   loading.value = true
   try {
-    const res = await api.fsRead(props.sid, props.path)
+    const res = await api.fsRead(props.sid, props.path, signal)
+    if (my !== seq) return // 已经不是这一次了：一个字段都不要写
     size.value = res.size
     tooLarge.value = res.tooLarge
     binary.value = !res.text
     encoding.value = res.encoding || ''
     content.value = res.text ? res.content : ''
   } catch (e) {
+    if (my !== seq) return
     error.value = describeError(e)
   } finally {
-    loading.value = false
+    if (my === seq) loading.value = false
   }
 }
 
-async function loadImage() {
+async function loadImage(my: number, signal: AbortSignal) {
   imgLoading.value = true
   try {
-    const blob = await fetchImageBlob(props.sid, props.path)
+    const blob = await fetchImageBlob(props.sid, props.path, signal)
+    if (my !== seq) return
     size.value = blob.size
     imgUrl.value = URL.createObjectURL(blob)
   } catch (e) {
+    if (my !== seq) return
     if (e instanceof ApiError && e.code === 'too_large') imgTooLarge.value = true
     else if (e instanceof ApiError && e.code === 'invalid') imgInvalid.value = true
     else imgError.value = describeError(e)
   } finally {
-    imgLoading.value = false
+    if (my === seq) imgLoading.value = false
   }
 }
 
 function load() {
   reset()
-  if (kind.value === 'image') void loadImage()
-  else void loadText()
+  const my = seq
+  controller = new AbortController()
+  if (kind.value === 'image') void loadImage(my, controller.signal)
+  else void loadText(my, controller.signal)
 }
 
 // 打开（或换文件）就重新读一次：不做内容缓存——远程文件随时可能被改，缓存只会骗自己。
@@ -138,7 +169,11 @@ watch(
   { immediate: true }
 )
 
-onBeforeUnmount(revokeImage)
+// 卸载时也要收尾：取消在飞请求（否则一个 4 MiB 的图片还会白传完）+ 释放 Blob URL。
+onBeforeUnmount(() => {
+  invalidate()
+  revokeImage()
+})
 
 // ---- 文本展示 ----
 

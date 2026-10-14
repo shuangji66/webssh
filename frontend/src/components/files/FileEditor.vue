@@ -166,16 +166,21 @@ const findInput = ref<HTMLInputElement | null>(null)
 /**
  * 扫描命中。**不分大小写**（为了大小写白找一遍更烦人），从左到右、不重叠。
  *
- * toLowerCase 在极少数情况下会改变长度（'İ' 小写化是两个码元），那样 indexOf 的下标就与正文
- * 错位了（选区会画到别处），所以一旦长度变了就退回区分大小写。
+ * ⚠️ 大小写折叠偶尔会改变长度（`'İ'.toLowerCase()` 是两个码元）。这时**整体退回区分大小写**
+ * （查询词与正文一起退回）——只退一半的后果是：命中的下标是在折叠后的坐标系里算的、
+ * 而选区和 `replace` 的切片用查询词的字符数，两边差一个码元，就会出现「替换少切一个字符」
+ * 这种把内容写坏的结果（选区也会画到别处）。回退之后 needle 的长度恒等于查询词的长度，
+ * 底下 selectMatch / replaceOne 用 `query.value.length` 才成立。
  */
 function scan(): number[] {
   const q = query.value
   if (!q) return []
   const content = st.value.content
-  let hay = content.toLowerCase()
-  if (hay.length !== content.length) hay = content
-  const needle = q.toLowerCase()
+  const lowerQ = q.toLowerCase()
+  const lowerContent = content.toLowerCase()
+  const fold = lowerQ.length === q.length && lowerContent.length === content.length
+  const hay = fold ? lowerContent : content
+  const needle = fold ? lowerQ : q
   const out: number[] = []
   let at = hay.indexOf(needle)
   while (at >= 0) {
@@ -398,7 +403,8 @@ function exit() {
 }
 
 async function save() {
-  if (!dirty.value || st.value.saving) return
+  // loading 期间也不能保存：还原请求在飞时发出去的是一份马上要被覆盖的旧正文（store 里也拦了一层）
+  if (!dirty.value || st.value.saving || st.value.loading) return
   try {
     await editor.save(sid)
     toastStore.show(t('files_editor_saved', { name: name.value }), 'success')
@@ -425,7 +431,13 @@ async function revert() {
   await run()
 }
 
-/** Ctrl/Cmd+S 保存：浏览器默认是「保存网页」，必须挡掉（prevent）。 */
+/**
+ * Ctrl/Cmd+S 保存：浏览器默认是「保存网页」，必须挡掉（prevent）。
+ *
+ * 挂在**面板根元素**上（不是 textarea）：「查找 / 替换」两个输入框里按 Ctrl+S 同样会触发
+ * 浏览器的「保存网页」对话框，而那时用户以为自己在保存文件——把处理器提到根上，两处都能拦到
+ * （keydown 会从输入框冒泡上来）。
+ */
 function onKeydown(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault()
@@ -435,10 +447,17 @@ function onKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <!-- absolute inset-0：**覆盖**文件管理页面（文件管理器保持挂载，退出后目录、视图、滚动都在） -->
-  <div class="absolute inset-0 z-30 flex flex-col bg-bg dark:bg-bg-dark">
+  <!-- absolute inset-0：**覆盖**文件管理页面（文件管理器保持挂载，退出后目录、视图、滚动都在）。
+       @keydown 挂在这一层：查找/替换输入框里按 Ctrl+S 也要被拦住（见 onKeydown）。 -->
+  <div
+    class="absolute inset-0 z-30 flex flex-col bg-bg dark:bg-bg-dark"
+    @keydown="onKeydown"
+  >
+    <!-- 顶栏**允许折行**：窄屏（手机）上「退出 + 文件名 + 编码/换行 + 未保存 + 查找 + 还原 + 保存」
+         一行放不下，而 meta 恰好只在 UTF-16 / CRLF 这类文件上出现——不折行的话「保存」会被推出
+         可视区（触屏上也没有 Ctrl+S 可用，等于存不了盘）。折行后按钮换到第二行，仍然点得到。 -->
     <div
-      class="flex shrink-0 items-center gap-2 border-b border-line px-2 py-1.5 dark:border-line-dark"
+      class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-line px-2 py-1.5 dark:border-line-dark"
     >
       <!-- 左上角：退出（回到文件管理，不动它的状态） -->
       <button
@@ -463,9 +482,19 @@ function onKeydown(event: KeyboardEvent) {
         <span>{{ t('files_editor_exit') }}</span>
       </button>
 
-      <span class="min-w-0 flex-1 truncate font-mono text-xs" :title="st.path">{{ name }}</span>
+      <!-- 文件名：min-w-0 + truncate 让它在窄屏上先让步（折行时也还能显示一段） -->
+      <span class="min-w-0 shrink flex-1 truncate font-mono text-xs" :title="st.path">{{
+        name
+      }}</span>
 
-      <span v-if="meta" class="shrink-0 font-mono text-xs text-ink-faint dark:text-ink-faint-dark">
+      <!-- 编码 / 换行：只在不是「UTF-8 + LF」时出现。允许被截断（`min-w-0 truncate`）：
+           窄屏上宁可把「UTF-16LE · CRLF 换行」截成「UTF-16LE…」，也不能把「保存」挤出屏幕。
+           完整值仍在 title 里，悬停/长按可见。 -->
+      <span
+        v-if="meta"
+        class="min-w-0 max-w-[40%] shrink truncate font-mono text-xs text-ink-faint dark:text-ink-faint-dark"
+        :title="meta"
+      >
         {{ meta }}
       </span>
       <!-- 未保存标记：右上角按钮的可用态已经说明了同一件事，但改完一个字符就想确认「存了没」时，
@@ -496,7 +525,9 @@ function onKeydown(event: KeyboardEvent) {
         </svg>
       </button>
 
-      <!-- 右上角：还原 / 保存 -->
+      <!-- 右上角：还原 / 保存。
+           两者的可用态互斥：还原在飞时不能保存、保存在飞时不能还原（否则两个请求并发，
+           回来的先后会决定「屏幕干净而磁盘是旧正文」这种状态，见 stores/fileEditor.ts）。 -->
       <button
         type="button"
         class="g-btn-secondary h-8 shrink-0"
@@ -509,7 +540,7 @@ function onKeydown(event: KeyboardEvent) {
       <button
         type="button"
         class="g-btn-primary h-8 shrink-0"
-        :disabled="!dirty || st.saving"
+        :disabled="!dirty || st.saving || st.loading"
         :title="t('files_editor_save_hint')"
         @click="save"
       >
@@ -608,9 +639,14 @@ function onKeydown(event: KeyboardEvent) {
         aria-hidden="true"
       >
         <div ref="rowHost">
+          <!-- v-memo：打字时只有**改动过的那一行**需要重新打补丁，其余幽灵块（以及行号）
+               整块跳过。两万行的文件上，每次按键都要重建/比对 6 万个 vnode 是这一页最大的
+               开销（无头实测约 30ms/键）。v-memo 的依赖是「第几行 + 这一行的文字」，
+               正好是这两个东西决定渲染结果。 -->
           <div
             v-for="(line, i) in lines"
             :key="i"
+            v-memo="[i, line]"
             class="relative"
             :style="{ lineHeight: `${LINE_H}px`, minHeight: `${LINE_H}px` }"
           >
@@ -636,7 +672,6 @@ function onKeydown(event: KeyboardEvent) {
         autocomplete="off"
         autocorrect="off"
         :aria-label="t('files_editor_title', { name })"
-        @keydown="onKeydown"
         @scroll="syncScroll"
       />
     </div>

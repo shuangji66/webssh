@@ -71,6 +71,11 @@ func (m *AdminMux) handleFsRead(w http.ResponseWriter, r *http.Request) *apierr.
 		if fi.IsDir() {
 			return errTargetIsDir
 		}
+		// 只接受普通文件（见 errNotRegularFile）：读打开一个 FIFO 会阻塞到有写者出现，
+		// 而这条请求整段持着 sftpMu，一次点击就能把整个文件管理卡住。
+		if !fi.Mode().IsRegular() {
+			return errNotRegularFile
+		}
 		size = fi.Size()
 		if size > maxReadBytes {
 			tooLarge = true
@@ -268,13 +273,40 @@ func sniffImageType(data []byte) (string, bool) {
 	if imageTypes[ct] {
 		return ct, true
 	}
-	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
-		switch string(data[8:12]) {
-		case "avif", "avis":
-			return "image/avif", true
-		}
+	if isAVIF(data) {
+		return "image/avif", true
 	}
 	return "", false
+}
+
+// isAVIF 判断 data 是不是 ISO-BMFF 的 AVIF/AVIF 序列（ftyp 盒里带 avif / avis 品牌）。
+//
+// 不能只看 major brand（ftyp 盒的第 8–12 字节）：AVIF 规范只要求 `avif` 出现在
+// **compatible_brands** 列表里，把 avif 放在 compatible_brands、major brand 用别的
+// （`mif1` / `heic` 这类）的文件是合法且常见的。只看 major brand 会把它们判成「不是图片」，
+// 用户看到的是「内容不是图片，只是名字像」——而浏览器其实渲染得出来。
+//
+// ftyp 盒的布局（ISO/IEC 14496-12 §4.3）：size(4) | 'ftyp'(4) | major_brand(4) |
+// minor_version(4) | compatible_brands(4 × n，直到盒尾)。盒长自述在头 4 字节里，
+// 但可能不可信（0 = 直到文件尾，1 = 64 位长度），所以再按**实际可用的字节数**封顶。
+func isAVIF(data []byte) bool {
+	if len(data) < 12 || string(data[4:8]) != "ftyp" {
+		return false
+	}
+	if brand := data[8:12]; string(brand) == "avif" || string(brand) == "avis" {
+		return true
+	}
+	end := len(data)
+	if size := uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3]); size >= 16 && int(size) < end {
+		end = int(size)
+	}
+	for off := 16; off+4 <= end; off += 4 {
+		switch string(data[off : off+4]) {
+		case "avif", "avis":
+			return true
+		}
+	}
+	return false
 }
 
 // handleFsImage 读取远程图片文件（文件管理器预览用），成功时回**原始字节 + inline**。
@@ -302,6 +334,10 @@ func (m *AdminMux) handleFsImage(w http.ResponseWriter, r *http.Request) *apierr
 		}
 		if fi.IsDir() {
 			return errTargetIsDir
+		}
+		// 与 /api/fs/read 同一条判据（见 errNotRegularFile）：不能拿 FIFO / 设备节点去 Open。
+		if !fi.Mode().IsRegular() {
+			return errNotRegularFile
 		}
 		if fi.Size() > maxImageBytes {
 			return apierr.TooLarge("图片 %s 超过预览上限 %s", humanSize(fi.Size()), humanSize(maxImageBytes))

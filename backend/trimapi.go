@@ -14,7 +14,13 @@ import (
 // ---------------------------------------------------------------------------
 
 // handleTrimStatus 返回飞牛宿主是否可用（设置弹窗里要显示原因）。
+//
+// 这是条只读接口（契约 4.2 标的是 GET）：显式校验方法，与 /api/info、/api/sessions、
+// /api/hostkeys 那三条 GET 一致——不校验时 POST 也能进来，文档与实现就对不上了。
 func (m *AdminMux) handleTrimStatus(w http.ResponseWriter, r *http.Request) *apierr.Error {
+	if apiErr := requireMethod(r, http.MethodGet); apiErr != nil {
+		return apiErr
+	}
 	return apierr.Respond(w, map[string]any{"ok": true, "trim": m.trim.Probe(r.Context())})
 }
 

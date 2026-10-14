@@ -163,6 +163,16 @@ func decodeFormFilenameEscapes(name string) string {
 //     失败路径上 Remove(dest)，于是「一个字节没写成功、原文件也没了」）。同目录的 rename
 //     是同一文件系统内的原子替换；失败只留一个临时文件，由这里删掉，目标一个字节都不动。
 //
+// ⚠️ 临时文件 + rename 有**两个副作用**，必须显式处理（否则就是从「写坏原文件」变成
+// 「悄悄换掉它的权限」）：
+//  1. rename 换掉 inode，目标的 mode / 属主 / ACL / xattr 全部跟着临时文件走——**覆盖一个
+//     0755 的脚本会丢掉执行位、覆盖 0600 的密钥会变成默认的 0644**。所以覆盖前先记下
+//     原 mode，rename 之前把它设回临时文件上（属主与 ACL 用 SFTP v3 恢复不了，只能在文档里
+//     写清这个取舍；见 CONTRACT 12.4）。
+//  2. rename 只要求**目录**可写，不再要求目标文件可写——那会绕开目标文件自己的权限
+//     （0444 的文件也能被替换）。所以覆盖前用一次 O_WRONLY 打开（不带 O_TRUNC/O_CREATE，
+//     不碰内容也不碰 mtime）探一次写权限，判据与 /api/fs/edit-load 完全一致。
+//
 // 失败时留下的临时文件（进程被杀这类情况）用 `.webssh-upload-*.part` 命名，可一眼认出。
 func writeRemote(ctx context.Context, c *sftp.Client, dest string, src io.Reader, overwrite bool) (int64, bool, error) {
 	if err := c.MkdirAll(path.Dir(dest)); err != nil {
@@ -188,6 +198,11 @@ func writeRemote(ctx context.Context, c *sftp.Client, dest string, src io.Reader
 		return n, false, nil
 	}
 
+	origMode, hasOrig, err := writableTargetMode(c, dest)
+	if err != nil {
+		return 0, false, err
+	}
+
 	tmp := path.Join(path.Dir(dest), ".webssh-upload-"+store.NewID()+".part")
 	f, err := c.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
@@ -197,6 +212,9 @@ func writeRemote(ctx context.Context, c *sftp.Client, dest string, src io.Reader
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
+	if err == nil && hasOrig {
+		err = restoreRemoteMode(c, tmp, dest, origMode)
+	}
 	if err == nil {
 		err = replaceRemoteFile(c, tmp, dest)
 	}
@@ -205,6 +223,47 @@ func writeRemote(ctx context.Context, c *sftp.Client, dest string, src io.Reader
 		return n, false, err
 	}
 	return n, false, nil
+}
+
+// writableTargetMode 在覆盖上传**之前**看一眼目标：它存在吗、是不是普通文件、当前用户能不能写。
+//
+// 返回原文件的 mode（hasOrig 为 true 时有效）。目标不存在时 hasOrig=false——
+// 那是「新建」，不涉及 preservation。
+func writableTargetMode(c *sftp.Client, dest string) (os.FileMode, bool, error) {
+	fi, err := c.Lstat(dest)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if !fi.Mode().IsRegular() {
+		// 目录 / 设备 / 管道：mode 无从谈起，也不去探写权限（以 O_WRONLY 打开一个 FIFO
+		// 会阻塞到有读者出现，见 files_edit.go 的同一条注释）。让后面的 rename 去失败。
+		return 0, false, nil
+	}
+	// 写权限探测：只打开、不写、不截断、不创建，判据与 edit-load 的探测一致。
+	wf, err := c.OpenFile(dest, os.O_WRONLY)
+	if err != nil {
+		return 0, false, err
+	}
+	if err := wf.Close(); err != nil {
+		return 0, false, err
+	}
+	return fi.Mode().Perm(), true, nil
+}
+
+// restoreRemoteMode 把原文件的 mode 设回临时文件（best-effort）。
+//
+// 失败只记日志、不中断：内容已经写进临时文件了，用户要的是「上传成功」，为一次 chmod 失败
+// 把整次上传判死反而更糟。但**必须留一条日志**——静默丢掉 mode 正是这次要修的问题，
+// 只不过它不再是默认行为，而是一个可查的例外。
+func restoreRemoteMode(c *sftp.Client, tmp, dest string, mode os.FileMode) error {
+	if err := c.Chmod(tmp, mode); err != nil {
+		logx.Warnf("覆盖上传：无法把 %s 的权限位恢复到 %s（临时文件 %s，目标 %s）：%v",
+			dest, mode.Perm(), tmp, dest, err)
+	}
+	return nil
 }
 
 // replaceRemoteFile 把临时文件换成目标（覆盖已有文件）。

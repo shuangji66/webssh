@@ -96,11 +96,30 @@ func (r *sessionRuntime) stats(ctx context.Context) (sessionStats, *apierr.Error
 		r.dropStatsClient(client)
 		return sessionStats{}, apiErr
 	}
+	// Code 为负（-1）表示**对端没回 exit-status**：连接是在命令跑的过程中断的，stdout 是
+	// 半截的。这种输出照样能解析出「一半字段」（例如只有 stat1 与 mem，available 仍为 true），
+	// 拿它当一次正常读数比不显示更容易骗人，所以按失败处理并丢掉这条连接。
+	//
+	// 注意**只判负数**：正的非零退出码说明命令跑完了（非 Linux 远端上 `cat /proc/stat`
+	// 失败就是 1，而那份输出里的 df 段仍然有用，见 parseStats 的分段口径）。
+	if !statsUsable(res) {
+		r.dropStatsClient(client)
+		return sessionStats{}, apierr.Fail(502, "internal", "读取远端系统信息失败：连接在命令执行中断开")
+	}
 	out := parseStats(res.Stdout)
 	if !out.Available {
 		logx.Warnf("会话 %s 读不到远端主机的系统信息：%s", r.id, out.Reason)
 	}
 	return out, nil
+}
+
+// statsUsable 报告一次 stats 命令的输出能不能用来解析。
+//
+// 判据只有「对端回没回 exit-status」：Code < 0（remoteResult 里记作 -1）意味着连接在命令
+// 执行中断开，输出可能是半截的；Code >= 0（含非 0 退出码）意味着命令跑完了，输出完整。
+// 单独抽成函数是为了让单测能钉住这条口径——它决定了「半死连接」是被当成一次读数还是失败。
+func statsUsable(res remoteResult) bool {
+	return res.Code >= 0
 }
 
 // statsClient 取（必要时懒建）轮询专用的连接。
@@ -130,20 +149,25 @@ func (r *sessionRuntime) statsClientFor(ctx context.Context) (*ssh.Client, *apie
 		return nil, errFromConnect(cerr)
 	}
 
+	// 拨号期间会话被关了 / 另一个并发轮询先建好了：只留一条，多出来的关掉。
+	//
+	// 两处 Close 都刻意放在**锁外**（与 sessionRuntime.close 同一个理由：Close 会等对端的
+	// 响应，而 r.mu 还护着 terminals / order / closed，卡住它会连带卡住 /api/sessions
+	// 与新终端）。
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	// 拨号期间会话被关了 / 另一个并发轮询先建好了：只留一条，多出来的立刻关掉。
 	if r.closed {
+		r.mu.Unlock()
 		res.client.Close()
 		return nil, errSessionGone("会话已关闭：%s", r.id)
 	}
-	if r.statsClient != nil {
-		client := r.statsClient
-		res.client.Close()
-		return client, nil
+	if existing := r.statsClient; existing != nil {
+		r.mu.Unlock()
+		res.client.Close() // 并发轮询刚建好的那条才是缓存，我们这条多余的关掉
+		return existing, nil
 	}
 	r.statsClient = res.client
-	return r.statsClient, nil
+	r.mu.Unlock()
+	return res.client, nil
 }
 
 // dropStatsClient 丢掉一条已经不可用的轮询连接（只有它仍是当前缓存的那条时才清空缓存）。
@@ -231,6 +255,11 @@ type cpuSample struct {
 // 只认行首是 `cpu ` 的那一行：`cpu0`、`cpu1`……是每个核的，聚合行才是「整机」。
 // 空闲时间算 idle + iowait：iowait 期间 CPU 并没有在干活，不把它算空闲的话，一台在做大量
 // 磁盘 IO 的 NAS 会一直显示 90%+ 的占用（而它其实是在等盘）。
+//
+// **只累加前 8 个字段**（user…steal）：第 9、10 个是 guest / guest_nice，内核已经把
+// guest 时间算进 user、guest_nice 算进 nice 了（proc(5) 第 5 节），再加一遍等于把分母
+// 放大——跑虚拟机的机器上（NAS 上开 VM 很常见）CPU 占用率会系统性偏低。procps 的 vmstat
+// 同样是取前 8 个。
 func parseCPUSample(block string) (cpuSample, bool) {
 	for _, line := range strings.Split(block, "\n") {
 		if !strings.HasPrefix(line, "cpu ") {
@@ -242,6 +271,9 @@ func parseCPUSample(block string) (cpuSample, bool) {
 		}
 		var s cpuSample
 		for i, f := range fields {
+			if i >= 8 { // guest / guest_nice：已含在 user / nice 里，不重复计入分母
+				break
+			}
 			v, err := strconv.ParseUint(f, 10, 64)
 			if err != nil {
 				return cpuSample{}, false
