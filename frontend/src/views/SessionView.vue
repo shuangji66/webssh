@@ -747,8 +747,10 @@ function onRenamed(value: string) {
       </div>
     </section>
 
+    <!-- 关闭子终端前确认（会终止远端的 shell）。`visible` 必须用 v-model 接回去：
+         漏接的话弹窗关一次之后就再也弹不出来（症状与原因见 ConfirmDialog 头部注释）。 -->
     <ConfirmDialog
-      :visible="closeVisible"
+      v-model:visible="closeVisible"
       :title="t('session_close_confirm_title')"
       :message="t('session_close_confirm_msg', { title: closeTitle })"
       :danger="true"
@@ -756,7 +758,6 @@ function onRenamed(value: string) {
       :cancel-text="t('common_cancel')"
       @confirm="confirmCloseTerm"
       @cancel="closeUid = null"
-      @update:visible="(v) => { if (!v) closeUid = null }"
     />
 
     <PromptDialog

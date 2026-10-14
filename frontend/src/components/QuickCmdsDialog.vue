@@ -516,8 +516,10 @@ function close() {
 
   <QuickCmdEditDialog v-model:visible="editVisible" :cmd="editing" @save="onSave" />
 
+  <!-- 删除快捷指令前确认。`visible` 必须用 v-model 接回去：漏接的话弹窗关一次之后就再也
+       弹不出来（症状与原因见 ConfirmDialog 头部注释）。 -->
   <ConfirmDialog
-    :visible="deleteVisible"
+    v-model:visible="deleteVisible"
     :title="t('qc_delete_confirm_title')"
     :message="t('qc_delete_confirm_msg', { name: deleteTarget?.name ?? '' })"
     :danger="true"
@@ -525,6 +527,5 @@ function close() {
     :cancel-text="t('common_cancel')"
     @confirm="confirmDelete"
     @cancel="deleteTarget = null"
-    @update:visible="(v) => { if (!v) deleteTarget = null }"
   />
 </template>

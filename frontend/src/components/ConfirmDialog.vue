@@ -4,10 +4,18 @@
 // 关闭与确认分成两个 emit：`update:visible` 只同步显隐，`confirm` 才是用户按下确认。
 // 参考项目里踩过的坑：调用方把「待处理目标」挂在 `update:visible` 上清空，结果弹窗一关
 // 目标就没了，confirm 触发时什么也删不掉。这里保证顺序是 confirm/cancel 先发、再关。
-import { ref, watch } from 'vue'
+//
+// 显隐是**受控**的：只认 props.visible，组件自己不留第二份状态。调用方必须把
+// `update:visible` 接回去（`v-model:visible`，或 `@update:visible="x = $event"`）。
+// 早先这里另存了一份 `open` ref（`close()` 先把它置 false 再 emit），本意是「立刻收起」，
+// 但调用方只要漏接 update:visible——只清自己的「待处理目标」而没把 visible 置回 false——
+// 就成了**静默死锁**：弹窗看着关了，props.visible 却停在 true；下次再点同一个入口时
+// `visible.value = true` 没有变化，组件收不到任何信号，弹窗再也不出现，用户只能刷新页面
+// （子终端标签「取消一次后再也关不掉」就是这么来的）。改成受控后，漏接的表现是
+// 「弹窗当场关不掉」——当场可见、能定位，不再是「之后所有关闭都失灵」。
 import { t } from '@/i18n'
 
-const props = defineProps<{
+defineProps<{
   visible: boolean
   title: string
   message: string
@@ -22,17 +30,7 @@ const emit = defineEmits<{
   (e: 'cancel'): void
 }>()
 
-const open = ref(props.visible)
-watch(
-  () => props.visible,
-  (v) => {
-    open.value = v
-  },
-  { immediate: true }
-)
-
 function close() {
-  open.value = false
   emit('update:visible', false)
 }
 
@@ -50,7 +48,7 @@ function onCancel() {
 <template>
   <Teleport to="body">
     <Transition name="modal-fade">
-      <div v-if="open" class="fixed inset-0 z-50">
+      <div v-if="visible" class="fixed inset-0 z-50">
         <!-- 遮罩铺满全屏（点任意处 = 取消，含顶栏区域） -->
         <div class="absolute inset-0 bg-black/50" @click="onCancel"></div>
         <!-- 面板在「内容区域」内垂直居中（.region-center 已扣掉顶栏与底部键条）。
