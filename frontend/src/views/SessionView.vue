@@ -424,8 +424,12 @@ function onRenamed(value: string) {
           >
             <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="termStatusDotClass(tab)"></span>
             <span class="truncate">{{ terminals.titleOf(sid, tab) }}</span>
-            <!-- 关闭按钮：鼠标悬停才变红，触屏常驻红（.close-danger，见 style.css） -->
+            <!-- 关闭按钮：鼠标悬停才变红，触屏常驻红（.close-danger，见 style.css）。
+                 只剩这一个终端时不显示：关掉它这个会话就一个 shell 都不剩（要重新连还得再点
+                 「+」），而它恰恰是用户唯一在用的那个，误触代价最大。首页卡片里那一行仍可关闭，
+                 所以不是「关不掉」而是「别在唯一标签上手滑」。 -->
             <button
+              v-if="termTabs.length > 1"
               class="close-danger flex h-4 w-4 shrink-0 items-center justify-center"
               :class="activeSub === tab.uid ? 'on-brand' : ''"
               :title="t('session_close_terminal')"
