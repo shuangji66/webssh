@@ -199,6 +199,11 @@ data/
 | POST | `/api/fs/create` | `{sid, path}` | `{ok}`（空文件；已存在则 `duplicate`） |
 | POST | `/api/fs/rename` | `{sid, path, to}` | `{ok}`（目标已存在则 `duplicate`） |
 | POST | `/api/fs/remove` | `{sid, path, dir}` | `{ok}`（dir 必须与真实类型一致，防止误删整棵树） |
+| POST | `/api/fs/copy` | `{sid, paths:[], toDir}` | `{ok, files:[{path,size}], skipped}`（同名**跳过**，不覆盖） |
+| POST | `/api/fs/move` | `{sid, paths:[], toDir}` | 同上（跨设备无法 rename → `conflict`，绝不静默降级成复制+删除） |
+| POST | `/api/fs/compress` | `{sid, paths:[], name?}` | `{ok, archive:{path,size,dir}}`（tar.gz / zip，产物在**远程**归档目录） |
+| POST | `/api/fs/extract` | `{sid, path}` | `{ok, dir}` |
+| POST | `/api/fs/export-to-nas` | `{sid, path, overwrite?}` | `{ok, export:{path,size,files}}` |
 | POST | `/api/fs/upload` | multipart：`sid`、`path`(目标目录)、`overwrite`、`files[]` | `{ok, files:[{path,size}], skipped}` |
 | POST | `/api/fs/upload-from-nas` | `{sid, path, source, overwrite}` | `{ok, files, skipped}` |
 | POST | `/api/fs/download` | `{sid, path}` | 文件流（`Content-Disposition`；目录打 zip） |
@@ -215,9 +220,11 @@ data/
 ```jsonc
 SessionView  { id, name, host, port, user, authType: "password"|"key",
                hasPassword: bool, hasPrivateKey: bool, keyFingerprint?: string,
-               note, createdAt, updatedAt, lastUsedAt? }          // 时间一律 RFC3339
-SessionInput { id?, name?, host, port?, user, authType,
-               password?, privateKey?, passphrase?, note? }        // 密钥字段缺省 = 不修改
+               credentialSaved: bool,                              // false = 该会话不落盘凭据
+               note, createdAt, updatedAt, lastUsedAt? }           // 时间一律 RFC3339
+SessionInput { id?, name?, host?, port?, user?, authType?,
+               password?, privateKey?, passphrase?, note?,
+               saveCredential? }                                    // 密钥字段缺省 = 不修改
 TestOutcome  { success, code, detail?, stage?, fingerprint?, keyType?,
                trusted?, mismatch?, banner?, latencyMs? }
 TerminalInfo { id, title, createdAt, exited }
@@ -229,6 +236,7 @@ QuickCmd     { id, name, content, auto }
 HostKeyRecord{ host, port, keyType, fingerprint, addedAt }
 AclEntry     { path, readable, writable, deletable }
 RuntimeInfo  { version, bootId, dataDir, adminSock, adminBaseURL, hostname,
+               archiveDir, exportRoot,                              // 压缩产物目录 / 飞牛导出根
                trim: {available, message, app}, gateway: {uid, username, isAdmin, fromGateway} }
 ```
 
@@ -261,11 +269,20 @@ RuntimeInfo  { version, bootId, dataDir, adminSock, adminBaseURL, hostname,
 
 路径 `/api/terminal/ws?sid=<会话 id>&tid=<终端 id 或省略>`。握手照 terminal 的自实现
 （`Sec-WebSocket-Accept`、单端帧编解码、掩码解包、上限、`opText/opBin/opClose/opPing/opPong`）。
+握手校验：`Sec-WebSocket-Key` 必须是 16 字节 base64；**不回显** `Sec-WebSocket-Protocol`
+（本应用没有子协议）；客户端帧必须掩码，RSV1-3 置位或保留 opcode 一律失败。
 
-- `tid` 为空 → **新建终端**：先发文本帧 `\x1b]tid;<id>\x07`（前端据此回填 id），再 `attach`。
+- ⚠️ **服务端 → 客户端的终端数据一律用二进制帧（`opBin`），不用文本帧。** 终端输出是任意
+  字节流，而文本帧的载荷按 RFC 6455 §8.1 必须是合法 UTF-8：只要有一个非法字节（分帧切在
+  多字节字符中间、或远端本来就输出非 UTF-8 字节，如 `cat` 二进制文件、GBK 文件名被 `ls`
+  回显），浏览器就会判定协议错误并**直接断开连接**。回放按 32 KiB、实时按 8 KiB 切帧，
+  两者都与字符边界无关。前端因此用**流式** `TextDecoder`（`{stream:true}`）解码，跨帧的
+  半个字符会被拼回来；非法字节按替换字符显示（真实终端的行为）。改回文本帧 = 含中文的终端
+  在重挂载时随机断连，`internal/ws` 与 `protocol.go` 的注释里都写了这一点。
+- `tid` 为空 → **新建终端**：先发一帧 `\x1b]tid;<id>\x07`（前端据此回填 id），再 `attach`。
 - `tid` 非空 → 挂载已有终端：回放历史（分帧，单帧 ≤ 32 KiB，最多 4 MiB）→ `\x1b]ready\x07`
   → 进入实时流。
-- 终端不存在 → 文本帧 `\r\n\x1b[31m…\x1b[0m\r\n` + `\x1b]gone\x07` 控制帧，然后关闭。
+- 终端不存在 → 一帧 `\r\n\x1b[31m…\x1b[0m\r\n` + `\x1b]gone\x07` 控制帧，然后关闭。
   ⚠️ 前端只认 `\x1b]gone\x07`，**不能**用人类可读文本判定（终端里 `echo` 出同样文本会误判）。
 - 客户端 → 服务端：普通字节写入远程 PTY；`\x1b]resize;<cols>;<rows>\x07` → `Session.WindowChange`；
   `\x1b]ping\x07` → 心跳，不写 PTY。
@@ -333,7 +350,8 @@ frontend/src/
 │   ├── ConfirmDialog.vue       [D]    visible/title/message/confirmText/cancelText → confirm|cancel
 │   ├── PromptDialog.vue        [D]    visible/title/label/placeholder/initialValue → confirm(value)|cancel
 │   ├── SettingsDialog.vue      [D]    主题/语言/字体/字号/关于（已信任主机第十一轮挪到会话弹窗）
-│   ├── QuickCmdsDialog.vue     [D]    全局 + 专属（会话）两个分组
+│   ├── QuickCmdsDialog.vue     [D]    三页：常用指令 / 全局 / 专属（会话）
+│   ├── CredentialPromptDialog.vue [D] 「不保存凭据」的会话在 open 时弹的凭据输入框
 │   ├── QuickCmdEditDialog.vue  [D]    新增/编辑单条
 │   ├── home/SessionCard.vue    [D]    大号会话卡片
 │   ├── home/SessionFormDialog.vue [D] 新增/编辑 + 测试连接
@@ -341,7 +359,8 @@ frontend/src/
 │   ├── terminal/KeypadBar.vue     [B] 移动端辅助键条
 │   ├── files/FileManager.vue      [C] 文件管理面板（工具栏 + 面包屑 + 列表/网格 + 菜单）
 │   ├── files/FileTree.vue         [C] 左栏文件树
-│   ├── files/BreadcrumbBar.vue    [C] 左栏面包屑（含「完整文件管理」入口）
+│   ├── files/BreadcrumbBar.vue    [C] 左栏面包屑（只有「刷新」与「隐藏面包屑」两个按钮）
+│   ├── files/InfoDialog.vue       [C] 「信息」弹窗（/api/fs/info，见 15.5）
 │   ├── files/UploadDialog.vue     [C] 上传弹窗（本地文件 / 本地目录 / 飞牛文件）
 │   └── files/PreviewDialog.vue    [C] 文本预览（可选，用 /api/fs/read）
 └── views/
@@ -414,8 +433,11 @@ interface PaneControls { paste(): void; clear(): void; reconnect(): void; search
 // [C] stores/sftp.ts
 export interface SftpState { dir: string; home: string; entries: FsEntry[]; loading: boolean;
                              error: string; back: string[]; forward: string[]; view: 'list'|'grid';
+                             mode: PermMode; sort: SortState; multi: boolean;
                              treeChildren: Record<string, FsEntry[]>; expanded: string[];
                              treeLoading: Record<string, boolean>; selected: string[] }
+// PermMode = 'symbolic'|'numeric'（权限列显示模式，点表头「权限」切换）
+// SortState = { key: 'name'|'size'|'mtime'|'mode'; asc: boolean }
 useSftpStore(): {
   stateOf(sid: string): SftpState
   ensure(sid: string): Promise<void>            // 首次进入：定位家目录并加载
@@ -435,6 +457,26 @@ useSftpStore(): {
   download(sid: string, path: string): Promise<void>
   select(sid: string, paths: string[]): void
   clearSelection(sid: string): void
+  // 多选模式（模式而非一次性全选，见 15.6/AGENTS 第 5 节）
+  setMulti(sid: string, on: boolean): void; exitMulti(sid: string): void
+  // 剪贴板：全局一份、不跨会话；「清不清」由入口决定（keepClipboard）
+  copyToClipboard(sid: string, paths: string[]): void
+  cutToClipboard(sid: string, paths: string[]): void
+  clipboardFor(sid: string): Clipboard | null; clipboardIsForeign(sid: string): boolean
+  clearClipboard(): void
+  paste(sid: string, toDir: string, keepClipboard: boolean): Promise<PasteOutcome>
+  // 远程批量操作与归档
+  compress(sid: string, paths: string[], format: 'tar.gz'|'zip', name?: string): Promise<ArchiveInfo>
+  extract(sid: string, path: string): Promise<string>
+  exportToNas(sid: string, path: string, overwrite: boolean): Promise<ExportInfo>
+  // 树 / 运行信息
+  expandPath(sid: string, path: string): Promise<void>
+  refreshTree(sid: string, path: string): Promise<void>
+  runtime(sid: string): RuntimeInfo | null; ensureRuntime(sid: string): Promise<void>
+  exportRoot(sid: string): string; archiveDir(sid: string): string
+  // 权限列模式 / 排序
+  toggleMode(sid: string): void; cycleSort(sid: string, key: string): void
+  sorted(sid: string): FsEntry[]
   forget(sid: string): void
 }
 
@@ -460,7 +502,8 @@ useToastStore(): { toasts: {id:number;msg:string;type:'success'|'error'|'info'}[
 // [冻结] stores/sessionUi.ts
 export const FILES_TAB = 'files'
 useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesActive(sid): boolean;
-                       leftIsVisible(sid): boolean; setLeftVisible(sid, v); toggleLeft(sid); forget(sid) }
+                       leftHiddenOf(sid): boolean; setLeftHidden(sid, hidden: boolean); forget(sid) }
+// 左栏可见性 = wide && !filesActive && !leftHidden（三者的交集，见 13.1/14.3/16.1）
 ```
 
 ### 6.2 组件接口
@@ -470,8 +513,8 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 | `TerminalPane.vue` [B] | `{ sid: string; tab: TermTab; active: boolean }` | — | 自己登记 paneControls、自己管 WS 与 xterm；**不负责**子标签栏 |
 | `KeypadBar.vue` [B] | `{ ctrl: boolean; alt: boolean; shift: boolean }` | `key(data)`, `toggle('ctrl'\|'alt'\|'shift')` | 与 terminal 项目一致 |
 | `FileManager.vue` [C] | `{ sid: string; mobile?: boolean }` | — | 完整文件管理面板；内部自己发起上传/下载/删除等 |
-| `FileTree.vue` [C] | `{ sid: string; mobile?: boolean }` | `open-files(path)` | 左栏文件树；点目录 = 导航 + 切到文件管理子标签 |
-| `BreadcrumbBar.vue` [C] | `{ sid: string }` | `show-full()` | 左栏面包屑 + 「完整文件管理」按钮 |
+| `FileTree.vue` [C] | `{ sid: string; mobile?: boolean }` | — | 左栏文件树；点目录 = 导航（**不切**文件管理子标签，见 11.3）。动作全部直接落 store |
+| `BreadcrumbBar.vue` [C] | `{ sid: string }` | — | 左栏面包屑；只有「刷新」「隐藏面包屑」两个按钮（18.1 删掉了「完整文件管理」） |
 | `UploadDialog.vue` [C] | `{ visible: boolean; sid: string; dir: string }` | `update:visible(v)`, `done(UploadResult)` | 三个分组：本地文件 / 本地目录 / 飞牛文件 |
 | `ConfirmDialog.vue` [D] | `{ visible, title, message, confirmText?, cancelText?, danger? }` | `confirm()`, `cancel()`, `update:visible(v)` | 通用确认框 |
 | `PromptDialog.vue` [D] | `{ visible, title, label?, placeholder?, initialValue?, confirmText?, cancelText? }` | `confirm(value: string)`, `cancel()`, `update:visible(v)` | 通用输入框（重命名 / 新建） |
@@ -485,24 +528,31 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   `home.closeSession(id)`（终止该会话全部终端 + SFTP）→ 关标签 → `terminals.forget(sid)`、
   `sftp.forget(sid)`、`sessionUi.forget(sid)`。**带会话的标签关闭前必须确认**。
 - **打开会话**：`home.openSession(id)` → 无条件 `appTabs.openSession(id, label)` →
-  `terminals.ensure(sid, state)` → 桌面端（`useMobileLayout() === false`）若没有任何终端标签则
-  自动建 1 个：`terminals.add(sid)`；移动端不自动建，由用户点 +。
+  `terminals.ensure(sid, state)` → 没有任何终端标签就自动建 1 个：`terminals.add(sid)`。
+  **桌面与窄屏一致**（第五轮改的，见 15.3：手机上新开会话也直接落在「终端 1」）。
+  新终端挂载时若是激活项，面板自己会聚焦（`TerminalPane` 的 `watch(active, {immediate:true})`），
+  用户不用先点一下终端才能打字。
 - **子标签栏**（`SessionView`）：
   - 固定段（不参与横向滚动）：`[文件管理]`（始终第一个，`FILES_TAB`）。
   - 滚动段：终端标签（点选激活、双击重命名、关闭按钮、显示状态点）+ 末尾 `[+]`。
   - 切到终端标签 → `sessionUi.setActiveSub(sid, tab.uid)`；切到文件管理 →
     `sessionUi.setActiveSub(sid, FILES_TAB)`。
-  - 面板用 `v-show` 全部保持挂载（终端靠 visibility 隐藏以保持尺寸与 WS 存活）。
-- **左栏**（桌面端）：`BreadcrumbBar` + `FileTree`，顶部有「完整文件管理」按钮（触发 `show-full`
-  → 切到文件管理子标签）。移动端不渲染左栏（`SessionView` 直接把文件管理面板当作子页面）。
-- **快捷指令**：工具条入口打开 `QuickCmdsDialog`，弹窗内部有「全局 / 专属」两个分组；
-  「专属」只有会话视图里能切（首页不显示专属分组）。点击命令 → 发给当前激活终端
+  - 面板**全部保持挂载**、`absolute inset-0` 叠放，非激活的加 `invisible`（`visibility:hidden`）。
+    **不要**用 `v-if`（切标签会销毁 xterm 与 WS）也不用 `v-show`/`display:none`（尺寸为 0，
+    FitAddon 量不到、WebGL 反复触发 0 尺寸重排）。例外只有左栏（没有 xterm，且必须真的让出
+    横向空间，见 `SessionView.vue` 的 `showLeft`）。
+- **左栏**（宽屏且终端在前台且没被手动收起时）：`BreadcrumbBar` + `FileTree`。可见性是
+  `wide && !filesActive && !leftHiddenOf(sid)` 的交集（13.1/14.3/16.1）；收起时子标签栏左侧出现
+  「展开面包屑」。**没有**「完整文件管理」按钮（13.1/18.1 两次删除）。移动端不渲染左栏
+  （`SessionView` 直接把文件管理面板当作子页面）。
+- **快捷指令**：工具条入口打开 `QuickCmdsDialog`，弹窗内部是**三页**：`常用指令 | 全局 | 专属`
+  （11.6）；「专属」只有会话视图里能切（首页不显示专属分组）。点击命令 → 发给当前激活终端
   （`paneControls.get(sid, activeUid)?.send(...)`），`auto` 为真时在内容后补 `\r`。
   未连接时 toast `qc_not_connected`。
 - **首页卡片**：只平铺（网格，不提供列表/表格视图），卡片做大（`min-w-[22rem]`）。
-  卡片必须显示：会话名 / `user@host:port` / 认证方式徽标（密码 / 密钥）/ 打开状态
-  （未打开 / 已打开 + 开了几个终端子标签 + 打开于多久之前）/ 最近使用时间；
-  操作：打开（或关闭）、编辑、删除。已打开时「关闭」按钮要显眼。
+  卡片显示：会话名 / `user@host:port` / 备注 / 「不保存凭据」提醒 / **内联的子终端列表**
+  （点一行 = 快捷打开）。**不再有**认证方式徽标、打开状态灯、打开时间与最近使用时间
+  （15.2/16.2 删的，见 16.2）。操作：打开（或关闭）、编辑、删除。已打开时「关闭」按钮要显眼。
 - **终端面板工具栏**（桌面端在子标签栏右侧，移动端第二行）：搜索 / 粘贴 / 清屏 / 重连 /
   快捷指令 / 设置 + 折叠功能名按钮（沿用 terminal 的 `labelsOn` 行为）。
 - 移动端：底部辅助键条（`KeypadBar`，仅移动端布局渲染）；虚拟键盘跟随（`--vvh/--vvt`）；
@@ -533,7 +583,14 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 ## 9. 验收与自测
 
 - 后端：`make test` 全绿（含 `testssh` 集成测试）。
-- 前端：`make typecheck` 无错误；`make dev` 能成功产出 `./webssh`。
+  ⚠️ 无 PTY 的环境（多数 CI 容器：`open /dev/ptmx: permission denied`）会**静默跳过** 11 个
+  PTY 用例（`requirePTY` → `t.Skip`），包括终端收发 / 单挂载点顶号 / 历史回放。看到「全绿」
+  时要顺带看一眼 skip 数，别把「没跑」当成「跑过了」。
+- 前端：`make check`（= `vue-tsc` + `check:i18n`）无错误；`make dev` 能成功产出 `./webssh`。
+  **完整门禁是 `make test check`**。
+- i18n key 数：**以 `npm run check:i18n` 的实际输出为准（当前 zh/en 各 399）**。下面各轮小节
+  括号里的 key 数是**那一轮当时的快照**，有增有删、不保证单调，不要拿它当基准（历史上有
+  396/397/398/400/402 几个数字并存）。
 - 端到端（Lead 负责）：用 `testssh` 起一个本地 SSH/SFTP 服务，走完整流程——建会话 → 测试连接
   （首次要信任指纹）→ 打开会话 → 自动出现 1 个终端标签 → 输入命令有回显 → 新建第 2 个终端
   标签 → 文件管理浏览、上传（本地文件/目录）、下载、新建、重命名、删除 → 快捷指令（全局 +
@@ -638,12 +695,14 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
      （因为没有可保留的东西），打开开关就等于把凭据存下来。
 4. **卡片上的终端数量可点击**：点开一个弹窗，列出该会话当前打开的每个终端
    （显示 `终端 N`、可改名、创建时间、单个关闭按钮、新建按钮）。
+   → **第六轮把这个弹窗整个删掉，终端列表直接内联在卡片下（带快捷打开），见 16.2。**
    弹窗里的**会话名称**与会话标签名**双向同步**：弹窗改名 → `/api/sessions/save` 更新配置 +
    应用标签标题；应用标签双击改名 → 同样调用 `/api/sessions/save` 更新配置。
    为此前端新增 `home.renameSession(id, name)`；`appTabs.setTitle` 只作为展示层缓存。
-   - 改名载荷：`{id, name, host, port, user, authType}`（**必须带上 `port` 原值**：更新一个已打开的
-     会话时，后端早期版本会把缺省的 `port=0` 归一成 22 并判成「改了身份」→ 409 conflict，
-     非 22 端口必现。后端已按「更新语义」修成 `port==0` 视为保留原值，但调用方仍应发全字段）。
+   - 改名载荷：**只发 `{id, name}`**（第六轮起）。历史上必须带 `port` 原值的原因是后端把
+     缺省的 `port=0` 归一成 22 并判成「改了身份」→ 409 conflict；现在后端按部分更新语义
+     把 `port==0` 视为保留原值（`resolveSessionFields`），回传本地缓存的身份字段反而会在
+     「另一台设备刚改过地址」时把它覆盖掉。
    - 统一的**部分更新语义**：更新已有会话时，`host`/`user`/`authType`/`port` 为空串或 0 表示
      「保留原值」；`name` 空串同样保留。凭据字段缺省 = 不修改。
 5. `terminals` 新增：`add(sid, opts?: { initialCommand?: string })` 与
@@ -738,7 +797,9 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 
 ### 11.6 快捷指令
 
-- 会话工具条里的「快捷指令」与「设置」按钮**删除**（顶栏已有全局入口）。
+- ~~会话工具条里的「快捷指令」与「设置」按钮删除（顶栏已有全局入口）。~~
+  → **这条被 13.1/13.2 推翻了**：快捷指令按钮**留在会话工具条**（它的作用对象是当前激活终端），
+  设置按钮进**首页**工具条；顶栏右侧不再有任何按钮。以 13.1/13.2 为准。
 - 弹窗改为**三页**：`常用指令 | 全局 | 专属`。
   - 「常用指令」是内置清单（`frontend/src/data/presetCommands.ts`，按用途分组：系统信息 /
     资源与进程 / 磁盘与目录 / 网络 / 日志 / 服务 / 用户 / Docker），
@@ -802,7 +863,7 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 合法路径改坏了。现在只把 TrimSpace 用于「整串都是空白」的判断，其余原样交给 SFTP，
 并加了回归测试 `TestRemotePathKeepsSurroundingSpaces`（list / export / remove 三个动作）。
 
-### 12.3 端到端验证（`internal/testssh` + 真二进制 + 真 unix socket，52 项断言全过）
+### 12.3 端到端验证（`internal/testssh` + 真二进制 + 真 unix socket，58 项断言全过）
 
 夹具特意含病态名字：`dir with space`、`it's a dir`、`evil $(touch x) ' name `（尾空格 + `$()` + 单引号），
 用来验证「远程命令里所有插值路径都用单引号引用」这条不是纸面约定。
@@ -1700,7 +1761,7 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   `settings_known_hosts_remove_failed`、`settings_known_hosts_confirm`；
   新增 6 条：`form_trusted_key`、`form_trusted_key_remove`、`form_trusted_key_removed`、
   `form_trusted_key_remove_failed`、`form_trusted_key_remove_confirm`、
-  `home_delete_trust_failed`（key 总数不变，仍是 396）。
+  `home_delete_trust_failed`（key 总数不变，仍是 399）。
 - 后端**未改**：`GET /api/hostkeys`、`POST /api/hostkeys/forget`（记录不存在时回 `not_found`）
   原样复用——「没有记录就不显示按钮」正是为了不去撞那个 `not_found`。
 
@@ -1718,7 +1779,7 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 
 ### 21.7 本轮的验证
 
-- `npm run type-check` + `npm run check:i18n`（402 → **398** key）+ `make`
+- `npm run type-check` + `npm run check:i18n`（402 → **399** key）+ `make`
   + `make test` 全绿（后端本轮未改，跑一遍确认仓库状态没被带坏）。
 - **剪贴板**（真二进制 + `internal/testssh` 的 `testsshd` + `socat` 桥，1280×720，baseurl
   `/app/WebSSH`）：本轮 `act.click` 可用，所以菜单项与剪贴板栏按钮都是**真实点击**，不是直接

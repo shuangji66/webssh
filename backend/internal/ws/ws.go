@@ -1,6 +1,7 @@
 // Package ws 是服务端用的 WebSocket 帧编解码（RFC 6455 的最小可用子集）。
 //
-// 为什么不用第三方库：整条链路只需要「服务端发文本帧 / 收客户端掩码帧 + 两个控制帧」，
+// 为什么不用第三方库：整条链路只需要「服务端发数据帧（终端输出，二进制，见 protocol.go 的说明）
+// / 收客户端掩码帧 + 两个控制帧」，
 // 一个库会带进一堆用不到的东西（还有它自己的升级/关闭语义）。这里照抄参考实现
 // terminal/backend/terminal.go 的实现，含它踩过的两个坑：
 //   - 帧长字段由客户端给（最大 2^63-1），**先校验上限再分配**，否则一条消息就能让进程 OOM；
@@ -84,14 +85,40 @@ func CloseFrame(code uint16, reason string) []byte {
 //
 // 传入的是 *bufio.Reader（不是裸 conn）：握手时缓冲里可能已经躺着客户端抢先发来的帧，
 // 从裸连接读会把这几个字节丢掉。
+//
+// 服务端读**客户端**帧用 ReadClientFrame（多一条「必须掩码」的校验）；ReadFrame 留给
+// 「读服务端帧」的场景（本仓库的测试客户端就是用它读服务端帧的，那种帧不掩码）。
 func ReadFrame(r io.Reader) (byte, bool, []byte, error) {
+	return readFrame(r, false)
+}
+
+// ReadClientFrame 与 ReadFrame 相同，但要求帧带掩码（RFC 6455 §5.1：客户端 → 服务端
+// 的帧必须掩码）。服务端读循环用它。
+func ReadClientFrame(r io.Reader) (byte, bool, []byte, error) {
+	return readFrame(r, true)
+}
+
+func readFrame(r io.Reader, requireMask bool) (byte, bool, []byte, error) {
 	var h [2]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
 		return 0, false, nil, err
 	}
+	// 保留位：本实现没有协商任何扩展，RSV1-3 永远是 0。RFC 6455 §5.2 要求「收到即失败」——
+	// 放行等于把协议未定义的行为当普通数据吞掉（将来某天接一个扩展就会静默错位）。
+	if h[0]&0x70 != 0 {
+		return 0, false, nil, fmt.Errorf("websocket 帧设置了保留位（RSV1-3）：0x%02x", h[0])
+	}
 	fin := h[0]&0x80 != 0
 	op := h[0] & 0x0f
+	switch op {
+	case OpContinuation, OpText, OpBinary, OpClose, OpPing, OpPong:
+	default:
+		return 0, false, nil, fmt.Errorf("websocket 帧使用了保留 opcode：0x%x", op)
+	}
 	masked := h[1]&0x80 != 0
+	if requireMask && !masked {
+		return 0, false, nil, fmt.Errorf("websocket 客户端帧没有掩码（RFC 6455 §5.1 要求必须掩码）")
+	}
 	ln := uint64(h[1] & 0x7f)
 	switch ln {
 	case 126:
@@ -135,6 +162,16 @@ func ReadFrame(r io.Reader) (byte, bool, []byte, error) {
 // 回放直接把错误返回给 WS handler。
 func WriteFramed(c net.Conn, frame []byte) error {
 	_ = c.SetWriteDeadline(time.Now().Add(WriteTimeout))
+	_, err := c.Write(frame)
+	return err
+}
+
+// WriteFramedDeadline 与 WriteFramed 相同，但由调用方给写超时。
+//
+// 给「整段回放」这类需要**总时限**的场景用：WriteFramed 每次都把超时重置成 now+5s，
+// 128 帧的历史回放最坏就是 128 × 5s，而这段时间里一直持有 terminal 的 histMu。
+func WriteFramedDeadline(c net.Conn, frame []byte, deadline time.Time) error {
+	_ = c.SetWriteDeadline(deadline)
 	_, err := c.Write(frame)
 	return err
 }

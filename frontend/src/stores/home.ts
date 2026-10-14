@@ -171,17 +171,19 @@ export const useHomeStore = defineStore('home', () => {
    * 会话改名（弹窗里的名称输入框与顶栏标签双击共用这一条路径）。
    *
    * 为什么必须走 `/api/sessions/save` 而不是只改本地展示：名字是**会话配置的一部分**，
-   * 只改本地的话刷新换台设备就没了。而 save 是整份提交，缺了 host/user/authType 后端会当成
-   * 新增或改错对象，所以这里用本地配置里的原值补齐；**绝不**带 password/privateKey/passphrase
-   * ——这既没必要（名字与凭据无关），也会把「留空 = 不修改」的语义搅浑。
+   * 只改本地的话刷新换台设备就没了。
    *
-   * ⚠️ **port 必须一起发**（契约 11.1.4 的示例载荷里没有它，但漏了它改名在已打开的会话上会
-   * 直接失败）：后端的 port 是非指针 int，缺省被 `validateSessionFields` 归一成 22，于是
-   * 「当前 2222 ≠ 收到 22」被判成改了身份 —— 会话开着时后端会回 `conflict`（
-   * 「会话已打开，请先关闭再修改地址 / 端口 / 登录名」）。实测：带 port 后改名成功，且配置里的
-   * 凭据与打开状态都不受影响。
+   * **只发 `{ id, name }`**：后端 save 是「部分更新」语义（缺省字段 = 保持原值，
+   * 见 backend/sessions.go 的 resolveSessionFields）。第六轮之前这里会回填本地缓存的
+   * host/user/authType 一起提交，结果「另一台设备刚改过地址」时会被本地的旧值覆盖回去。
+   * 也**绝不**带 password/privateKey/passphrase——改名与凭据无关，带上还会把
+   * 「留空 = 不修改」的语义搅浑。
    *
-   * 名字为空串时后端保留原名（契约 11.1.4），所以这里回填的是后端返回的 session 而不是入参。
+   * ⚠️ port 不再需要一起发（历史坑：后端曾把缺省的 port 归一成 22，于是「当前 2222 ≠ 收到 22」
+   * 被判成改了身份，会话开着时直接回 conflict。现在 save 走「缺省 = 保持原值」，不会再误判）。
+   *
+   * 名字为**空串**时后端是「清除自定义名」（契约 11.1：显式空串 = 清除、字段缺省 = 保持），
+   * 展示时由 sessionLabel() 退回 `user@host`。所以这里回填的是后端返回的 session，不是入参。
    */
   async function renameSession(id: string, name: string): Promise<SessionView> {
     if (!sessions.value.some((item) => item.id === id)) {

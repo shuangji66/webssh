@@ -81,6 +81,14 @@ let imeGuard: {
 let searchAddon: SearchAddon | null = null
 let webglAddon: WebglAddon | null = null
 let sock: WebSocket | null = null
+// 终端数据的解码器：**必须是流式的，而且每条连接一个**。
+//
+// 后端发的是二进制帧（见 backend/protocol.go 的 ⚠️：终端输出是任意字节流，用文本帧会
+// 被浏览器按 RFC 6455 校验 UTF-8，一个非法字节就断开连接），所以这里自己解码。
+// `{stream:true}` 让 TextDecoder 把**跨帧切开的半个多字节字符**留在内部缓冲里等下一帧，
+// 否则每个帧单独解码会把「中」变成两个替换字符（重挂载回放 32 KiB 分帧必然踩到）。
+// 每条连接一个实例：上一连接残留的半个字符不能泄漏给新连接。
+let decoder: TextDecoder | null = null
 let termOpened = false
 let disposed = false
 // 待补的聚焦意图：term.open() 之前 .xterm-helper-textarea 尚未创建，此时 term.focus()
@@ -366,6 +374,8 @@ function disconnect() {
     sock.close()
     sock = null
   }
+  // 连接没了，解码器里可能还留着半个多字节字符：丢掉，别泄漏给下一次挂载
+  decoder = null
 }
 
 // 新终端的一次性命令（`tab.initialCommand`，目前只有「在此目录新建终端」的 `cd '<目录>'`）。
@@ -405,6 +415,7 @@ function openSocket() {
   // tid 为空 = 让后端新建一个终端（随后用 TID_PAYLOAD_RE 回填 id）
   sock = new WebSocket(wsUrl(props.sid, props.tab.tid))
   sock.binaryType = 'arraybuffer'
+  decoder = new TextDecoder()
 
   sock.onopen = () => {
     setConnected(true)
@@ -414,7 +425,9 @@ function openSocket() {
     flushInitialCommand()
   }
   sock.onmessage = (ev) => {
-    const data = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data)
+    // 二进制帧走流式解码（见 decoder 的说明）；字符串只在后端万一发文本帧时才会出现。
+    const data =
+      typeof ev.data === 'string' ? ev.data : (decoder ?? new TextDecoder()).decode(ev.data, { stream: true })
     handleData(data)
   }
   sock.onclose = (ev: CloseEvent) => {
@@ -1378,6 +1391,14 @@ watch(
 // 搜索词变化 → 增量搜索；清空 → 清除高亮
 watch(searchTerm, onSearchTermChange)
 
+// 激活即聚焦（含**挂载时就是激活**的情况，所以必须 immediate）。
+//
+// 没有 immediate 时，面板以 active=true 挂载这一帧不会触发聚焦——而「从首页点打开」
+// （HomeView.openWith）与「刷新后恢复会话」（App.vue 的启动循环）都是这种形态：
+// 标签切过去了、终端出来了，焦点却还在首页那个按钮上（首页随后被 v-show 隐藏，焦点
+// 掉回 body），用户接着敲的字符全部丢失，必须先用鼠标点一下终端。会话内的「+」与
+// 「快捷打开」各自显式调过 focus，所以只有这两条路能看出来。
+// 挂载帧里 term.open() 还没完成，focusTerm() 会把意图挂起（pendingFocus），open() 后补发。
 watch(
   () => props.active,
   (v) => {
@@ -1390,7 +1411,8 @@ watch(
         term?.scrollToBottom()
       })
     }
-  }
+  },
+  { immediate: true }
 )
 
 onMounted(() => {

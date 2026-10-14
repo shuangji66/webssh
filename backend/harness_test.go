@@ -146,6 +146,12 @@ func newUnixClient(sock string) *http.Client {
 }
 
 // restart 用同一个数据目录重建后端（模拟进程重启：bootId 换新、内存态会话消失、配置保留）。
+//
+// 必须先关掉旧实例（listener + 终端/SFTP）：「重启」= 旧进程消失。不关就相当于两个实例
+// 同时监听同一个 socket——新的 listenAdminSocket 会（正确地）拒绝抢一个活着的 socket，
+// 而真实重启时旧进程早就没了。
+//
+// socket 文件**刻意不删**：模拟 kill -9 之后留下的残留文件，验证新实例能自己清掉它再绑。
 func (a *testApp) restart(t *testing.T) *testApp {
 	t.Helper()
 	// 模拟新进程：bootId 是进程级随机标识，重启必然不同。
@@ -153,6 +159,9 @@ func (a *testApp) restart(t *testing.T) *testApp {
 	// 旧连接池里可能还连着上一个服务实例：必须丢掉（否则请求会打到已经「重启」过的进程上，
 	// 表现就是「重启后内存态居然还在」）。
 	a.client.CloseIdleConnections()
+	_ = a.srv.Close()
+	a.mux.sessions.closeAll()
+
 	next := &testApp{t: t, renv: a.renv}
 	mux, err := newAdminMux(a.renv)
 	if err != nil {
@@ -477,7 +486,11 @@ func (w *wsClient) readFrame(timeout time.Duration) (byte, []byte, error) {
 	return op, payload, err
 }
 
-// readText 读到一帧文本（跳过 ping/pong），返回内容。
+// readText 读到一帧终端数据（跳过 ping/pong），返回内容。
+//
+// 顺带钉住一条协议不变量：**服务端 → 客户端的终端数据必须是二进制帧**（见 protocol.go 的
+// ⚠️：终端输出是任意字节流，文本帧会被浏览器按 UTF-8 校验并直接断连）。这里的 t.Errorf
+// 是「没有浏览器可用」的测试环境里唯一能发现「有人把 opcode 改回文本帧」的地方。
 func (w *wsClient) readText(timeout time.Duration) (string, error) {
 	for {
 		op, payload, err := w.readFrame(timeout)
@@ -485,7 +498,10 @@ func (w *wsClient) readText(timeout time.Duration) (string, error) {
 			return "", err
 		}
 		switch op {
-		case ws.OpText, ws.OpBinary:
+		case ws.OpBinary:
+			return string(payload), nil
+		case ws.OpText:
+			w.t.Errorf("服务端终端数据必须用二进制帧，收到文本帧：%q", snippetOf(payload))
 			return string(payload), nil
 		case ws.OpClose:
 			return "", io.EOF

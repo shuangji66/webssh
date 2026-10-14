@@ -54,6 +54,36 @@ func TestWSHandshakeAndFrames(t *testing.T) {
 	}
 }
 
+// TestWSFrameValidation 覆盖帧层的协议校验：保留位、保留 opcode、客户端帧必须掩码。
+//
+// 这三种都是 RFC 6455 §5.2/§5.1 要求「收到即失败」的情况。放行它们不会立刻出事，但协议层
+// 会悄悄接受未定义的行为（将来接一个扩展、或者中间有代理改写了帧头，症状会非常难查）。
+func TestWSFrameValidation(t *testing.T) {
+	// RSV1 置位：本实现没有协商任何扩展，RSV1-3 必须为 0
+	rsv := ws.Frame(ws.OpText, []byte("hi"))
+	rsv[0] |= 0x40
+	if _, _, _, err := ws.ReadClientFrame(bytes.NewReader(rsv)); err == nil {
+		t.Error("RSV1 置位的帧应当被拒绝")
+	}
+	// 保留 opcode（0x3 是保留数据帧）
+	if _, _, _, err := ws.ReadClientFrame(bytes.NewReader(ws.Frame(0x3, []byte("hi")))); err == nil {
+		t.Error("保留 opcode 的帧应当被拒绝")
+	}
+	// 客户端 → 服务端必须掩码（Frame 产出的是服务端帧，不掩码）
+	plain := ws.Frame(ws.OpText, []byte("hi"))
+	if _, _, _, err := ws.ReadClientFrame(bytes.NewReader(plain)); err == nil {
+		t.Error("未掩码的客户端帧应当被拒绝")
+	}
+	// 对照：合法的掩码帧照常通过
+	if _, _, payload, err := ws.ReadClientFrame(bytes.NewReader(maskFrame(ws.OpText, []byte("hi")))); err != nil || string(payload) != "hi" {
+		t.Errorf("合法的掩码帧被拒了：%v %q", err, payload)
+	}
+	// 读服务端帧的场景（测试客户端）不能要求掩码，否则整套用例都跑不起来
+	if _, _, payload, err := ws.ReadFrame(bytes.NewReader(plain)); err != nil || string(payload) != "hi" {
+		t.Errorf("ReadFrame 不该要求掩码：%v %q", err, payload)
+	}
+}
+
 // TestStoreHelpers 校验 id 校验、原子写与目录布局。
 func TestStoreHelpers(t *testing.T) {
 	if id := store.NewID(); len(id) != 32 {

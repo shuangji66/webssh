@@ -33,7 +33,18 @@ var bootID = store.NewID()
 func main() {
 	renv := loadRuntimeEnv()
 
-	// 1) 准备数据目录 + 主密钥 + 已存配置。失败即退出：没有数据目录就没有会话配置，
+	// 1) socket 已经被占用时**先**退出：两个实例抢同一个 socket 会互相删对方的文件，
+	//    表现为「界面时好时坏」，而两个进程各自都觉得自己正常。
+	//
+	//    这一步刻意放在准备数据目录之前：newAdminMux 会创建 master.key、读写会话配置，
+	//    让一个注定要退出的实例先碰一遍数据目录纯属多余（两个进程共用数据目录会互相覆盖）。
+	//    真正的防抢在 listenAdminSocket 里（绑定失败时才判残留，绝不 unlink 活着的 socket）。
+	if _, err := net.Dial("unix", renv.AdminSock); err == nil {
+		logx.Warnf("admin socket %s 已被占用，退出", renv.AdminSock)
+		os.Exit(1)
+	}
+
+	// 2) 准备数据目录 + 主密钥 + 已存配置。失败即退出：没有数据目录就没有会话配置，
 	//    「活着但一打开就报错」比直接退出更难排查（supervisor 能看见退出码）。
 	mux, err := newAdminMux(renv)
 	if err != nil {
@@ -41,13 +52,6 @@ func main() {
 		os.Exit(1)
 	}
 	mux.SetSPA(embeddedFS)
-
-	// 2) socket 已经被占用时退出：两个实例抢同一个 socket 会互相删对方的文件，
-	//    表现为「界面时好时坏」，而两个进程各自都觉得自己正常。
-	if _, err := net.Dial("unix", renv.AdminSock); err == nil {
-		logx.Warnf("admin socket %s 已被占用，退出", renv.AdminSock)
-		os.Exit(1)
-	}
 
 	// 3) **先绑定成功再进信号等待**：绑定失败就退出（而不是空转）。
 	ln, err := listenAdminSocket(renv)

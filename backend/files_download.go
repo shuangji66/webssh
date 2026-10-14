@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,6 +66,12 @@ func (m *AdminMux) handleFsDownload(w http.ResponseWriter, r *http.Request) *api
 		if err != nil {
 			return err
 		}
+		// 与其他「整棵树」的操作（copy / move / export-to-nas）口径一致：拒绝根目录。
+		// 下载 `/` 会把整棵文件系统打进一个临时 zip（只受远端磁盘限制、用户也取消不掉），
+		// 而且 base = path.Dir("/") = "/" 会让 zip 条目名带上前导 `/`。
+		if target == "/" {
+			return errRootOp
+		}
 		fi, err := sess.client.Stat(target)
 		if err != nil {
 			return err
@@ -81,7 +88,8 @@ func (m *AdminMux) handleFsDownload(w http.ResponseWriter, r *http.Request) *api
 			if err != nil {
 				return fmt.Errorf("创建下载临时文件失败：%w", err)
 			}
-			if err := zipRemoteTree(sess.client, target, tmp); err != nil {
+			budget := maxTransferBytes
+			if err := zipRemoteTree(r.Context(), sess.client, target, tmp, &budget); err != nil {
 				return fmt.Errorf("打包目录失败：%w", err)
 			}
 			if err := tmp.Sync(); err != nil {
@@ -103,7 +111,9 @@ func (m *AdminMux) handleFsDownload(w http.ResponseWriter, r *http.Request) *api
 		return nil
 	})
 	if opErr != nil {
-		return fsError("下载失败", opErr)
+		// mapTransferError 而不是 fsError：打包超限要回 too_large（用户一眼看出是自己选的
+		// 目录太大），否则会变成一句「内部错误」。
+		return mapTransferError("下载失败", opErr)
 	}
 
 	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeHeader(name)+`"`)
@@ -126,12 +136,26 @@ func (m *AdminMux) handleFsDownload(w http.ResponseWriter, r *http.Request) *api
 	return nil
 }
 
+// zipEntryName 把绝对路径翻成 zip 里的条目名（相对于 root 的**父目录**，所以包里带一层
+// 顶层目录名，例如 /home/user/docs/a.txt → docs/a.txt）。
+//
+// 先摘 base 再摘前导 `/`：base 为 `/`（root 是顶层目录，例如 /home、/tmp）时 `base+"/"` 是
+// `//`，一次 TrimPrefix 都匹配不上，条目名会变成 `/home/...`（带前导斜杠的绝对路径，
+// Windows 解压会得到奇怪的盘符路径）。见 TestZipEntryName。
+func zipEntryName(full, base string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(full, base), "/")
+}
+
 // zipRemoteTree 把一个远程目录递归打进 zip（相对路径保留目录结构）。
 //
 // 自己走 Lstat 而不是用 pkg/sftp 的 Walk：Walk 基于 kr/fs 的 WalkFS，用的是 Stat
 // （跟随软链接），遇到「目录里的软链接指回上层」会无限递归。这里不跟随链接
 // （软链接条目跳过并记一条日志——把别人的文件内容打进包更糟）。
-func zipRemoteTree(c *sftp.Client, root string, w io.Writer) error {
+//
+// budget 与另外三条「服务端自己搬数据」的路径同口径（见 maxTransferBytes）：下载一个
+// 几百 GB 的目录不能一直占着这条会话的 SFTP 通道把 NAS 临时盘写满。超限返回
+// errTransferBudget，由调用方翻成 too_large。
+func zipRemoteTree(ctx context.Context, c *sftp.Client, root string, w io.Writer, budget *int64) error {
 	zw := zip.NewWriter(w)
 	base := path.Dir(root)
 	var walk func(dir string) error
@@ -142,7 +166,7 @@ func zipRemoteTree(c *sftp.Client, root string, w io.Writer) error {
 		}
 		for _, info := range infos {
 			full := path.Join(dir, info.Name())
-			rel := strings.TrimPrefix(full, base+"/")
+			rel := zipEntryName(full, base)
 			if info.IsDir() {
 				if _, err := zw.Create(rel + "/"); err != nil {
 					return err
@@ -172,7 +196,7 @@ func zipRemoteTree(c *sftp.Client, root string, w io.Writer) error {
 				src.Close()
 				return err
 			}
-			_, copyErr := io.Copy(dst, src)
+			_, copyErr := io.Copy(dst, budgetReader{ctx: ctx, r: src, budget: budget})
 			src.Close()
 			if copyErr != nil {
 				return fmt.Errorf("%s：%w", full, copyErr)

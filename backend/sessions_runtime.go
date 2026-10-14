@@ -181,6 +181,19 @@ type sessionRuntime struct {
 	// base 是打开会话时建立的连接：SFTP 通道挂在它上面（终端的连接各自独立）。
 	// 远端家目录的缓存在 sftpSession 里（与登录同生命周期）。
 	base *ssh.Client
+
+	// ownerMu 保护 ownerNames：{uid,gid} → {账号名, 组名}（见 resolveOwnerNames）。
+	// 名字只用于显示（权限判定用的是数字 uid/gid），所以进程内缓存到会话结束就够：
+	// 远端改了账号名要重开会话才看得到，这个代价远小于「每点一次『信息』就新拨一条 SSH」。
+	// 键用 (uid,gid) 成对：一次查询同时拿两个名字，只命中一半就等于拿到半份错误结果。
+	ownerMu    sync.Mutex
+	ownerNames map[ownerKey][2]string
+}
+
+// ownerKey 是属主名字缓存的键（uid + gid）。
+type ownerKey struct {
+	uid uint32
+	gid uint32
 }
 
 func newSessionRuntime(mgr *sessionManager, cfg *store.Session) *sessionRuntime {

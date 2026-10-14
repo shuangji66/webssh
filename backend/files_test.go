@@ -217,6 +217,33 @@ func TestFsInfo(t *testing.T) {
 	a.fail(t, "/api/fs/info", map[string]any{"sid": "ffffffffffffffffffffffffffffffff", "path": ""}, "session_gone", http.StatusNotFound)
 }
 
+// TestFsInfoCachesOwnerNames 钉住「属主名字按会话缓存」。
+//
+// resolveOwnerNames 每次都要**新拨一条 SSH** 跑 `id -nu/-ng`（见 remote_exec 的说明），
+// 而「信息」弹窗会被反复打开。缓存后第二次查同一对 uid/gid 不该再拨连接。
+func TestFsInfoCachesOwnerNames(t *testing.T) {
+	a, sid := fsTestApp(t)
+	target := filepath.Join(a.sshRoot, "hello.txt")
+
+	// 本机没有 `id` 时查不到名字（也不写缓存），这条用例就没有意义
+	if _, err := exec.Command("id", "-nu", strconv.Itoa(os.Getuid())).Output(); err != nil {
+		t.Skip("本机没有可用的 id 命令，属主名字查询不适用")
+	}
+
+	before := a.ssh.ConnsAccepted()
+	a.ok(t, "/api/fs/info", map[string]any{"sid": sid, "path": target})
+	first := a.ssh.ConnsAccepted()
+	if first <= before {
+		t.Fatalf("第一次查属主名字应当新拨一条 SSH：%d → %d", before, first)
+	}
+
+	// 第二次（同一个文件的同一对 uid/gid）：必须命中缓存
+	a.ok(t, "/api/fs/info", map[string]any{"sid": sid, "path": target})
+	if got := a.ssh.ConnsAccepted(); got != first {
+		t.Errorf("重复查同一个属主不该再拨 SSH：%d → %d", first, got)
+	}
+}
+
 // TestFsInfoCountError 校验「数不出子项」时如实带原因回来，而不是把 0 当空目录。
 //
 // 用 0000 权限的目录模拟：SFTP 的 ReadDir 会失败。两种环境里这招不灵，直接 skip 并写明原因
@@ -391,6 +418,58 @@ func TestFsUploadLocal(t *testing.T) {
 	}
 }
 
+// TestZipEntryName 钉住目录下载的 zip 条目名（不要带前导 `/`）。
+//
+// root 是顶层目录（`/home`、`/tmp`）时 base = path.Dir(root) = `/`，旧实现用
+// `strings.TrimPrefix(full, base+"/")`（即 `"//"`）一次都匹配不上，条目名成了 `/home/x`——
+// 带前导斜杠的绝对路径，Windows 解压会解出奇怪的盘符路径。
+func TestZipEntryName(t *testing.T) {
+	cases := []struct{ full, base, want string }{
+		{"/home/user/docs/a.txt", "/home/user", "docs/a.txt"},
+		{"/home/user/docs/sub/b.txt", "/home/user", "docs/sub/b.txt"},
+		{"/home/a.txt", "/", "home/a.txt"}, // root = /home：旧实现给 "/home/a.txt"
+		{"/tmp/x", "/", "tmp/x"},
+		{"/home/userdata/x", "/home", "userdata/x"}, // base 是部分路径段时也不能多切
+	}
+	for _, c := range cases {
+		if got := zipEntryName(c.full, c.base); got != c.want {
+			t.Errorf("zipEntryName(%q, %q) = %q，期望 %q", c.full, c.base, got, c.want)
+		}
+	}
+}
+
+// TestFsUploadOverwriteKeepsExistingDirectory 钉住「覆盖上传失败绝不动目标」。
+//
+// 目标同名且是个目录时，写文件必然失败。旧实现先在目标上 O_TRUNC、失败再 Remove(dest)，
+// 会把那个目录直接删掉——用户只是想上传一个同名文件，结果丢了一个目录。
+func TestFsUploadOverwriteKeepsExistingDirectory(t *testing.T) {
+	a, sid := fsTestApp(t)
+	root := a.sshRoot
+	dirPath := filepath.Join(root, "same-name")
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		t.Fatalf("建目录失败：%v", err)
+	}
+
+	res, out := a.doUpload(t, sid, root, true, map[string]string{"same-name": "x"})
+	if res.StatusCode == http.StatusOK {
+		t.Fatalf("往同名目录上覆盖上传竟然成功了：%v", out)
+	}
+	fi, err := os.Stat(dirPath)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("上传失败后同名目录没了（这正是旧实现的数据丢失路径）：%v %v", fi, err)
+	}
+	// 临时文件必须被清掉，不能留在用户的目录里
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("读目标目录失败：%v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".webssh-upload-") {
+			t.Errorf("上传失败后残留了临时文件：%s", e.Name())
+		}
+	}
+}
+
 // TestFsUploadTooLarge 校验上传整体上限（把上限临时调小，避免真造 1 GiB 请求体）。
 func TestFsUploadTooLarge(t *testing.T) {
 	old := maxUploadBytes
@@ -505,6 +584,9 @@ func TestFsDownloadAndRead(t *testing.T) {
 	// 下载不存在的路径 → not_found；路径非法 → invalid
 	a.fail(t, "/api/fs/download", map[string]any{"sid": sid, "path": filepath.Join(root, "nope")}, "not_found", http.StatusNotFound)
 	a.fail(t, "/api/fs/download", map[string]any{"sid": sid, "path": root + "/../x"}, "invalid", http.StatusBadRequest)
+	// 根目录：与 copy / move / export-to-nas 口径一致，直接拒绝——下载 `/` 会把整棵文件系统
+	// 打进一个临时 zip（只受远端磁盘限制、用户取消不掉），条目名还会带上前导 `/`。
+	a.fail(t, "/api/fs/download", map[string]any{"sid": sid, "path": "/"}, "invalid", http.StatusBadRequest)
 
 	// 文本预览
 	out := a.ok(t, "/api/fs/read", map[string]any{"sid": sid, "path": filepath.Join(root, "hello.txt")})

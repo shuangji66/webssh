@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/creack/pty"
@@ -77,6 +78,10 @@ type Server struct {
 	conns  map[net.Conn]struct{}
 	closed bool
 	wg     sync.WaitGroup
+
+	// connCount 是累计接受的连接数。只给测试断言用（例如「属主名字按会话缓存，
+	// 第二次查同一个 uid/gid 不该再拨一条 SSH」）。
+	connCount int64
 }
 
 // Start 启动服务器并返回句柄。调用方负责 Close。
@@ -188,6 +193,7 @@ func (s *Server) acceptLoop() {
 		if err != nil {
 			return
 		}
+		atomic.AddInt64(&s.connCount, 1)
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
@@ -237,6 +243,9 @@ func (s *Server) serveConn(nc net.Conn) {
 }
 
 // Close 关闭监听、断开所有连接并等待处理协程退出。
+// ConnsAccepted 返回累计接受的 SSH 连接数（测试用来断言「没有多拨连接」）。
+func (s *Server) ConnsAccepted() int { return int(atomic.LoadInt64(&s.connCount)) }
+
 func (s *Server) Close() {
 	s.mu.Lock()
 	if s.closed {

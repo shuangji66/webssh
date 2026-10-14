@@ -264,6 +264,53 @@ func TestCredentialSaveSwitchEdits(t *testing.T) {
 	a.fail(t, "/api/sessions/open", map[string]any{"id": sid}, "credential_required", http.StatusConflict)
 }
 
+// TestCredentialCacheOnAuthTypeSwitch 钉住「改认证方式要清内存凭据、不改就不能清」。
+//
+// 背景：会话「不保存凭据」+ 已打开时，内存里留着一份明文凭据（只由一次成功的 open 写入）。
+// 把认证方式从 password 改成 key 之后，那份密码已经和配置不匹配：留着它，下一次 open 会
+// 拿密码去走密钥认证分支，报出「该会话使用密钥认证，但没有可用的私钥」——错误信息与真实
+// 原因不符（真正的原因是缓存里有一份类型不匹配的旧凭据），用户完全无法自查。
+// 正确行为：认证方式变了就清缓存 → open 回到 credential_required（前端据此弹凭据输入框）。
+//
+// 这条路径只有直接打 API 才走得到（前端的表单在切换认证方式时要求重填凭据），所以用例
+// 刻意不带 password / privateKey。
+//
+// 反向同样重要：认证方式没变时**不能**清缓存，否则「打开过一次、进程内复用」的承诺就没了。
+func TestCredentialCacheOnAuthTypeSwitch(t *testing.T) {
+	a := newCredApp(t)
+	sid, _ := saveUnsavedSession(t, a)
+
+	// 打开一次：内存里留下密码（只有成功的 open 才会写缓存）
+	a.ok(t, "/api/sessions/open", map[string]any{"id": sid, "password": secretPassword})
+	if _, ok := a.mux.sessions.cachedCredential(sid); !ok {
+		t.Fatal("open 成功后内存里应当有凭据")
+	}
+
+	// ① 只改名（认证方式不变、不带凭据）：缓存必须留着——否则「打开过一次、进程内复用」
+	//    的承诺就没了（用户会被莫名其妙地要求重新输入密码）
+	a.ok(t, "/api/sessions/save", map[string]any{
+		"id": sid, "name": "renamed", "host": a.ssh.Host(), "port": a.ssh.Port(),
+		"user": a.sshUser, "authType": "password",
+	})
+	if _, ok := a.mux.sessions.cachedCredential(sid); !ok {
+		t.Error("认证方式没变，内存凭据不该被清掉")
+	}
+
+	// ② 改成密钥认证（不带凭据）：那份密码已经和配置不匹配，必须清掉
+	a.ok(t, "/api/sessions/save", map[string]any{
+		"id": sid, "name": "renamed", "host": a.ssh.Host(), "port": a.ssh.Port(),
+		"user": a.sshUser, "authType": "key",
+	})
+	if _, ok := a.mux.sessions.cachedCredential(sid); ok {
+		t.Error("改了认证方式之后内存里还留着旧凭据（下一次 open 会报出与原因不符的 no_credential）")
+	}
+
+	// 行为侧：关掉再打开（不带凭据）要回 409 credential_required（前端据此弹凭据输入框），
+	// 而不是拿着残留密码去连、报 400 no_credential。
+	a.ok(t, "/api/sessions/close", map[string]any{"id": sid})
+	a.fail(t, "/api/sessions/open", map[string]any{"id": sid}, "credential_required", http.StatusConflict)
+}
+
 // TestOpenWithBadCredentialKeepsNothing 校验「失败的凭据不会被留在内存里」。
 func TestOpenWithBadCredentialKeepsNothing(t *testing.T) {
 	a := newCredApp(t)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -34,6 +35,28 @@ func exitedGrace() time.Duration { return time.Duration(exitedGraceNanos.Load())
 
 // setExitedGrace 只给测试用：缩短保留时长，避免等 10 分钟。
 func setExitedGrace(d time.Duration) { exitedGraceNanos.Store(int64(d)) }
+
+// replayTimeoutNanos 是一整段历史回放的总时限（默认 30s）。
+//
+// 为什么需要「总」时限：每帧的写超时是 ws.WriteTimeout（5s），而 4 MiB 历史按 32 KiB
+// 分帧有 128 帧——一个连上就不再读数据的客户端最坏能让 attach 在 128 × 5s ≈ 10 分钟里
+// 一直持有 histMu，期间同终端的实时广播（pump）、/api/terminals/history、清屏、
+// 以及另一台设备的顶号通知（kickDetached）全部排队。
+//
+// 正常回放 4 MiB 是毫秒级（本地 socket + 浏览器读得很快），30s 只在「对端根本不读」
+// 时才生效；超时即返回错误 → handler 关掉这条连接并解挂载。
+//
+// 用 atomic 存纳秒的理由与 exitedGraceNanos 相同：测试要把它缩到毫秒级，而回收协程
+// 可能比测试活得久，普通变量会被 -race 判成数据竞争。
+var replayTimeoutNanos atomic.Int64
+
+func init() { replayTimeoutNanos.Store(int64(30 * time.Second)) }
+
+// replayTimeout 返回当前的回放总时限。
+func replayTimeout() time.Duration { return time.Duration(replayTimeoutNanos.Load()) }
+
+// setReplayTimeout 只给测试用：把总时限缩到毫秒级，避免用例等 30 秒。
+func setReplayTimeout(d time.Duration) { replayTimeoutNanos.Store(int64(d)) }
 
 // 新终端建立时的默认 PTY 尺寸。前端拿到 ready 后会按 xterm 的实际尺寸发一次
 // `\x1b]resize;…`（握手 URL 里没有尺寸参数，这也是 xterm.js fit 的职责）。
@@ -141,6 +164,10 @@ func isNormalSessionEnd(err error) bool {
 
 // pump 持续读取 shell 输出：追加到历史文件，并向已挂载的连接实时广播。
 // 同一把 histMu 保证「文件」与「连接」两路顺序一致。
+//
+// 帧边界就是这里 8 KiB 读缓冲的边界（也就是远端一次输出的字节数），**可能切在多字节
+// UTF-8 字符中间**；所以数据帧必须是二进制帧（见 protocol.go 的 ⚠️），前端用流式
+// TextDecoder 把跨帧的半个字符拼回来。改回文本帧会让「cat 中文文件」这类输出直接断连。
 func (t *terminal) pump() {
 	buf := make([]byte, 8192)
 	for {
@@ -153,7 +180,7 @@ func (t *terminal) pump() {
 					_, _ = t.hist.Write(chunk)
 				}
 				if c := t.mounted(); c != nil {
-					t.writeConn(c, ws.Frame(ws.OpText, chunk))
+					t.writeConn(c, ws.Frame(termDataOp, chunk))
 				}
 			}
 			t.histMu.Unlock()
@@ -177,8 +204,8 @@ func (t *terminal) pump() {
 			_, _ = t.hist.Write(note)
 		}
 		if c := t.mounted(); c != nil {
-			t.writeConn(c, ws.Frame(ws.OpText, note))
-			t.writeConn(c, ws.Frame(ws.OpText, []byte(oscExit)))
+			t.writeConn(c, ws.Frame(termDataOp, note))
+			t.writeConn(c, ws.Frame(termDataOp, []byte(oscExit)))
 		}
 	}
 	t.histMu.Unlock()
@@ -211,14 +238,34 @@ func (t *terminal) writeConn(c net.Conn, frame []byte) {
 	}
 }
 
+// writeFramedBefore 写一帧，写超时取「单帧超时」与「整段回放的总时限」里更早的那个。
+//
+// 回放循环用它而不是 ws.WriteFramed：后者每次都把超时重置成 now+5s，帧多了就没有
+// 总上限（见 replayTimeout 的说明）。
+func writeFramedBefore(c net.Conn, frame []byte, deadline time.Time) error {
+	d := time.Now().Add(ws.WriteTimeout)
+	if deadline.Before(d) {
+		d = deadline
+	}
+	return ws.WriteFramedDeadline(c, frame, d)
+}
+
 // attach 把连接挂到终端上：先回放历史（分帧 ≤32 KiB，最多 4 MiB），再发 `\x1b]ready\x07`，
 // 然后接管实时流。整段在 histMu 内完成，保证不重不漏。
+//
+// 回放的分帧边界是 32 KiB 的字节边界，**会切在多字节字符中间**——所以数据帧是二进制帧
+// （见 protocol.go 的 ⚠️），前端流式解码。历史 > 4 MiB 时起点还要落在 size-maxHistoryBytes，
+// 同样可能是半个字符，二进制帧同样不受影响。
 //
 // 返回**被顶掉的旧连接**（无则 nil），由调用方负责通知并关闭（kickDetached）——
 // 单挂载点只影响这一个终端，其他终端与其他会话的连接不动。
 func (t *terminal) attach(c net.Conn) (net.Conn, error) {
 	t.histMu.Lock()
 	defer t.histMu.Unlock()
+
+	// 整段回放的总时限（见 replayTimeout 的说明）：没有它，128 帧 × 每帧 5s 的写超时
+	// 最坏能把 histMu 占十几分钟，pump / history / kickDetached 全部排队。
+	deadline := time.Now().Add(replayTimeout())
 
 	if t.hist != nil {
 		if size, err := t.hist.Seek(0, io.SeekEnd); err == nil {
@@ -232,7 +279,7 @@ func (t *terminal) attach(c net.Conn) (net.Conn, error) {
 					n, rerr := t.hist.Read(chunk)
 					if n > 0 {
 						// 回放同样带写超时：新端不读数据时不能让 histMu 一直被占着。
-						if werr := ws.WriteFramed(c, ws.Frame(ws.OpText, chunk[:n])); werr != nil {
+						if werr := writeFramedBefore(c, ws.Frame(termDataOp, chunk[:n]), deadline); werr != nil {
 							return nil, werr
 						}
 					}
@@ -243,13 +290,13 @@ func (t *terminal) attach(c net.Conn) (net.Conn, error) {
 			}
 		}
 	}
-	if err := ws.WriteFramed(c, ws.Frame(ws.OpText, []byte(oscReady))); err != nil {
+	if err := writeFramedBefore(c, ws.Frame(termDataOp, []byte(oscReady)), deadline); err != nil {
 		return nil, err
 	}
 	// 已经退出的终端：历史里只有「[process exited]」这段文本，控制帧没写进历史文件。
 	// 不补一帧 oscExit 的话，重新挂载的客户端会以为 shell 还活着（看不到退出提示）。
 	if t.isExited() {
-		if err := ws.WriteFramed(c, ws.Frame(ws.OpText, []byte(oscExit))); err != nil {
+		if err := writeFramedBefore(c, ws.Frame(termDataOp, []byte(oscExit)), deadline); err != nil {
 			return nil, err
 		}
 	}
@@ -281,7 +328,7 @@ func (t *terminal) kickDetached(c net.Conn) {
 	t.histMu.Lock()
 	defer t.histMu.Unlock()
 	_ = c.SetWriteDeadline(time.Now().Add(time.Second))
-	_, _ = c.Write(ws.Frame(ws.OpText, []byte(oscDetached)))
+	_, _ = c.Write(ws.Frame(termDataOp, []byte(oscDetached)))
 	_, _ = c.Write(ws.CloseFrame(wsCloseDetached, "detached"))
 	_ = c.Close()
 }
@@ -431,7 +478,7 @@ func (t *terminal) close() {
 //   - tid 为空 → 新建终端：先发 `\x1b]tid;<id>\x07`（前端据此回填 id），再 attach。
 //   - tid 非空 → 挂载已有终端：回放历史（分帧，单帧 ≤32 KiB，最多 4 MiB）→ `\x1b]ready\x07`
 //     → 进入实时流。
-//   - 终端不存在 → 文本帧 + `\x1b]gone\x07` 控制帧，然后关闭。
+//   - 终端不存在 → 一帧数据（人可读的说明）+ `\x1b]gone\x07` 控制帧，然后关闭。
 //     前端**只认控制帧**（见 ws.go 的 oscGone 注释），不能靠人类可读文本判定。
 // 浏览器断开只解挂载：终端继续跑、输出继续写历史文件，刷新后重新挂载即可回放。
 // ---------------------------------------------------------------------------
@@ -451,17 +498,25 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "缺少 Sec-WebSocket-Key", http.StatusBadRequest)
 		return
 	}
-	proto := r.Header.Get("Sec-WebSocket-Protocol")
+	// 按 RFC 6455 §4.1 校验：这个值必须是**16 字节的随机数的 base64**。只判非空等于接受
+	// 任意字符串并照它算 Accept，非标准客户端可以完成握手（真实客户端永远满足这条）。
+	if raw, err := base64.StdEncoding.DecodeString(key); err != nil || len(raw) != 16 {
+		http.Error(w, "Sec-WebSocket-Key 不是 16 字节的 base64", http.StatusBadRequest)
+		return
+	}
 
 	conn, brw, err := hj.Hijack()
 	if err != nil {
 		return
 	}
-	protoHdr := ""
-	if proto != "" {
-		protoHdr = "\r\nSec-WebSocket-Protocol: " + proto
+	// **不回显 Sec-WebSocket-Protocol**：本应用没有子协议，回显只是把客户端给的字符串
+	// 原样拼进协议响应行（把客户端输入当协议输出）。浏览器原生 WebSocket 本来就不发这个头，
+	// 需要它的客户端（比如某些 websocat 用法）在这里也拿不到任何协商结果——宁可不回，
+	// 也不要凭空造一个「协商成功」的假象。
+	if proto := r.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+		logx.Warnf("忽略客户端请求的 Sec-WebSocket-Protocol=%q（本应用没有子协议）", proto)
 	}
-	if _, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws.AcceptKey(key) + protoHdr + "\r\n\r\n")); err != nil {
+	if _, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws.AcceptKey(key) + "\r\n\r\n")); err != nil {
 		_ = conn.Close()
 		return
 	}
@@ -470,10 +525,10 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	sid := r.URL.Query().Get("sid")
 	tid := r.URL.Query().Get("tid")
 
-	// gone 分支：文本帧给人看（非本前端的客户端也能看懂），末尾的 oscGone 给前端判定用。
+	// gone 分支：人可读的说明给非本前端的客户端也能看懂，末尾的 oscGone 给前端判定用。
 	gone := func(detail string) {
 		frame := []byte("\r\n\x1b[31m" + detail + "\x1b[0m\r\n" + oscGone)
-		_ = ws.WriteFramed(conn, ws.Frame(ws.OpText, frame))
+		_ = ws.WriteFramed(conn, ws.Frame(termDataOp, frame))
 		_ = ws.WriteFramed(conn, ws.CloseFrame(1000, "gone"))
 		_ = conn.Close()
 	}
@@ -491,7 +546,7 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 			gone("新建终端失败：" + apiErr.Message)
 			return
 		}
-		if err := ws.WriteFramed(conn, ws.Frame(ws.OpText, []byte("\x1b]tid;"+t.id+"\x07"))); err != nil {
+		if err := ws.WriteFramed(conn, ws.Frame(termDataOp, []byte("\x1b]tid;"+t.id+"\x07"))); err != nil {
 			// 挂载失败（多半是写不出去）：这个终端已经没人能认领了（id 虽然发出过，
 			// 但连接已坏、前端拿不到），直接回收，避免表里留一个孤儿终端。
 			t.close()
@@ -534,7 +589,7 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// 按 FIN 位累积成完整消息后再处理，避免长粘贴被截断。
 	var msgBuf []byte
 	for {
-		op, fin, payload, rerr := ws.ReadFrame(brw)
+		op, fin, payload, rerr := ws.ReadClientFrame(brw)
 		if rerr != nil {
 			break
 		}

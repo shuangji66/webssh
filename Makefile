@@ -3,7 +3,11 @@
 #   make                   # dev（默认，不裁剪符号）
 #   make release V=1.0.1   # release（-s -w 裁剪 + 版本号覆盖）
 #   make test              # 后端单元测试（含内嵌 SSH/SFTP 测试服务器）
-#   make typecheck         # 前端 vue-tsc 类型检查
+#   make check             # 前端检查（vue-tsc 类型 + i18n 双向一致性）
+#   make typecheck         # 只跑前端 vue-tsc 类型检查
+#
+# 完整门禁是 `make test check`：AGENTS.md 第 7 节要求后端测试与前端检查都绿，
+# 但两者刻意不绑在一起——构建机上不一定有 node，`make test` 只依赖 Go。
 #   make clean             # 清理构建产物
 #
 # 产物是项目根目录的 ./webssh（前端 dist 经 //go:embed 打进 backend/embed 编译进去）。
@@ -47,7 +51,7 @@ ifneq ($(strip $(NODE_BIN)),)
 export PATH := $(NODE_BIN):$(PATH)
 endif
 
-.PHONY: all dev release build test typecheck clean
+.PHONY: all dev release build test check typecheck clean
 
 all: dev
 
@@ -86,6 +90,11 @@ test:
 	@test -e "$(EMBED)/index.html" || echo "placeholder for //go:embed (see Makefile test target)" > "$(EMBED)/index.html"
 	cd "$(BACKEND)" && go test ./...
 
+# 前端完整检查：类型 + i18n（缺 key / 多余 key / 代码引用了不存在的 key 都会失败）。
+check:
+	cd "$(FRONTEND)" && npm install --no-audit --no-fund && npm run check
+
+# 只跑类型检查（改前端时的高频操作）。
 typecheck:
 	cd "$(FRONTEND)" && npm install --no-audit --no-fund && npm run type-check
 

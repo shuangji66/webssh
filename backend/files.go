@@ -161,10 +161,16 @@ func (m *AdminMux) handleFsInfo(w http.ResponseWriter, r *http.Request) *apierr.
 // 想知道*名字*（权限问题一半是「属主是 root，所以我写不进去」）。查不到（远端没有 id、
 // 账号已删、或这条命令超时）一律返回空串，由界面退回显示数字——**绝不编一个名字**。
 //
+// 结果按会话缓存（`resolveOwnerNames` 每次都要**新拨一条 SSH** 跑命令，而「信息」弹窗
+// 可能被反复打开）：只有查成功才写缓存，失败下次照旧重试（超时不该被永久记住）。
+//
 // 用 `printf` 把两行结果显式分开：`id -nu` 失败时不能把组名当成账号名读进来。
 func (r *sessionRuntime) resolveOwnerNames(ctx context.Context, uid, gid uint32) (string, string) {
 	if r == nil {
 		return "", ""
+	}
+	if owner, group, ok := r.cachedOwnerNames(uid, gid); ok {
+		return owner, group
 	}
 	cmd := "printf '%s\n' \"$(id -nu " + strconv.FormatUint(uint64(uid), 10) +
 		" 2>/dev/null)\" \"$(id -ng " + strconv.FormatUint(uint64(gid), 10) + " 2>/dev/null)\""
@@ -182,7 +188,29 @@ func (r *sessionRuntime) resolveOwnerNames(ctx context.Context, uid, gid uint32)
 	if len(lines) > 1 {
 		group = strings.TrimSpace(lines[1])
 	}
+	r.cacheOwnerNames(uid, gid, owner, group)
 	return owner, group
+}
+
+// cachedOwnerNames 取缓存的属主 / 组名；命中才返回 ok。
+func (r *sessionRuntime) cachedOwnerNames(uid, gid uint32) (string, string, bool) {
+	r.ownerMu.Lock()
+	defer r.ownerMu.Unlock()
+	pair, ok := r.ownerNames[ownerKey{uid: uid, gid: gid}]
+	if !ok {
+		return "", "", false
+	}
+	return pair[0], pair[1], true
+}
+
+// cacheOwnerNames 记下一次成功的查询结果。
+func (r *sessionRuntime) cacheOwnerNames(uid, gid uint32, owner, group string) {
+	r.ownerMu.Lock()
+	defer r.ownerMu.Unlock()
+	if r.ownerNames == nil {
+		r.ownerNames = map[ownerKey][2]string{}
+	}
+	r.ownerNames[ownerKey{uid: uid, gid: gid}] = [2]string{owner, group}
 }
 
 // childIsDir 判断一条 ReadDir 结果是不是目录，规则与 buildFsEntry 保持一致：软链接要跟随一次

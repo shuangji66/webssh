@@ -228,6 +228,19 @@ func (m *sessionManager) save(in store.SessionInput) (*store.SessionView, *apier
 		return nil, apiErr
 	}
 
+	// 记下改动前的状态：「内存缓存怎么清」要用到「原来保存不保存凭据」「认证方式换没换」
+	// 这两个旧值，而下面会把它们覆盖掉。
+	//
+	// ⚠️ **必须在 sc 被赋值之前读**：sc 是 cur 的副本，`sc.Host, ..., sc.AuthType = ...`
+	// 一旦执行，prevAuthType 就恒等于新值、`prevAuthType != sc.AuthType` 永远为假——
+	// 「会话不保存凭据 + 改了认证方式」的内存凭据就永远清不掉，下一次 open 会拿着类型
+	// 不匹配的旧凭据报出一个看不懂的 no_credential。
+	wasSaved := cur != nil && cur.CredentialsSaved()
+	prevAuthType := ""
+	if cur != nil {
+		prevAuthType = cur.AuthType
+	}
+
 	var sc *store.Session
 	if cur != nil {
 		// 复制一份再改：失败路径不污染内存态，成功路径换成一个新对象（见 configs 的注释）。
@@ -293,11 +306,6 @@ func (m *sessionManager) save(in store.SessionInput) (*store.SessionView, *apier
 	case !created:
 		saveCred = sc.CredentialsSaved()
 	}
-	// 记下改动前的状态：下面会把 CredentialSaved / AuthType 覆盖掉，而「内存缓存怎么清」
-	// 要用到「原来保存不保存凭据」「认证方式换没换」这两个旧值。
-	wasSaved := sc.CredentialsSaved()
-	prevAuthType := sc.AuthType
-
 	// 从「不保存」切到「保存」时，本次请求必须带凭据（见下面 cache 同步之后的检查）。
 	planningToStore := saveCred && !created && !wasSaved
 

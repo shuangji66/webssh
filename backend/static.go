@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"webssh/backend/internal/logx"
 )
 
@@ -127,21 +130,45 @@ func contentTypeFor(name string) string {
 // 绑定必须**成功**才进信号等待：早先的实现（参考项目）在 goroutine 里 bind、失败只打
 // 日志，于是进程会「活着但没有任何 socket」——supervisor 看不出异常，用户访问不了，
 // 也查不出原因。
+//
+// 顺序同样重要：**先直接绑**，绑不上再判断「是残留文件还是真有实例在跑」。旧实现是
+// 「无条件 os.Remove 再 Listen」，在「两个实例同时启动」时会把先到者**正在使用**的
+// socket 文件 unlink 掉：后到者绑定成功，先到者变成不可达却还在读写同一个数据目录
+// （两个进程共用数据目录会互相覆盖，见 AGENTS.md 第 1 节）。现在只有确认「没有活着的
+// 监听者」才删残留文件重试，任何情况下都不会 unlink 一个有人用的 socket。
 func listenAdminSocket(renv *RuntimeEnv) (net.Listener, error) {
 	if dir := filepath.Dir(renv.AdminSock); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
 	}
-	// 上一次异常退出留下的 socket 文件会让 bind 直接失败（EADDRINUSE）。调用方已经
-	// 确认过没有活着的监听者，这里删掉残留文件再绑。
-	_ = os.Remove(renv.AdminSock)
 	ln, err := net.Listen("unix", renv.AdminSock)
+	if err == nil {
+		return setSocketPerm(ln, renv.AdminSock)
+	}
+	// 绑不上：先探活。能连上说明真有实例在监听（调用方会据此退出）。
+	if c, derr := net.DialTimeout("unix", renv.AdminSock, socketProbeTimeout); derr == nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("admin socket %s 已被占用：%w", renv.AdminSock, err)
+	}
+	// 连不上：上一次异常退出留下的残留 socket 文件（EADDRINUSE），删掉再绑一次。
+	if rerr := os.Remove(renv.AdminSock); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+		return nil, err
+	}
+	ln, err = net.Listen("unix", renv.AdminSock)
 	if err != nil {
 		return nil, err
 	}
-	// 0660：nginx / 网关与进程同组即可访问；同组之外任何用户都进不来。
-	if err := os.Chmod(renv.AdminSock, 0o660); err != nil {
+	return setSocketPerm(ln, renv.AdminSock)
+}
+
+// socketProbeTimeout 是「这个 socket 文件背后还有没有活着的监听者」的探活超时：
+// 本地 unix socket 要么立刻连上要么立刻被拒，500ms 足够，也不会拖慢启动。
+const socketProbeTimeout = 500 * time.Millisecond
+
+// setSocketPerm 把 socket 设成 0660：nginx / 网关与进程同组即可访问，同组之外进不来。
+func setSocketPerm(ln net.Listener, sock string) (net.Listener, error) {
+	if err := os.Chmod(sock, 0o660); err != nil {
 		logx.Warnf("设置 socket 权限失败：%v", err)
 	}
 	return ln, nil

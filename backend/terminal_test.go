@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -396,4 +397,110 @@ func TestTerminalWriteInputDropsNonOwner(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("操作端的输入没有到达 PTY（没等到 owner-marker）")
+}
+
+// ---------------------------------------------------------------------------
+// 回放分帧的两条不变量（都不依赖 PTY：直接构造带历史文件的 terminal）
+// ---------------------------------------------------------------------------
+
+// newHistTerminal 造一个只有历史文件的终端（不建 SSH 连接，所以任何环境都能跑）。
+func newHistTerminal(t *testing.T, body []byte) *terminal {
+	t.Helper()
+	histPath := filepath.Join(t.TempDir(), "hist.log")
+	if err := os.WriteFile(histPath, body, 0o600); err != nil {
+		t.Fatalf("写历史文件失败：%v", err)
+	}
+	// 与生产一致：O_RDWR|O_APPEND（只写打开会让回放 EBADF）
+	f, err := os.OpenFile(histPath, os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("打开历史文件失败：%v", err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return &terminal{id: "hist-only", hist: f, exitedCh: make(chan struct{})}
+}
+
+// TestTerminalReplayFramesAreBinaryAndByteExact 钉住「终端数据用二进制帧」+「回放不丢/不重字节」。
+//
+// 为什么必须有这条：数据帧曾经是文本帧，而回放按 32 KiB 的**字节**边界切帧（实时广播按
+// 8 KiB 同理），边界会落在多字节字符中间；WebSocket 文本帧的载荷按 RFC 6455 §8.1 必须是
+// 合法 UTF-8，浏览器收到非法文本帧会**直接断开连接**（Chromium 实测：onerror + close 1006，
+// 一帧数据都收不到）。症状是「刷新后终端回放到出问题的那一帧就断，且每次都在同一位置断」。
+//
+// 这条用例不需要 PTY，所以在没有 /dev/ptmx 的环境（CI 容器）里也会真的跑。
+func TestTerminalReplayFramesAreBinaryAndByteExact(t *testing.T) {
+	// 32767 个 ASCII + 汉字 + 两个非 UTF-8 字节：第 32768 个字节正好是「中」的第一个字节，
+	// 旧实现下第一帧就是一帧非法 UTF-8；末尾的 0xff 0xfe 是 `cat` 二进制文件那种形态。
+	body := append(bytes.Repeat([]byte("a"), wsChunkSize-1), []byte("中文测试中文测试")...)
+	body = append(body, 0xff, 0xfe, '\n')
+
+	term := newHistTerminal(t, body)
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	go func() { _, _ = term.attach(c1) }()
+
+	var replayed bytes.Buffer
+	frames := 0
+	for {
+		_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+		op, _, payload, err := ws.ReadFrame(c2)
+		if err != nil {
+			t.Fatalf("读第 %d 帧失败：%v", frames, err)
+		}
+		if op != ws.OpBinary {
+			t.Fatalf("终端数据帧必须是二进制帧（OpBinary），第 %d 帧的 opcode = 0x%x"+
+				"（改回文本帧会让含中文的终端在重挂载时被浏览器断连）", frames, op)
+		}
+		frames++
+		if string(payload) == oscReady {
+			break
+		}
+		replayed.Write(payload)
+	}
+	if frames < 2 {
+		t.Fatalf("回放只有 %d 帧，用例前提不成立（应当被 32 KiB 边界切开）", frames)
+	}
+	if !bytes.Equal(replayed.Bytes(), body) {
+		t.Fatalf("回放字节与历史文件不一致：收到 %d 字节、文件 %d 字节", replayed.Len(), len(body))
+	}
+}
+
+// TestTerminalReplayTimeoutFreesHistMu 钉住「整段回放有总时限」。
+//
+// 每帧的写超时是 ws.WriteTimeout（5s），4 MiB 历史按 32 KiB 分帧有 128 帧：一个连上就
+// 不再读数据的客户端，最坏能让 attach 在十几分钟里一直持有 histMu（同终端的实时广播、
+// /api/terminals/history、清屏、另一台设备的顶号通知全部排队）。
+func TestTerminalReplayTimeoutFreesHistMu(t *testing.T) {
+	old := replayTimeout()
+	setReplayTimeout(200 * time.Millisecond)
+	t.Cleanup(func() { setReplayTimeout(old) })
+
+	term := newHistTerminal(t, bytes.Repeat([]byte("x"), maxHistoryBytes))
+	c1, c2 := net.Pipe()
+	defer c2.Close() // 刻意不读：写一定阻塞
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := term.attach(c1)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("对端不读数据时，回放应当以超时结束")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("回放没有在总时限内结束（histMu 被慢客户端占住了）")
+	}
+
+	// 锁必须已经释放：history() 拿不到锁就会一直等（这就是用户看到的「历史接口一起挂死」）。
+	histDone := make(chan struct{})
+	go func() {
+		_, _ = term.history()
+		close(histDone)
+	}()
+	select {
+	case <-histDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("回放超时后 histMu 没有释放，history() 被堵住")
+	}
 }

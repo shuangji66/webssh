@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/sftp"
 	"webssh/backend/internal/apierr"
 	"webssh/backend/internal/logx"
+	"webssh/backend/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -89,12 +90,11 @@ func (m *AdminMux) handleFsUpload(w http.ResponseWriter, r *http.Request) *apier
 			if oerr != nil {
 				return fmt.Errorf("读取上传内容失败：%w", oerr)
 			}
+			// 半成品的清理在 writeRemote 里做（它才知道那是临时文件还是本次新建的文件）：
+			// 这里绝不能再 Remove(dest)——overwrite 失败时 dest 是**用户原有的文件**。
 			size, skip, werr := writeRemote(r.Context(), sess.client, dest, src, overwrite)
 			src.Close()
 			if werr != nil {
-				// 写了一半的文件不能留：它顶掉的可能是同名的那份（overwrite），
-				// 留在那儿就是一个看着正常、其实是残渣的文件。
-				_ = sess.client.Remove(dest)
 				return werr
 			}
 			if skip {
@@ -141,35 +141,87 @@ func rawUploadName(h textproto.MIMEHeader) (string, error) {
 }
 
 // decodeFormFilenameEscapes 还原 HTML 规范里对 filename 的百分号转义（只解这三个）。
+//
+// 大小写两种形态都要解：规范说浏览器转义的是大写十六进制，但别的实现/中间层可能给小写，
+// 解错的表现是「文件名里多出一串 %22」。
 func decodeFormFilenameEscapes(name string) string {
-	replacer := strings.NewReplacer("%22", `"`, "%0D", "\r", "%0A", "\n",
-		"%22", `"`, "%0d", "\r", "%0a", "\n")
+	replacer := strings.NewReplacer(
+		"%22", `"`, "%0D", "\r", "%0A", "\n",
+		"%0d", "\r", "%0a", "\n")
 	return replacer.Replace(name)
 }
 
 // writeRemote 边收边写一个上传项（不整份读进内存：放几百 MB 的二进制是常见用法）。
 //
-// overwrite=false 的语义是「别动已有的文件」：只省掉一次 O_TRUNC 是不够的
-// （pkg/sftp 的 Create/OpenFile 本身就是 O_TRUNC），存在就整份跳过并计数。
+// 两条路径都不碰「用户已有的文件」：
+//   - overwrite=false：用 O_EXCL 打开，已存在就整份跳过并计数。**不能**「先 Lstat 再打开」：
+//     OpenFile 本身带 O_TRUNC，中间那个窗口足以把别人的文件清成 0 字节。
+//     O_EXCL 失败时再 Lstat 一次判「是不是因为已存在」（不依赖服务端把 EEXIST 映射成
+//     哪个状态码——不同 SFTP 实现的映射并不一致）。
+//   - overwrite=true：先写**同目录**下的临时文件，成功后再 rename 覆盖目标。
+//     直接在目标上 O_TRUNC 会让「写到一半失败」等于把用户原来的文件毁掉（旧实现还在
+//     失败路径上 Remove(dest)，于是「一个字节没写成功、原文件也没了」）。同目录的 rename
+//     是同一文件系统内的原子替换；失败只留一个临时文件，由这里删掉，目标一个字节都不动。
+//
+// 失败时留下的临时文件（进程被杀这类情况）用 `.webssh-upload-*.part` 命名，可一眼认出。
 func writeRemote(ctx context.Context, c *sftp.Client, dest string, src io.Reader, overwrite bool) (int64, bool, error) {
-	if !overwrite {
-		if _, err := c.Lstat(dest); err == nil {
-			return 0, true, nil
-		}
-	}
 	if err := c.MkdirAll(path.Dir(dest)); err != nil {
 		return 0, false, err
 	}
-	f, err := c.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	if !overwrite {
+		f, err := c.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+		if err != nil {
+			if _, lerr := c.Lstat(dest); lerr == nil {
+				return 0, true, nil
+			}
+			return 0, false, err
+		}
+		n, err := io.Copy(f, ctxReader{ctx: ctx, r: src})
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			// 这个文件是本次 O_EXCL 创建出来的，写坏了就删掉，不留残骸。
+			_ = c.Remove(dest)
+			return n, false, err
+		}
+		return n, false, nil
+	}
+
+	tmp := path.Join(path.Dir(dest), ".webssh-upload-"+store.NewID()+".part")
+	f, err := c.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return 0, false, err
 	}
 	n, err := io.Copy(f, ctxReader{ctx: ctx, r: src})
-	closeErr := f.Close()
-	if err == nil {
+	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
-	return n, false, err
+	if err == nil {
+		err = replaceRemoteFile(c, tmp, dest)
+	}
+	if err != nil {
+		_ = c.Remove(tmp)
+		return n, false, err
+	}
+	return n, false, nil
+}
+
+// replaceRemoteFile 把临时文件换成目标（覆盖已有文件）。
+//
+// 先试标准 SSH_FXP_RENAME，失败再试 posix-rename@openssh.com 扩展：SFTP v3 对「目标已存在」
+// 的语义不确定（draft-ietf-secsh-filexfer-02 §6.5.3 说「已存在即错误」），OpenSSH 专门加了
+// posix-rename 扩展来表达「像 rename(2) 一样覆盖」。两个都失败才报错——**不要**退回
+// 「先删目标再改名」：那个窗口里进程被杀，用户的文件就真没了（正是这次要修的问题）。
+func replaceRemoteFile(c *sftp.Client, tmp, dest string) error {
+	firstErr := c.Rename(tmp, dest)
+	if firstErr == nil {
+		return nil
+	}
+	if err := c.PosixRename(tmp, dest); err == nil {
+		return nil
+	}
+	return firstErr
 }
 
 // ctxReader 让「客户端取消」能中断一次正在进行的写入（见 withSFTP 的说明：
@@ -311,7 +363,6 @@ func (m *AdminMux) handleFsUploadFromNas(w http.ResponseWriter, r *http.Request)
 		defer f.Close()
 		size, skip, werr := writeRemote(r.Context(), sess.client, dest, f, req.Overwrite)
 		if werr != nil {
-			_ = sess.client.Remove(dest)
 			return werr
 		}
 		if skip {

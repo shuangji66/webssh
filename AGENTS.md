@@ -56,9 +56,15 @@
 
 **入口与生命周期（`main.go`）**
 
-- 顺序：准备数据目录 → 检查 socket 是否已被占用（占用即退出，避免两个实例抢同一个 socket）
-  → **先绑定成功再进信号等待**。绑定失败就退出：旧实现（参考项目）在 goroutine 里 bind、
-  失败只打日志，进程会「活着但没有任何 socket」，supervisor 看不出异常、用户也访问不了。
+- 顺序：检查 socket 是否已被占用（占用即退出）→ 准备数据目录 → **先绑定成功再进信号等待**。
+  占用检查刻意排在准备数据目录**之前**：`newAdminMux` 会建 master.key、读写会话配置，让一个
+  注定要退出的实例先碰一遍数据目录纯属多余（两个进程共用数据目录会互相覆盖）。
+  绑定失败就退出：旧实现（参考项目）在 goroutine 里 bind、失败只打日志，进程会「活着但没有任何
+  socket」，supervisor 看不出异常、用户也访问不了。
+- `listenAdminSocket` 的顺序是**先直接绑、绑不上再判残留**（`net.DialTimeout` 探活）：只有
+  确认没有活着的监听者才删残留 socket 文件重试。旧实现无条件 `os.Remove` 再 bind，两个实例
+  同时启动时会把先到者**正在用**的 socket unlink 掉——后到者绑定成功、先到者变成不可达却还在
+  读写同一个数据目录。
 - 收到 SIGTERM/SIGINT/SIGQUIT：先 `srv.Close()` 停入口 → 终止所有终端与 SFTP 连接 →
   删 socket → **保留数据目录**（会话配置必须活过重启）。
 - `bootID`（每次启动随机）经 `/api/info` 下发，前端据此判断「后端换进程了 → 内存态会话全没了」。
@@ -299,11 +305,28 @@
 后端 `protocol.go` 的常量与前端 `serverapi/index.ts` 的常量是**一对**，改名/改值必须同步，
 否则表现是「终端连上但完全没有输出」或「被顶掉不提示」。
 
+**终端数据（含上面所有控制帧）一律用二进制帧（`opBin`）发送，不要用文本帧。** 终端输出是
+任意字节流，而文本帧的载荷按 RFC 6455 §8.1 必须是合法 UTF-8——只要有一个非法字节（回放按
+32 KiB、实时按 8 KiB 切帧，边界会落在多字节字符中间；或者远端本来就输出非 UTF-8 字节），
+浏览器就会判定协议错误并**直接断开连接**（实测 Chromium：onerror + close 1006，一帧数据都
+收不到），表现为「刷新后终端回放到同一位置就断，点几次重连都一样」。前端用**流式**
+`TextDecoder`（`{stream:true}`）解码，跨帧的半个字符会拼回来。改这一处要同时看：
+`backend/protocol.go` 的 `termDataOp`、`backend/terminal.go` 的三处发帧、`TerminalPane` 的
+`decoder`、以及测试客户端的 `readText`（它断言了 opcode，改回文本帧会立刻红）。
+
+握手同样要校验：`Sec-WebSocket-Key` 必须是 16 字节 base64；**不回显** `Sec-WebSocket-Protocol`
+（没有子协议，回显等于把客户端输入拼进协议响应）；客户端帧必须掩码；RSV1-3 置位或保留
+opcode 一律失败（`internal/ws` 的 `ReadClientFrame`）。
+
 错误码同样是契约：后端返回裸码（`duplicate`、`hostkey_unknown`…），前端映射成 i18n 的
 `err_<code>`；新增错误码要在两套字典里都加文案。
 
 ## 7. 测试与验收
 
+- 完整门禁是 **`make test check`**（`make check` = 前端 `vue-tsc` + `check:i18n`）。
+  `make test` 只跑 Go：构建机上不一定有 node，所以两者刻意不绑在一起。
+- ⚠️ 无 PTY 的环境（多数 CI 容器）会**静默跳过** 11 个 PTY 用例（`requirePTY` → `t.Skip`），
+  包括 PTY 收发 / 单挂载点顶号 / 历史回放。看到「全绿」时要顺带看一眼 skip 数。
 - 后端：`make test` 必须全绿。集成测试用 `internal/testssh` 起进程内 SSH+SFTP 服务器，
   **不允许**依赖外部 sshd（构建机上不一定有）。覆盖：密码/密钥认证、三种连接测试结局、
   PTY 收发与 resize、单挂载点顶号、历史回放、文件全套操作（含相对路径目录上传）、
@@ -318,6 +341,8 @@
   `make test` 首次跑要能访问模块代理，之后走本地 `.gomodcache/`。
 - 端到端校验脚本（第二轮的功能都在里面，含病态路径名与「命令注入未执行」的断言）：
   `.tmp/e2e2/verify.py`（`python3 verify.py <base_url> <sftp_root> <share_root>`，**58 项断言**，
+  ⚠️ `.tmp/` 已被 gitignore：**这个脚本不在仓库里**，clone 出来是拿不到的，别把它当成
+  可依赖的资产；它读的是 WebSocket 帧，认 `opText` **也认 `opBin`**（终端数据现在是二进制帧），
   含 tar.gz 与 zip 压缩、多父目录追加、非法 format、病态路径名与「命令注入未执行」）；
   它需要 `TRIM_DATA_SHARE_PATHS` 指向一个可写目录（否则导出一条会按预期报 `no_share_path`）。
 - 端到端手测：`go run ./internal/testssh/cmd/testsshd -addr 127.0.0.1:2222 -user demo -password demo -root <可写目录>`
