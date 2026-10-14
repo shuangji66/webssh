@@ -31,7 +31,6 @@ export interface FileEditorState {
   content: string
   /** 打开时（或上次保存后）的内容：脏判据与「还原」的基准 */
   original: string
-  size: number
   /** 'utf-8' | 'utf-16le' | 'utf-16be'（保存时原样带回） */
   encoding: string
   /** 原文件是否以 BOM 开头（保存时原样带回） */
@@ -48,7 +47,6 @@ function blankState(): FileEditorState {
     path: '',
     content: '',
     original: '',
-    size: 0,
     encoding: '',
     bom: false,
     eol: 'lf'
@@ -97,7 +95,6 @@ export const useFileEditorStore = defineStore('fileEditor', () => {
       st.path = res.path
       st.content = res.content
       st.original = res.content
-      st.size = res.size
       st.encoding = res.encoding
       st.bom = res.bom
       st.eol = res.eol
@@ -122,7 +119,6 @@ export const useFileEditorStore = defineStore('fileEditor', () => {
       const res = await api.fsEditLoad(sid, st.path)
       st.content = res.content
       st.original = res.content
-      st.size = res.size
       st.encoding = res.encoding
       st.bom = res.bom
       st.eol = res.eol
@@ -143,13 +139,13 @@ export const useFileEditorStore = defineStore('fileEditor', () => {
     if (!st.open || st.saving || st.content === st.original) return
     st.saving = true
     try {
-      const res = await api.fsEditSave(sid, st.path, st.content, {
+      // 回执里的 size 不再用了（第十七轮起编辑页不显示体积）：要的是「写成功」这件事本身。
+      await api.fsEditSave(sid, st.path, st.content, {
         encoding: st.encoding,
         bom: st.bom,
         eol: st.eol
       })
       st.original = st.content
-      st.size = res.size
       try {
         await useSftpStore().refreshTree(sid, parentPath(st.path))
       } catch {
