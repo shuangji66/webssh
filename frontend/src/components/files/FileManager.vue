@@ -31,6 +31,12 @@
 //   2) 预览弹窗里点了「编辑」也走同一条路（进了编辑页才关弹窗：它 Teleport 到 body、层级在
 //      编辑页之上，不关会盖住编辑页；失败时留着，用户还在读那个文件）。
 //
+// 第二十轮新增一件事（契约 30）：
+//   快捷访问的两个入口——工具栏右侧的书签按钮（与左栏面包屑按钮条上那一个打开**同一个**
+//   弹窗，见 QuickAccessDialog）与目录行菜单/空白处菜单里的「添加快捷访问」（直接加当前目录，
+//   不弹窗；文件没有这一项）。点弹窗里的路径走 `sftp.jumpTo`（先探测、成功了才切过去），
+//   没权限时只报错、不进入目录、也不切子标签。
+//
 // 切回终端由工具栏最左侧的「返回终端」按钮负责（第四轮新增）：它只把 sessionUi 的激活子标签
 // 改回**上一次激活的终端**，左栏（面包屑 + 目录树）随之回来——与左栏那条按钮条里的「切换到
 // 文件管理」互为一对，两处共用同一个状态（契约 13.1 的「二选一」判据没变，也没有第二套开关）。
@@ -48,6 +54,7 @@ import {
 } from '@/serverapi'
 import { useFileEditorStore } from '@/stores/fileEditor'
 import { usePaneControlsStore } from '@/stores/paneControls'
+import { useQuickAccessStore } from '@/stores/quickAccess'
 import { useSessionUiStore } from '@/stores/sessionUi'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
@@ -79,6 +86,7 @@ const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 const sessionUi = useSessionUiStore()
 const editor = useFileEditorStore()
+const quickAccess = useQuickAccessStore()
 const toastStore = useToastStore()
 
 /** 统一的提示出口：文案一律走 i18n，失败必须说清原因（不能「点了没反应」）。 */
@@ -371,6 +379,35 @@ function openInfo(path: string) {
   if (!path) return
   infoPath.value = path
   infoVisible.value = true
+}
+
+// ---- 快捷访问（第二十轮，契约 30） ----
+
+/**
+ * 把一个**目录**加入快捷访问（行菜单 / 空白处菜单 / 左栏目录树菜单共用这一条路）。
+ *
+ * 只「加」，不弹快捷访问弹窗：用户点的是「把这个目录存下来」，再弹一个窗让他确认等于多一步；
+ * 看列表、删条目、跳转都在弹窗里（工具栏右侧与面包屑按钮条的书签按钮打开它）。
+ *
+ * 已经在列表里时给一句「已经在快捷访问里了」——不是错误，也不重复添加（后端的整表保存同样
+ * 会去重，两个设备同时加一条时也不会变成两行）。文件没有这一项：快捷访问只存目录。
+ */
+async function addQuickAccess(path: string) {
+  hideMenu()
+  if (!path) return
+  try {
+    const result = await quickAccess.add(sid, path)
+    if (result === 'exists') toast(t('files_quick_exists'), 'info')
+    else toast(t('files_quick_added', { path }), 'success')
+  } catch (e) {
+    toast(t('files_quick_add_failed', { error: describeError(e) }))
+  }
+}
+
+/** 工具栏右侧的书签按钮 / 面包屑按钮条那个：打开同一个弹窗。 */
+function openQuickAccess() {
+  leaveMulti()
+  quickAccess.setDialog(sid, true)
 }
 
 // ---- 剪贴板栏 ----
@@ -1007,8 +1044,8 @@ function multiMenuItems(): MenuItem[] {
 }
 
 /**
- * 空白处菜单（13.4 + 第四轮 + 第六轮）：新建文件 / 新建文件夹 / 上传 / 粘贴到当前目录 /
- * 信息 / 在当前目录开终端 / 复制当前目录路径 / 刷新。
+ * 空白处菜单（13.4 + 第四轮 + 第六轮 + 第二十轮）：新建文件 / 新建文件夹 / 上传 /
+ * 粘贴到当前目录 / 信息 / 在当前目录开终端 / 复制当前目录路径 / 添加快捷访问 / 刷新。
  *
  * 为什么把「新建 / 上传」也放这里：空白处右键是「对**这个目录**做事」最自然的入口，
  * 而这三件事（尤其是上传）在工具栏上都要先回到工具栏去点。粘贴仍然放在中间靠前的位置
@@ -1025,6 +1062,9 @@ function blankMenuItems(): MenuItem[] {
   items.push({ label: t('files_info'), run: () => openInfo(dir) })
   items.push({ label: t('files_open_terminal'), run: () => openTerminalHere(dir) })
   items.push({ label: t('files_copy_path'), run: () => void copyPath(dir) })
+  // 添加快捷访问（第二十轮）：空白处右键是「对**这个目录**做事」的入口，把当前目录存成
+  // 快捷访问正属于这一类。**只对目录**：空白处菜单作用的对象就是当前目录，天然是目录。
+  items.push({ label: t('files_quick_add'), run: () => void addQuickAccess(dir) })
   // 刷新（第七轮）：空白处右键是「对这个目录做事」的入口，刷新放这里最顺手
   items.push({ label: t('files_refresh'), run: () => retry() })
   return items
@@ -1071,6 +1111,11 @@ const menuItems = computed<MenuItem[]>(() => {
   }
   items.push({ label: t('files_info'), run: () => openInfo(entry.path) })
   items.push({ label: t('files_copy_path'), run: () => void copyPath(entry.path) })
+  // 添加快捷访问（第二十轮）：**只对目录**出现（用户要求「文件不需要快捷访问」——文件既不是
+  // 跳转目标，也没有「进入」这个动作）。
+  if (entry.dir) {
+    items.push({ label: t('files_quick_add'), run: () => void addQuickAccess(entry.path) })
+  }
   items.push({
     label: t('files_open_terminal_here'),
     run: () => openTerminalHere(entry.dir ? entry.path : state.value.dir)
@@ -1323,6 +1368,28 @@ onBeforeUnmount(hideMenu)
           stroke-linejoin="round"
         >
           <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+        </svg>
+      </button>
+
+      <!-- 快捷访问（第二十轮）：紧挨着视图切换，打开快捷访问弹窗（契约 30.3）。左栏面包屑
+           按钮条上那一个书签按钮打开的是同一个弹窗（显隐在 stores/quickAccess.ts 里）。 -->
+      <button
+        type="button"
+        class="tree-tool"
+        :title="t('files_quick_access')"
+        :aria-label="t('files_quick_access')"
+        @click="openQuickAccess"
+      >
+        <svg
+          class="h-4 w-4"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z" />
         </svg>
       </button>
       <!-- 权限显示模式不再是独立按钮：点列表表头里的「权限」就能切（见下面的表头区），

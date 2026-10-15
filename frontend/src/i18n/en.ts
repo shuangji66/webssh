@@ -50,7 +50,7 @@ export const en: Record<string, string> = {
   home_close_confirm_title: 'Close session',
   home_close_confirm_msg: 'Close “{name}”? All terminal sub-tabs and the SFTP connection of this session will be terminated.',
   home_delete_confirm_title: 'Delete remote session',
-  home_delete_confirm_msg: 'Delete “{name}”? Its credentials, quick commands and history will be removed as well.',
+  home_delete_confirm_msg: 'Delete “{name}”? Its credentials, quick commands, quick access paths and history will be removed as well.',
   home_delete_success: 'Deleted “{name}”',
   home_delete_failed: 'Failed to delete: {error}',
   home_delete_trust_failed: 'Session deleted, but removing the trusted host key failed: {error}',
@@ -353,6 +353,22 @@ export const en: Record<string, string> = {
   files_selected: '{n} selected',
   files_delete_selected: 'Delete selected ({n})',
   files_delete_selected_confirm: 'Delete the {n} selected item(s)? Directories are removed with their contents; this cannot be undone.',
+
+  // ===== quick access (round 20) =====
+  files_quick_access: 'Quick access',
+  files_quick_add: 'Add to quick access',
+  files_quick_added: 'Added “{path}” to quick access',
+  files_quick_exists: 'That path is already in quick access',
+  files_quick_add_failed: 'Could not add to quick access: {error}',
+  files_quick_remove: 'Remove from quick access',
+  files_quick_remove_failed: 'Could not remove from quick access: {error}',
+  files_quick_load_failed: 'Could not load quick access: {error}',
+  files_quick_empty: 'No quick access paths yet',
+  files_quick_empty_hint: 'Pick “Add to quick access” from a folder’s “more” menu, or type an absolute path below.',
+  files_quick_input: 'Directory path',
+  files_quick_input_ph: '/vol1/1000/docker',
+  files_quick_invalid: 'The path must be absolute (start with /) and must not contain ..',
+  files_quick_open_failed: 'Could not open the directory: {error}',
 
   // ===== upload dialog =====
   upload_title: 'Upload to {path}',

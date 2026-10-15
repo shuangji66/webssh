@@ -26,13 +26,16 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { useWideLayout } from '@/composables/useMobileLayout'
+import { useAppTabsStore } from '@/stores/appTabs'
 import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
 import { usePaneControlsStore } from '@/stores/paneControls'
+import { useQuickAccessStore } from '@/stores/quickAccess'
 import { termStatusDotClass, useTerminalsStore, type TermTab } from '@/stores/terminals'
 import { revealActive, wheelToHorizontal } from '@/utils/scroll'
 import BreadcrumbBar from '@/components/files/BreadcrumbBar.vue'
 import FileManager from '@/components/files/FileManager.vue'
 import FileTree from '@/components/files/FileTree.vue'
+import QuickAccessDialog from '@/components/files/QuickAccessDialog.vue'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import PromptDialog from '@/components/PromptDialog.vue'
@@ -47,6 +50,28 @@ const emit = defineEmits<{
 const sessionUi = useSessionUiStore()
 const terminals = useTerminalsStore()
 const paneControls = usePaneControlsStore()
+/**
+ * 快捷访问（第二十轮）：弹窗显隐存在 store 里（两个入口在两个兄弟组件上：文件管理工具栏与
+ * 左栏面包屑按钮条），弹窗本体挂在**这里**——它是两者的共同父级，且属于「一个会话一个」的
+ * 界面状态（与下面那两个子标签弹窗同一层）。
+ */
+const quickAccess = useQuickAccessStore()
+
+/**
+ * 切走这个会话标签时关掉快捷访问弹窗。
+ *
+ * 为什么需要这一句：弹窗 Teleport 到 body，而会话视图在切标签时只是 `v-show` 隐藏——
+ * Teleport 出去的节点**不在**那棵 display:none 的子树里，会一直浮在首页/另一个会话上面。
+ * 列表类弹窗（重命名、关闭确认）都是「点了立刻有结果」的短命弹窗，捞不到也就算了；快捷访问
+ * 是一个用户会读、会停一会儿再点的面板，留着它挡住别的标签是明显的错。
+ */
+const appTabs = useAppTabsStore()
+watch(
+  () => appTabs.activeId,
+  (active) => {
+    if (active !== props.sid) quickAccess.setDialog(props.sid, false)
+  }
+)
 /**
  * 左栏要不要占位，看的是**视口宽不宽**（≥ Tailwind 的 md 断点），而不是「是不是触屏」。
  *
@@ -782,6 +807,15 @@ function onRenamed(value: string) {
       :label="t('session_rename_prompt')"
       :initial-value="renameInitial"
       @confirm="onRenamed"
+    />
+
+    <!-- 快捷访问弹窗（第二十轮）：文件管理工具栏与左栏面包屑按钮条上的两个书签按钮打开的是
+         **同一个**弹窗，所以它挂在这一层（两处的共同父级），显隐由 store 里的 per-sid 开关
+         驱动。`visible` 必须接回去（漏接的症状见 ConfirmDialog 头部注释）。 -->
+    <QuickAccessDialog
+      :sid="sid"
+      :visible="quickAccess.isDialogOpen(sid)"
+      @update:visible="quickAccess.setDialog(sid, $event)"
     />
   </div>
 </template>

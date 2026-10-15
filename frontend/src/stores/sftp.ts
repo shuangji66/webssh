@@ -28,6 +28,9 @@
 //                                          「···更多文件」那一行去文件管理里看，见契约 26.4）
 //   runtime / ensureRuntime / exportRoot / archiveDir
 //                                          运行信息（导出目标目录、压缩包输出目录）
+//   jumpTo（第二十轮）                       「先探测、成功了才切过去」的跳转（快捷访问的点击）：
+//                                          列目录失败时**不动任何展示状态**，把异常抛给调用方去报错，
+//                                          所以它不取代 navigate（普通导航仍然「先切、再显示错误」）
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { t } from '@/i18n'
@@ -40,6 +43,7 @@ import {
   type ArchiveResult,
   type ExportResult,
   type FsEntry,
+  type FsListing,
   type RuntimeInfo,
   type UploadEntry,
   type UploadResult
@@ -282,6 +286,24 @@ export const useSftpStore = defineStore('sftp', () => {
   }
 
   /**
+   * 把一次列目录的结果装进状态：**成功路径唯一的写入点**（loadDir 与 jumpTo 都走它）。
+   *
+   * 分开的原因见 jumpTo：快捷访问的点击要「先探测、成功了才改状态」，而探测成功的那个响应
+   * 就是这一次加载的结果——如果不抽出来，jumpTo 只能先探一次、再让 loadDir 请求第二次，
+   * 目录一大的时候这一下是肉眼可见的。
+   */
+  function applyListing(sid: string, st: SftpState, res: FsListing) {
+    st.home = res.home || st.home
+    // 家目录请求（path 为空）时以响应里的解析结果为准
+    st.dir = res.path || st.dir
+    st.entries = res.entries
+    loadedDirs.add(dirKey(sid, st.dir))
+    // 树和列表是同一份数据：这个目录在树里已经展开过的话，一并换掉它的缓存，
+    // 免得「列表里删掉的文件，树里还挂在那儿」。
+    if (st.treeChildren[st.dir]) st.treeChildren[st.dir] = treeRows(st, st.dir, res.entries)
+  }
+
+  /**
    * 拉一个目录的内容到当前视图。
    *
    * `path` 为空表示「家目录」——后端会解析出真实家目录并在响应里回填（响应体的 path/home），
@@ -302,14 +324,7 @@ export const useSftpStore = defineStore('sftp', () => {
     st.entries = []
     try {
       const res = await api.fsList(sid, target)
-      st.home = res.home || st.home
-      // 家目录请求（path 为空）时以响应里的解析结果为准
-      st.dir = res.path || target
-      st.entries = res.entries
-      loadedDirs.add(dirKey(sid, st.dir))
-      // 树和列表是同一份数据：这个目录在树里已经展开过的话，一并换掉它的缓存，
-      // 免得「列表里删掉的文件，树里还挂在那儿」。
-      if (st.treeChildren[st.dir]) st.treeChildren[st.dir] = treeRows(st, st.dir, res.entries)
+      applyListing(sid, st, res)
     } catch (e) {
       st.error = describeError(e)
     } finally {
@@ -460,6 +475,31 @@ export const useSftpStore = defineStore('sftp', () => {
     if (prev === undefined) return
     if (st.dir) st.forward.push(st.dir)
     await loadDir(sid, prev)
+  }
+
+  /**
+   * 跳到某个目录，但**先探测**：列目录成功才动状态，失败（权限不足 / 目录不存在 / 会话没开）
+   * 原样抛给调用方去报错。
+   *
+   * 给快捷访问的点击用（契约 30.3）。为什么不像 navigate 那样「先切过去、再在面板里显示错误」：
+   *  - 入口在左栏按钮条与弹窗里，用户可能压根没在看文件管理——切过去只看到一屏错误；
+   *  - 更实际的是它会毁掉现场：`back` 历史会记下「刚才那个目录」，当前目录也变成了一个打不开
+   *    的路径，用户想的是「打开另一个目录」，不是「离开现在这个目录」。
+   *
+   * 探测的那次响应**直接当成本次加载的结果**（`applyListing`）：一次点击只发一次请求。
+   * 探测失败时不动任何展示状态（`entries` / `error` / `back` 全部保持原样）。
+   */
+  async function jumpTo(sid: string, path: string): Promise<void> {
+    const st = stateOf(sid)
+    const target = path || st.home
+    if (!target) throw new Error(t('files_quick_invalid'))
+    const res = await api.fsList(sid, target)
+    if (res.path && res.path !== st.dir) {
+      if (st.dir) st.back.push(st.dir)
+      st.forward = []
+    }
+    st.error = ''
+    applyListing(sid, st, res)
   }
 
   async function forward(sid: string): Promise<void> {
@@ -835,6 +875,7 @@ export const useSftpStore = defineStore('sftp', () => {
     exportRoot,
     archiveDir,
     navigate,
+    jumpTo,
     back,
     forward,
     refresh,

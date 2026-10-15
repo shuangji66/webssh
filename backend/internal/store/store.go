@@ -5,7 +5,8 @@
 //	├── known_hosts.json            已信任的主机密钥（TOFU）
 //	├── sessions/<sid>.json         远程会话配置（凭据字段是密文）
 //	├── history/<sid>/<tid>.log     终端历史（会话存活期间；会话关闭时删整个目录）
-//	└── quickcmds/{global,<sid>}.json  全局 / 会话专属快捷指令
+//	├── quickcmds/{global,<sid>}.json  全局 / 会话专属快捷指令
+//	└── quickaccess/<sid>.json      会话的快捷访问目录路径（第二十轮，见 main 包的 quickaccess.go）
 //
 // 目录里**没有** meta.json：契约把它标为「可选（终端标题等）」。终端是纯内存态
 // （进程重启即消失），把标题另存一份没有任何读取者，属于死代码，故不实现。
@@ -46,7 +47,7 @@ type Store struct {
 // New 准备数据目录并返回句柄（缺目录会建出来）。
 func New(dir string) (*Store, error) {
 	s := &Store{dir: dir}
-	for _, d := range []string{s.sessionsDir(), s.historyRoot(), s.quickcmdsDir()} {
+	for _, d := range []string{s.sessionsDir(), s.historyRoot(), s.quickcmdsDir(), s.quickAccessDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, fmt.Errorf("创建数据目录 %s 失败：%w", d, err)
 		}
@@ -57,6 +58,7 @@ func New(dir string) (*Store, error) {
 func (s *Store) sessionsDir() string    { return filepath.Join(s.dir, "sessions") }
 func (s *Store) historyRoot() string    { return filepath.Join(s.dir, "history") }
 func (s *Store) quickcmdsDir() string   { return filepath.Join(s.dir, "quickcmds") }
+func (s *Store) quickAccessDir() string { return filepath.Join(s.dir, "quickaccess") }
 func (s *Store) knownHostsPath() string { return filepath.Join(s.dir, "known_hosts.json") }
 
 // SessionsDir 暴露会话配置目录（测试与诊断用）。
@@ -460,4 +462,27 @@ func (s *Store) QuickCmdsScopes() ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// 快捷访问（第二十轮）
+// ---------------------------------------------------------------------------
+
+// QuickAccessPath 是某个会话的快捷访问路径文件。
+//
+// **没有全局表**（与快捷指令不同）：路径是远程主机上的绝对路径，跨会话共享会把 A 主机的
+// `/vol1/1000` 挂到 B 会话的弹窗里，点开只能报错。会话身份（user@host:port）去重保证
+// 「一个主机一个会话」，因此「按会话」就等于「按主机」。
+func (s *Store) QuickAccessPath(sid string) string {
+	return filepath.Join(s.quickAccessDir(), sid+".json")
+}
+
+// DeleteQuickAccess 删除某个会话的快捷访问表（会话被删时调用）。
+func (s *Store) DeleteQuickAccess(sid string) {
+	if sid == "" || !ValidID(sid) {
+		return
+	}
+	if err := os.Remove(s.QuickAccessPath(sid)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		logx.Warnf("删除会话快捷访问 %s 失败：%v", sid, err)
+	}
 }

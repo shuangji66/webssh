@@ -267,6 +267,19 @@ export interface FsOpResult {
   skipped: number
 }
 
+/**
+ * 列目录的响应（`/api/fs/list`，契约 4.2）。
+ *
+ * `path` 是**后端解析后**的绝对路径、`home` 是登录用户的家目录：请求里给空路径（家目录）时
+ * 只有后端知道答案，前端一律以响应为准（不同账号可能是 /root、/home/x，也可能被 chroot 到 /）。
+ * 快捷访问的「先探测再跳转」（stores/sftp.ts 的 jumpTo）用的就是这个响应。
+ */
+export interface FsListing {
+  path: string
+  home: string
+  entries: FsEntry[]
+}
+
 /** 支持的压缩格式：tar.gz（默认）与 zip。 */
 export type ArchiveFormat = 'tar.gz' | 'zip'
 
@@ -565,7 +578,7 @@ export const api = {
     request<{ ok: boolean }>('/api/terminals/rename', { json: { sid, tid, title } }),
 
   fsList: (sid: string, path: string) =>
-    request<{ ok: boolean; path: string; home: string; entries: FsEntry[] }>('/api/fs/list', {
+    request<FsListing & { ok: boolean }>('/api/fs/list', {
       json: { sid, path }
     }),
 
@@ -672,6 +685,19 @@ export const api = {
     request<{ ok: boolean; scope: string; commands: QuickCmd[] }>('/api/quickcmds/save', {
       json: { sid: sid ?? '', commands }
     }),
+
+  /**
+   * 快捷访问（第二十轮，契约 30）：**按会话**存的一串远程目录路径，没有全局表——
+   * 路径是某台远程主机上的绝对路径，跨会话共享只会是一条条点了报错的项。
+   *
+   * 保存是整表覆盖（与快捷指令同一套）：去重与规整都由后端做，前端发整份列表。
+   * 会话不存在（已被删）时回 `session_gone`。
+   */
+  quickAccess: (sid: string) =>
+    request<{ ok: boolean; paths: string[] }>('/api/quickaccess/list', { json: { sid } }),
+
+  saveQuickAccess: (sid: string, paths: string[]) =>
+    request<{ ok: boolean; paths: string[] }>('/api/quickaccess/save', { json: { sid, paths } }),
 
   hostKeys: () => request<{ ok: boolean; hosts: HostKeyRecord[] }>('/api/hostkeys'),
 

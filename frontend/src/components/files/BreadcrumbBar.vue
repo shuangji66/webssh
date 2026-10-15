@@ -4,7 +4,7 @@
 // 为什么去掉路径：左栏宽度只有 11~20rem，一串「根目录 / vol1 / 1000 / docker / …」在这里
 // 只能靠横向滚动看，而它想回答的「我在哪」在文件管理器的面包屑里已经回答过了（那里有整行
 // 宽度）。左栏这一行的价值在于**动作**：
-//   [刷新] [隐藏面包屑]
+//   [刷新] [快捷访问] [隐藏面包屑]
 //
 // 第四轮：家目录按钮简化成纯图标。
 // 第六轮：删掉「在此目录新建终端」（工具栏/文件树菜单里都有，重复）；新增「隐藏面包屑」——
@@ -15,16 +15,20 @@
 //   - 删掉「切换到文件管理」：子标签栏里那个「文件管理」子标签是常驻的，不需要第二个入口
 //     （注意：文件管理器里的「返回终端」**不是**它的反面，那个要留着）。
 //
-// 本组件不 emit 任何事件：动作全部直接落到 store（sftp / sessionUi）上。
+// 本组件不 emit 任何事件：动作全部直接落到 store（sftp / sessionUi / quickAccess）上。
 import { computed } from 'vue'
 import { t } from '@/i18n'
 import { useSessionUiStore } from '@/stores/sessionUi'
+import { useQuickAccessStore } from '@/stores/quickAccess'
 import { useSftpStore } from '@/stores/sftp'
 
 const { sid } = defineProps<{ sid: string }>()
 
 const sftp = useSftpStore()
 const ui = useSessionUiStore()
+// 快捷访问弹窗挂在会话视图上（契约 30.3）：这里只负责把它的显隐打开——弹窗本体与文件管理
+// 工具栏那个书签按钮共用同一个（见 QuickAccessDialog）。
+const quickAccess = useQuickAccessStore()
 
 const state = computed(() => sftp.stateOf(sid))
 
@@ -60,6 +64,29 @@ function hideLeft() {
       >
         <path d="M21 12a9 9 0 1 1-3-6.7" />
         <path d="M21 4v5h-5" />
+      </svg>
+    </button>
+
+    <!-- 快捷访问（第二十轮）：打开快捷访问弹窗（与文件管理工具栏右边那个书签按钮同一个，
+         见 QuickAccessDialog）。放在左栏是因为用户在这里正看着目录树，想「把常去的目录存
+         下来 / 跳过去」的时候不用先切到文件管理。 -->
+    <button
+      type="button"
+      class="tree-tool"
+      :title="t('files_quick_access')"
+      :aria-label="t('files_quick_access')"
+      @click="quickAccess.setDialog(sid, true)"
+    >
+      <svg
+        class="h-4 w-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z" />
       </svg>
     </button>
 

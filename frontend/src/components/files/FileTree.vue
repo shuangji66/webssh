@@ -30,6 +30,7 @@ import { t } from '@/i18n'
 import { ApiError, describeError, type ArchiveFormat } from '@/serverapi'
 import { useFileEditorStore } from '@/stores/fileEditor'
 import { usePaneControlsStore } from '@/stores/paneControls'
+import { useQuickAccessStore } from '@/stores/quickAccess'
 import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
 import { TREE_FILE_LIMIT, useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
@@ -51,6 +52,7 @@ const ui = useSessionUiStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 const editor = useFileEditorStore()
+const quickAccess = useQuickAccessStore()
 const toastStore = useToastStore()
 
 const state = computed(() => sftp.stateOf(sid))
@@ -533,6 +535,26 @@ async function copyPath() {
 }
 
 /**
+ * 把一个目录加入快捷访问（第二十轮，契约 30）。
+ *
+ * 与 FileManager 里的同名实现同一套语义：只加、不弹窗（弹窗在工具栏/面包屑的书签按钮上），
+ * 已经在列表里时给一句提示而不是报错。树里只有**目录**菜单有这一项——文件菜单没有（用户
+ * 要求「文件不需要快捷访问」）。
+ */
+async function addQuickAccess() {
+  const path = menu.path
+  hideMenu()
+  if (!path) return
+  try {
+    const result = await quickAccess.add(sid, path)
+    if (result === 'exists') toast(t('files_quick_exists'), 'info')
+    else toast(t('files_quick_added', { path }), 'success')
+  } catch (e) {
+    toast(t('files_quick_add_failed', { error: describeError(e) }))
+  }
+}
+
+/**
  * 在此目录新建终端。
  *
  * 只做两件事：建标签（openTerminalAt 内部会把它设成激活项 → 子标签栏切过去、主区域显示它）
@@ -704,6 +726,9 @@ function dirMenuItems(path: string): MenuItem[] {
     items.push(exportItem(path))
   }
   items.push({ label: t('files_copy_path'), run: () => void copyPath() })
+  // 添加快捷访问（第二十轮）：放在 root 判断**之外**——根目录（`/`）也是一个目录，把它存成
+  // 快捷访问是合理的（上面那几项被排除是因为它们是「对父目录/自身名字」的操作）。
+  items.push({ label: t('files_quick_add'), run: () => void addQuickAccess() })
   items.push({ label: t('files_refresh'), run: () => void refreshHere() })
   return items
 }

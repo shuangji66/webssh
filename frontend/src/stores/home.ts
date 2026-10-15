@@ -24,6 +24,7 @@ import { sessionLabel } from '@/utils/format'
 import { useAppTabsStore } from '@/stores/appTabs'
 import { useSessionUiStore } from '@/stores/sessionUi'
 import { useFileEditorStore } from '@/stores/fileEditor'
+import { useQuickAccessStore } from '@/stores/quickAccess'
 import { useSftpStore } from '@/stores/sftp'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
@@ -223,6 +224,9 @@ export const useHomeStore = defineStore('home', () => {
     useTerminalsStore().forget(sid)
     useSftpStore().forget(sid)
     useFileEditorStore().forget(sid)
+    // 快捷访问也要丢：那串路径属于这个会话的远程主机（后端在删会话时也清了文件，
+    // 前端留着会在下次进入同名 sid 时显示一份已经不存在的列表）。
+    useQuickAccessStore().forget(sid)
     useSessionUiStore().forget(sid)
     delete openStates.value[sid]
   }

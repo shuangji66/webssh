@@ -105,6 +105,10 @@ func (m *AdminMux) buildHandler() http.Handler {
 			m.route(m.handleQuickCmdsList)(w, r)
 		case p == "/api/quickcmds/save":
 			m.route(m.handleQuickCmdsSave)(w, r)
+		case p == "/api/quickaccess/list":
+			m.route(m.handleQuickAccessList)(w, r)
+		case p == "/api/quickaccess/save":
+			m.route(m.handleQuickAccessSave)(w, r)
 		case p == "/api/trim/status":
 			m.route(m.handleTrimStatus)(w, r)
 		case p == "/api/trim/acl":

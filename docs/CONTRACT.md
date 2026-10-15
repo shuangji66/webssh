@@ -118,9 +118,10 @@ data/
 ├── sessions/<sid>.json          远程会话配置（凭据字段是密文）
 ├── history/<sid>/<tid>.log      终端会话历史（会话存活期间；会话关闭时删除整目录）
 ├── history/<sid>/meta.json      会话级元数据（终端标题等，可选）
-└── quickcmds/
-    ├── global.json              全局快捷指令（`content` 是密文，其余字段明文）
-    └── <sid>.json               会话专属快捷指令（同上）
+├── quickcmds/
+│   ├── global.json              全局快捷指令（`content` 是密文，其余字段明文）
+│   └── <sid>.json               会话专属快捷指令（同上）
+└── quickaccess/<sid>.json       会话的快捷访问目录路径（第二十轮，见第 30 节；路径明文）
 ```
 
 - **凭据加密**：`password` / `privateKey` / `passphrase` 三个字段以
@@ -224,6 +225,8 @@ data/
 | POST | `/api/fs/edit-save` | `{sid, path, content, encoding, bom, eol}` | `{ok, size}`（按原编码 / BOM / 换行写回；见 26.2） |
 | POST | `/api/quickcmds/list` | `{sid}`（空 = 全局） | `{ok, scope, commands:[QuickCmd]}` |
 | POST | `/api/quickcmds/save` | `{sid, commands:[QuickCmd]}` | `{ok, scope, commands}` |
+| POST | `/api/quickaccess/list` | `{sid}`（**必填**，没有全局表） | `{ok, paths:[string]}`（第二十轮，见第 30 节） |
+| POST | `/api/quickaccess/save` | `{sid, paths:[string]}` | `{ok, paths}`（整表覆盖；逐条规整 + 去重） |
 | GET | `/api/trim/status` | — | `{ok, trim:{available, message, app}}`（handler 里也校验了方法） |
 | POST | `/api/trim/acl` | `{paths:[...]}` | `{ok, list:[AclEntry]}` |
 
@@ -287,6 +290,10 @@ RuntimeInfo  { version, bootId, dataDir, adminSock, adminBaseURL, hostname,
   半截 zip 会让用户以为下载成功）。
 - `/api/trim/*` 只能服务端调（token 在 `TRIM_API_TOKEN` 环境变量里）；飞牛不可用时
   `/api/trim/status` 返回 `available:false` + 原因，`/api/trim/acl` 返回 `unavailable` 错误。
+- `/api/quickaccess/*`（第二十轮，第 30 节）：`paths` 是**按会话**的远程绝对路径列表，没有
+  全局表；`sid` 为空 → `invalid`，会话不存在 → `session_gone`。`save` 是**整表覆盖**，后端
+  逐条规整（清重复/末尾斜杠、拒绝相对路径与 `..` 段、按规整后的结果去重）并保留 `paths` 的
+  顺序；**不 trim**（以空格结尾的目录名合法，与 `resolveRemotePath` 同一条纪律）。
 
 ### 4.4 终端 WebSocket 协议
 
@@ -367,7 +374,8 @@ frontend/src/
 │   ├── paneControls.ts         [B]    终端命令出口（按 sid+uid 登记）
 │   ├── sftp.ts                 [C]    SFTP 文件浏览状态（含目录树的文件截断与总数）
 │   ├── sessionStats.ts         [D]    卡片上的系统信息（5 秒轮询，见 23）
-│   └── fileEditor.ts           [C]    文件编辑页状态（按 sid 分片，见 26.3）
+│   ├── fileEditor.ts           [C]    文件编辑页状态（按 sid 分片，见 26.3）
+│   └── quickAccess.ts          [C]    快捷访问：按会话分片的目录路径 + 弹窗显隐（见 30）
 ├── trim/sdk.ts                 [C]    @trimjs/web-app 薄封装（选飞牛文件）
 ├── components/
 │   ├── AppTabBar.vue           [D]    顶栏标签条（首页固定 + 会话标签）
@@ -384,7 +392,8 @@ frontend/src/
 │   ├── terminal/KeypadBar.vue     [B] 移动端辅助键条
 │   ├── files/FileManager.vue      [C] 文件管理面板（工具栏 + 面包屑 + 列表/网格 + 菜单）
 │   ├── files/FileTree.vue         [C] 左栏文件树
-│   ├── files/BreadcrumbBar.vue    [C] 左栏面包屑（只有「刷新」与「隐藏面包屑」两个按钮）
+│   ├── files/BreadcrumbBar.vue    [C] 左栏按钮条（刷新 / 快捷访问 / 隐藏面包屑）
+│   ├── files/QuickAccessDialog.vue [C] 快捷访问弹窗（列表 + 手动输入 + 删除，见 30）
 │   ├── files/InfoDialog.vue       [C] 「信息」弹窗（/api/fs/info，见 15.5）
 │   ├── files/UploadDialog.vue     [C] 上传弹窗（本地文件 / 本地目录 / 飞牛文件）
 │   ├── files/PreviewDialog.vue    [C] 预览：图片走 /api/fs/image、文本走 /api/fs/read（见 25）
@@ -478,6 +487,8 @@ useSftpStore(): {
   stateOf(sid: string): SftpState
   ensure(sid: string): Promise<void>            // 首次进入：定位家目录并加载
   navigate(sid: string, path: string): Promise<void>   // 记录前进/后退历史
+  jumpTo(sid: string, path: string): Promise<void>     // 先探测再切过去（快捷访问的点击，见 30.3）：
+                                                       // 列目录失败 → 抛异常且**不动任何展示状态**
   back(sid: string): Promise<void>; forward(sid: string): Promise<void>
   refresh(sid: string): Promise<void>
   loadDir(sid: string, path: string, force?: boolean): Promise<void>
@@ -526,6 +537,19 @@ useQuickCmdsStore(): {
   reorder(sid: string | null, orderedIds: string[]): Promise<void>
 }
 
+// [C] stores/quickAccess.ts（第二十轮，见 30）
+export function normalizeQuickPath(raw: string): string | null   // 与后端 sanitizeQuickPath 同一套规则
+useQuickAccessStore(): {
+  listOf(sid: string): string[]
+  isLoading(sid: string): boolean; isFailed(sid: string): boolean
+  ensure(sid: string): Promise<void>              // 幂等；同一个 sid 上并发只发一次请求
+  reload(sid: string): Promise<void>
+  add(sid: string, path: string): Promise<'added' | 'exists'>   // 路径非法 → 抛 Error；否则乐观更新 + 失败回滚
+  remove(sid: string, path: string): Promise<void>
+  isDialogOpen(sid: string): boolean; setDialog(sid: string, open: boolean): void
+  forget(sid: string): void                       // home.forgetSession 会调它
+}
+
 // [D] stores/settings.ts
 export const FONT_FAMILY_KEY: string   // main.ts 用到
 useSettingsStore(): { fontSize: number; terminalFont: 'maple'|'system';
@@ -560,9 +584,10 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 | `KeypadBar.vue` [B] | `{ ctrl: boolean; alt: boolean; shift: boolean }` | `key(data)`, `toggle('ctrl'\|'alt'\|'shift')` | 与 terminal 项目一致 |
 | `FileManager.vue` [C] | `{ sid: string; mobile?: boolean }` | — | 完整文件管理面板；内部自己发起上传/下载/删除等 |
 | `FileTree.vue` [C] | `{ sid: string }` | — | 左栏文件树（目录 + 每个目录前 20 个文件）；点目录 = 只更新当前目录并展开（**不切**子标签，见 11.3），点文件 = 预览。只有一个调用方且只在宽屏渲染，所以没有 `mobile` prop |
-| `BreadcrumbBar.vue` [C] | `{ sid: string }` | — | 左栏面包屑；只有「刷新」「隐藏面包屑」两个按钮（18.1 删掉了「完整文件管理」） |
+| `BreadcrumbBar.vue` [C] | `{ sid: string }` | — | 左栏按钮条；「刷新」「快捷访问」（第二十轮，与文件管理工具栏那个书签按钮**同一个**弹窗）「隐藏面包屑」（18.1 删掉了「完整文件管理」） |
 | `UploadDialog.vue` [C] | `{ visible: boolean; sid: string; dir: string }` | `update:visible(v)`, `done(UploadResult)` | 三个分组：本地文件 / 本地目录 / 飞牛文件 |
 | `PreviewDialog.vue` [C] | `{ visible: boolean; sid: string; path: string; size?: number }` | `update:visible(v)`, `edit(path)` | 图片 / 文本两种模式；`size` 是列表里已知的体积（图片超限时用它把话说清楚）；`edit` 由调用方决定怎么进编辑页 |
+| `QuickAccessDialog.vue` [C] | `{ sid: string; visible: boolean }` | `update:visible(v)` | 快捷访问弹窗（第二十轮，见 30）：路径列表 + 手动输入添加 + 逐条删除；点一条 = 先探测再进那个目录。挂在 `SessionView` 上（显隐在 `stores/quickAccess.ts`） |
 | `ConfirmDialog.vue` [D] | `{ visible, title, message, confirmText?, cancelText?, danger? }` | `confirm()`, `cancel()`, `update:visible(v)` | 通用确认框 |
 | `PromptDialog.vue` [D] | `{ visible, title, label?, placeholder?, initialValue?, confirmText?, cancelText? }` | `confirm(value: string)`, `cancel()`, `update:visible(v)` | 通用输入框（重命名 / 新建） |
 | `SessionFormDialog.vue` [D] | `{ visible: boolean; session?: SessionView \| null }` | `update:visible(v)`, `saved(s: SessionView)` | 新增/编辑 + 测试连接 + 首次信任指纹 |
@@ -599,6 +624,11 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   （11.6）；「专属」只有会话视图里能切（首页不显示专属分组）。点击命令 → 发给当前激活终端
   （`paneControls.get(sid, activeUid)?.send(...)`），`auto` 为真时在内容后补 `\r`。
   未连接时 toast `qc_not_connected`。
+- **快捷访问**（第二十轮，第 30 节）：入口两个——文件管理工具栏「视图」右侧的书签按钮与左栏
+  按钮条的「快捷访问」按钮，都打开 `QuickAccessDialog`（挂在 `SessionView` 上，显隐是
+  `stores/quickAccess.ts` 的 per-sid 开关）；另有两个「只加不弹窗」的入口：目录的「更多」菜单
+  （文件管理与目录树）与文件管理列表/网格的空白处右键菜单。点弹窗里的一条路径 = `sftp.jumpTo`
+  先探测再进那个目录（失败只 toast，**不切子标签、不改变当前目录**）。
 - **首页卡片**：只平铺（网格，不提供列表/表格视图），卡片做大（`min-w-[22rem]`）。
   卡片显示：会话名 / `user@host:port` / 备注 / 「不保存凭据」提醒 / **内联的子终端列表**
   （点一行 = 快捷打开）。**不再有**认证方式徽标、打开状态灯、打开时间与最近使用时间
@@ -2679,3 +2709,93 @@ README 的安全边界（必须由反代覆写、客户端可伪造；`upload-fr
 - 未做：无头浏览器里点一遍（本轮只动后端落盘格式，界面零改动；接口收发的仍是明文 `content`，
   前端行为不变——`QuickCmdsDialog` 把内容发进终端时本来就把 `\r?\n` 转成 `\r`，多行内容是有意义的）。
 
+---
+
+## 30. 第二十轮：快捷访问（文件管理/面包屑的书签 + 目录菜单）
+
+### 30.1 需求
+
+- 文件管理工具栏「视图」按钮**右侧**加一个书签图标按钮 → 打开「快捷访问」弹窗；
+- 弹窗里**不预设任何路径**，支持手动输入添加、支持逐条删除、把路径列出来；
+- 目录的「更多操作」菜单（文件管理行菜单 + 左栏目录树的目录菜单）与文件管理**列表/网格的
+  空白处右键菜单**加「添加快捷访问」（**文件没有这一项**）；
+- 左栏面包屑按钮条也加一个书签按钮，点开**同一个**弹窗；
+- 点弹窗里的一条路径 = 在文件管理里进入那个目录；**没权限就报错、并且不打开文件管理 / 不进入
+  那个目录**。
+
+### 30.2 后端（`backend/quickaccess.go`）
+
+- 存储 `quickaccess/<sid>.json`（`{version:1, paths:[...]}`，0600）。**按会话**存、没有全局表：
+  路径是某台远程主机上的绝对路径，而会话身份（user@host:port）在后端是去重的，所以「按会话」
+  就等于「按主机」——把 A 主机的路径挂进 B 会话，点开只能报错。删除会话时一并
+  `DeleteQuickAccess`（`sessions.go` 的 `delete`，前端确认文案也加了一句「快捷访问」）。
+- 接口（契约 4.2）：`POST /api/quickaccess/list` 与 `save`，**整表提交/整表返回**（与快捷指令
+  同一套，去重与规整只实现一遍）。`sid` 为空 → `invalid`（这里没有全局作用域），会话不存在 →
+  `session_gone`。条数上限 200（`maxQuickAccess`）、单条长度上限 4096。
+- 路径规整 `sanitizeQuickPath`：必须是绝对路径、**拒绝 `..` 段**（而不是靠 `path.Clean` 折掉——
+  Clean 之后是另一个目录，悄悄改掉比报错更糟），清掉重复斜杠 / `.` 段 / 末尾斜杠；
+  **不 trim**（以空格结尾的目录名合法，与 `resolveRemotePath` 同一条纪律）。整表按规整后的结果
+  去重并保留原顺序（先出现的留下）。磁盘上的文件读回时重新规整一遍，认不出就报错（不静默丢条目）。
+- **不做加密**（与快捷指令的命令内容不同）：目录路径不是秘密，加密只会让它没法排查。
+
+### 30.3 前端
+
+- `stores/quickAccess.ts`（[C]，契约 6.1）：按 sid 分片 + 乐观更新/失败回滚（与 `quickCmds`
+  一致），**但新增/删除都先 `ensure`**——整表覆盖的硬前提是「手上这份就是服务端那份」；同一个
+  sid 上并发只发一次请求。路径校验 `normalizeQuickPath`（与后端同一套规则），**不 trim**；用户在
+  输入框里手输时误带的首尾空白由**弹窗那一层**去掉（`submit` 里 `trim()`），菜单/树传进来的
+  路径一个字都不动。弹窗显隐（per-sid）也放在这里：三个入口分属两个兄弟组件，弹窗本体挂在
+  `SessionView` 上，显隐只能有一个共享来源。
+- `stores/sftp.ts` 新增 `jumpTo(sid, path)`：**先列一次目录**（`api.fsList`），成功才写状态
+  （`applyListing` 是成功路径唯一的写入点，与 `loadDir` 共用），失败**原样抛异常且不动任何展示
+  状态**（`entries` / `error` / `back` 全不变）。这就是「没权限不进入目录」的实现：用户可能压根
+  没在看文件管理（从面包屑按钮进来），先切过去只会看到一屏错误，还会把后退历史与当前目录一起
+  毁掉；探测的那次响应直接当成本次加载的结果，一次点击只发一次请求。
+- `components/files/QuickAccessDialog.vue`（挂在 `SessionView`）：头部（标题 + 关闭）/
+  正文（列表，`min-h-0 flex-1 overflow-y-auto`）/ 页脚（输入框 + 「添加快捷访问」按钮）三段，
+  输入框用 `id`/`for` 与可见 label 关联。加载失败显示原因 + 「重试」，**不显示成「还没有快捷
+  访问」**（那会让用户以为自己加的条目被删了）。删除不弹确认框（删一条书签没有破坏性）。
+  点一条路径：`jumpTo` 成功 → `sessionUi.setActiveSub(sid, FILES_TAB)` → 关弹窗；失败 →
+  toast `files_quick_open_failed`（`describeError` 会把 `permission` 翻成「权限不足」）并**留着
+  弹窗**（用户多半想顺手删掉这条失效路径）。
+- 两个书签按钮（`FileManager` 工具栏「视图」右侧 / `BreadcrumbBar`）都只写
+  `quickAccess.setDialog(sid, true)`；两个「只加不弹窗」的入口（`FileManager` 的空白处菜单与
+  目录行菜单、`FileTree` 的目录菜单）走 `quickAccess.add` + toast（已在列表里时提示
+  「这个路径已经在快捷访问里了」，不是错误）。
+- `SessionView` 在**切走这个会话标签时**关掉弹窗：弹窗 Teleport 到 `body`，而会话视图切标签只是
+  `v-show` 隐藏——Teleport 出去的节点不在那棵 `display:none` 的子树里，会一直浮在首页/另一个
+  会话上面。
+
+### 30.4 冻结文件（本轮）
+
+`backend/admin_routes.go`（两条路由）、`backend/sessions.go`（删会话多清一张表）、
+`backend/internal/store/store.go`（新增 `quickaccess/` 目录与两个方法）、
+`frontend/src/serverapi/index.ts`（`quickAccess`/`saveQuickAccess` + 抽出 `FsListing`）、
+`frontend/src/stores/{sftp,home}.ts`（`jumpTo` / `forgetSession`）、`frontend/src/i18n/*`
+（新增 14 条 `files_quick_*`，改 1 条 `home_delete_confirm_msg`）、`docs/CONTRACT.md`。
+
+### 30.5 本轮的验证
+
+- 后端新增 `backend/quickaccess_test.go`：
+  `TestSanitizeQuickPaths`（`/a//b/` → `/a/b`、`/a/./b` → `/a/b`、`/a/my dir ` 的**末尾空格保留**、
+  相对路径与 `..` → `invalid`、整表顺序保留 + 去重、超过 200 条 → `too_large`）、
+  `TestQuickAccessApi`（新会话读回空表、保存后的规整结果、磁盘文件 `quickaccess/<sid>.json` 的
+  形态与 0600、**重启后仍在**、`sid` 为空 → `invalid`、会话不存在 → `session_gone`、非法路径 →
+  `invalid`、删会话后文件被清掉且再问就是 `session_gone`）。
+- `make test`：**123 PASS / 11 SKIP / 0 FAIL**（134 个 Test 函数；11 个 skip 里 10 个是
+  `requirePTY` 的 PTY 环境跳过、1 个是 `TestFsInfoCountError`，与上一轮相同）。
+- `make check`（`vue-tsc` + `check:i18n`）无错误：zh/en 各 **452** key 双向一致（上轮 438）。
+- 真二进制 + 无头浏览器点了一遍（`make` 出的 `./webssh` + `testsshd` + `socat` 转发 unix socket，
+  1280×720 宽屏判定，临时数据目录）：① 工具栏「视图」右侧出现书签按钮、左栏按钮条出现
+  「快捷访问」；② 弹窗打开是**空列表**（无预设）；③ 手输 `vol1/1000` → toast「路径必须是绝对
+  路径（以 / 开头），且不能包含 ..」且列表不变；④ 手输带末尾斜杠的绝对路径 → 存成规整后的路径、
+  输入框清空、磁盘出现 `quickaccess/<sid>.json`；⑤ 点该路径 → 文件管理器面包屑落到那个目录、
+  弹窗关闭；⑥ 对一个 `chmod 000` 的目录点路径 → toast「打开目录失败：权限不足」、**文件管理
+  子标签没被切过去**（面板仍是 `invisible`）、当前目录与列表原样、弹窗留着；⑦ 点删除按钮 →
+  列表少一条（磁盘同步）；⑧ 目录行菜单有「添加快捷访问」、**文件行菜单没有**；⑨ 列表与网格的
+  空白处右键菜单都有「添加快捷访问」，对已在列表里的当前目录点它 → 「这个路径已经在快捷访问
+  里了」；⑩ 左栏目录树的目录菜单有「添加快捷访问」，点 `/tmp` → toast 并落盘；⑪ 刷新整页后
+  重新打开弹窗，两条路径都从后端读回来了；⑫ 打开弹窗后切到「会话」标签，弹窗自动关闭。
+  验完已停掉进程、删掉临时目录与二进制。
+- 未做：移动端（窄视口）点一遍——本轮的入口都在工具栏/左栏/右键菜单里，前两者与桌面同源，
+  空白处右键菜单在窄屏本来就不弹（`mobile` prop，见 14.x），没有新增的移动端专属分支。

@@ -51,7 +51,7 @@ export const zh: Record<string, string> = {
   home_close_confirm_title: '关闭会话',
   home_close_confirm_msg: '关闭「{name}」？该会话下所有终端子标签和 SFTP 连接都会被终止。',
   home_delete_confirm_title: '删除远程会话',
-  home_delete_confirm_msg: '删除「{name}」？登录数据、专属快捷指令与该会话的历史都会一并删除。',
+  home_delete_confirm_msg: '删除「{name}」？登录数据、专属快捷指令、快捷访问与该会话的历史都会一并删除。',
   home_delete_success: '已删除「{name}」',
   home_delete_failed: '删除失败：{error}',
   home_delete_trust_failed: '会话已删除，但移除该主机的信任记录失败：{error}',
@@ -347,6 +347,22 @@ export const zh: Record<string, string> = {
   files_selected: '已选 {n} 项',
   files_delete_selected: '删除所选（{n}）',
   files_delete_selected_confirm: '删除选中的 {n} 项？目录会连同其中内容一起删除，不可恢复。',
+
+  // ===== 快捷访问（第二十轮）=====
+  files_quick_access: '快捷访问',
+  files_quick_add: '添加快捷访问',
+  files_quick_added: '已把「{path}」加入快捷访问',
+  files_quick_exists: '这个路径已经在快捷访问里了',
+  files_quick_add_failed: '添加快捷访问失败：{error}',
+  files_quick_remove: '移除快捷访问',
+  files_quick_remove_failed: '移除快捷访问失败：{error}',
+  files_quick_load_failed: '读取快捷访问失败：{error}',
+  files_quick_empty: '还没有快捷访问路径',
+  files_quick_empty_hint: '在目录的「更多」菜单里选「添加快捷访问」，或在下面直接输入一个绝对路径。',
+  files_quick_input: '输入目录路径',
+  files_quick_input_ph: '/vol1/1000/docker',
+  files_quick_invalid: '路径必须是绝对路径（以 / 开头），且不能包含 ..',
+  files_quick_open_failed: '打开目录失败：{error}',
 
   // ===== 上传弹窗 =====
   upload_title: '上传到 {path}',

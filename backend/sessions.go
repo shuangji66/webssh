@@ -426,7 +426,7 @@ func (m *sessionManager) save(in store.SessionInput) (*store.SessionView, *apier
 // boolPtr 取一个 bool 的地址（CredentialSaved 用指针表达「缺省 = true」）。
 func boolPtr(v bool) *bool { return &v }
 
-// delete 删除会话：先关掉运行时（终端 + SFTP），再删配置、专属快捷指令与历史目录
+// delete 删除会话：先关掉运行时（终端 + SFTP），再删配置、专属快捷指令、快捷访问与历史目录
 // （前端的确认文案就是这么承诺的：「登录数据、专属快捷指令与该会话的历史都会一并删除」）。
 func (m *sessionManager) delete(id string) *apierr.Error {
 	if !store.ValidID(id) {
@@ -449,6 +449,9 @@ func (m *sessionManager) delete(id string) *apierr.Error {
 	// 历史可能还在（会话没打开过、或上次没清理干净）
 	m.st.RemoveHistoryDir(id)
 	m.st.DeleteQuickCmds(id)
+	// 快捷访问的路径属于这台远程主机：会话没了，它们也就没有意义了（列表里的路径会在
+	// 别的会话上指向完全不同的目录，留着只会是一条条点了报错的项）。
+	m.st.DeleteQuickAccess(id)
 	if err := m.st.DeleteSession(id); err != nil {
 		return apierr.Internal("删除会话失败：%v", err)
 	}
