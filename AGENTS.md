@@ -105,9 +105,12 @@
   客户端打爆进程（进程承载全部会话）的入口。
 - 控制帧不走 PTY：`\x1b]resize;<cols>;<rows>\x07`、`\x1b]ping\x07`。
 - 握手要校验 `Origin`（`originAllowed`）：跨站页面借受害者浏览器直连本服务开终端（CSWSH）是
-  真实存在的攻击面，而浏览器**改不了** `Origin`、也加不了自定义头。判据是 Origin 的
-  `host:port` 等于本次请求的 `Host`；反代改写 Host 时接受 `X-Forwarded-Host`（只有代理能加）。
-  没有 Origin 的请求放行（curl / websocat；入口只有 unix socket + 网关）。
+  真实存在的攻击面，而浏览器**改不了** `Origin`、也加不了自定义头。判据是 Origin 的**主机名**
+  等于本次请求的 `Host`，而**端口只在 Host 这一侧带了端口时才比**——飞牛统一网关配的是
+  `proxy_set_header Host $host;`（`/usr/trim/nginx/conf/conf.d/trim_http_cgi.conf`），
+  `$host` **不带端口**，硬比 host:port 会让反代后的终端 WS 全部 403（文件管理照常好用；
+  症状与真机现场见 CONTRACT 第 31 节）。反代把 Host 改写成别的名字时接受 `X-Forwarded-Host`
+  （只有代理能加）。没有 Origin 的请求放行（curl / websocat；入口只有 unix socket + 网关）。
 - 「会话/终端不存在」要附 `\x1b]gone\x07` 控制帧，前端**只认这个**——
   用人类可读文本（如 `session not found`）判定会被终端里 `echo` 出来的同样文本误判。
 

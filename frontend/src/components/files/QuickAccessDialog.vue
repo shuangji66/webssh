@@ -14,7 +14,7 @@
 //
 // 删除不弹确认框：删掉一条书签没有任何破坏性（重新加一条的成本是点两下），而多一次确认
 // 反而与「点一下移除」的预期不符。
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { describeError } from '@/serverapi'
 import { normalizeQuickPath, useQuickAccessStore } from '@/stores/quickAccess'
@@ -60,8 +60,10 @@ watch(
   (v) => {
     if (!v) return
     void load()
-    // 打开就聚焦输入框：这个弹窗最常见的用法是「手输一条新路径」
-    void nextTick(() => inputEl.value?.focus())
+    // 打开时**刻意不聚焦**输入框（用户要求）：打开这个弹窗有两个用途——挑一条已有的路径跳过去、
+    // 或者加一条新的，而前者更常见；自动聚焦会让移动端键盘立刻弹起来盖住半屏列表，桌面端则会
+    // 把光标停在输入框里等着，用户点列表还要先挪一次焦点。输入框就在页脚，想加的时候直接点它
+    // 或者按 Tab 进去（加完之后焦点**留**在输入框里，连着加几条不用反复点，见 submit）。
   },
   { immediate: true }
 )

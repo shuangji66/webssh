@@ -2568,7 +2568,7 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 | 24 | 关会话的确认文案在**编辑页有未保存内容**时追加一句（`files_editor_close_warning`，`fileEditor.isDirty` 由此从死代码变成在用） |
 | 25 | 编辑区行号幽灵块加 `v-memo="[i, line]"`：打字时只重新打补丁改动过的那一行。**实测**（无头 Chromium，20000 行）：每键 87.1ms → **9.2ms** |
 | 26 | `/api/trim/status` 补 `requireMethod(GET)`（文档早就写的是 GET，实现没校验） |
-| 27 | WebSocket 握手补 **`Origin` 校验**（防 CSWSH）：Origin 的 `host:port` 必须等于本次请求的 `Host`（缺端口按 scheme 补默认端口），反代改写 Host 时接受 `X-Forwarded-Host`；**没有 Origin 的请求放行**（curl / websocat，入口只有 unix socket + 网关）。`TestOriginAllowed` + `TestTerminalWSRejectsForeignOrigin` |
+| 27 | WebSocket 握手补 **`Origin` 校验**（防 CSWSH）：Origin 的 `host:port` 必须等于本次请求的 `Host`（缺端口按 scheme 补默认端口），反代改写 Host 时接受 `X-Forwarded-Host`；**没有 Origin 的请求放行**（curl / websocat，入口只有 unix socket + 网关）。`TestOriginAllowed` + `TestTerminalWSRejectsForeignOrigin`。⚠️ **端口判据在第二十一轮改过**（反代丢端口时硬比端口会把终端 WS 全拒，见第 31 节） |
 
 **同时**：`X-Trim-Userid` / `X-Trim-Username` / `X-Trim-Isadmin` 是**信任头**这件事写进了
 README 的安全边界（必须由反代覆写、客户端可伪造；`upload-from-nas` 的 `source` 是以登录用户
@@ -2755,6 +2755,8 @@ README 的安全边界（必须由反代覆写、客户端可伪造；`upload-fr
   正文（列表，`min-h-0 flex-1 overflow-y-auto`）/ 页脚（输入框 + 「添加快捷访问」按钮）三段，
   输入框用 `id`/`for` 与可见 label 关联。加载失败显示原因 + 「重试」，**不显示成「还没有快捷
   访问」**（那会让用户以为自己加的条目被删了）。删除不弹确认框（删一条书签没有破坏性）。
+  **打开时不自动聚焦输入框**（用户要求）：打开弹窗更常见的用途是「挑一条已有路径跳过去」，
+  抢焦点会在移动端立刻弹起键盘盖住列表；添加成功之后焦点**留在**输入框（连着加几条不用反复点）。
   点一条路径：`jumpTo` 成功 → `sessionUi.setActiveSub(sid, FILES_TAB)` → 关弹窗；失败 →
   toast `files_quick_open_failed`（`describeError` 会把 `permission` 翻成「权限不足」）并**留着
   弹窗**（用户多半想顺手删掉这条失效路径）。
@@ -2799,3 +2801,82 @@ README 的安全边界（必须由反代覆写、客户端可伪造；`upload-fr
   验完已停掉进程、删掉临时目录与二进制。
 - 未做：移动端（窄视口）点一遍——本轮的入口都在工具栏/左栏/右键菜单里，前两者与桌面同源，
   空白处右键菜单在窄屏本来就不弹（`mobile` prop，见 14.x），没有新增的移动端专属分支。
+
+### 30.6 同轮追加：打开弹窗不自动聚焦输入框
+
+用户追加要求：**弹窗打开时焦点不落在添加输入框上**。改动只有一处——`QuickAccessDialog` 的
+`watch(visible)` 里删掉 `nextTick(() => inputEl.focus())`（`nextTick` 导入一并去掉）；
+添加成功之后仍然把焦点留在输入框（连着加几条不用反复点，见 `submit`）。`make check` 复跑无错误；
+**未再跑无头浏览器复验这一条**（首次验证里打开弹窗那一步已经证明弹窗能正常打开与加载列表，
+这次只删掉了聚焦那一句）。
+
+---
+
+## 31. 第二十一轮：反代丢掉 Host 端口时终端 WS 全部 403（Origin 判据修正）
+
+### 31.1 用户报告
+
+原话：「http 环境打开前端时 进入会话文件管理正常 终端提示 ws 连接错误」。真机（飞牛网关，
+`http://192.168.5.222:5666/app/WebSSH` 与 `https://…:5667/app/WebSSH` 两条都试过）的后端日志：
+
+```
+[WebSSH] 2026/10/16 00:11:00 拒绝来源不明的 WebSocket 握手：Origin="https://192.168.5.222:5667" Host="192.168.5.222" X-Forwarded-Host=""
+```
+
+前端表现：**文件管理（POST /api/fs/*）一切正常**，一打开会话终端里就打印 `term_ws_error`
+（「WebSocket 错误或被飞牛关闭」），浏览器侧是 `Unexpected response code: 403`。
+
+### 31.2 根因
+
+飞牛统一网关把 `/app/` 交给 `trim_http_cgi` 时用的是（`/usr/trim/nginx/conf/conf.d/trim_http_cgi.conf`）：
+
+```nginx
+location /app/ {
+    proxy_pass http://unix:/var/run/trim_http_cgi.socket:;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;        # $host = **不带端口**的主机名，且不补 X-Forwarded-Host
+    proxy_read_timeout 300s;
+}
+```
+
+第十八轮（第 28 节第 27 条）加的 CSWSH 校验把判据定成「Origin 的 `host:port` == 请求的 `Host`，
+缺端口按 scheme 补 80/443」，于是 `Origin: …:5666/5667` 与 `Host: 192.168.5.222`（补成 80/443）
+**永远不相等** → 每条终端 WS 都被 403 拒掉。文件管理因为不校验 Origin，所以看起来一切正常。
+
+### 31.3 修复（`backend/terminal.go`）
+
+- 判据拆成两层：**主机名必须一致**（大小写不敏感、IPv6 去方括号，仍是 CSWSH 的主要防线）；
+  **端口只在「请求这一侧的权威值带了端口」时才比**——带了就必须相等，没带就只比主机名。
+  Origin 那一侧不带端口仍按浏览器语义补默认端口（浏览器只在非默认端口时才写出来）。
+  `Host` / `X-Forwarded-Host` 两项都走同一个 `originHostMatches`。
+- 函数重命名：`hostPortOf(authority, scheme)` → `splitAuthority(authority)`（**不补默认端口**，
+  `port == ""` 就是「这一侧没给端口」这个第三态）+ `defaultPortOf(scheme)`（只用来解释 Origin）。
+- 已知取舍：`Host` 不带端口时，「同一主机名、别的端口上的页面」也会被算作同源。代价可接受——
+  跨主机的页面（远程站点、别的域名）仍然被主机名比较挡住；而且这类网关后面本来就没有别的端口
+  信息可用（浏览器改不了 Origin，服务端也拿不回外部端口）。
+- 前端与协议都没动：`wsUrl()` 拼出来的地址本来就是对的，坏在服务端这一道校验。
+
+### 31.4 验证
+
+- 单元测试：`TestOriginAllowed` 新增 6 条（飞牛网关 http/https 两条现场、丢端口但主机不同、
+  `X-Forwarded-Host` 丢端口 / 带端口、IPv6 丢端口）；
+  `TestTerminalWSRejectsForeignOrigin` 补两条端到端断言——`Host: webssh` + `Origin: http://webssh:5666`
+  必须**不再** 403，而 `Origin: http://evil.example:5666` 仍然 403。
+- `make test` 全绿（本机有 PTY：主包 **128 PASS / 0 SKIP / 0 FAIL**，内置 SSH/SFTP 服务器与
+  secret 包同样全过）；`make check`（`vue-tsc` + `check:i18n`，zh/en 各 452 key）无错误。
+- **真二进制 + 无头 Chromium 前后对照**（`.tmp/origin/`：`testsshd` + `proxy.py` 复刻网关行为——
+  「把 Host 的端口丢掉、不补 X-Forwarded-Host」+ `playwright` 驱动）：
+  - 修复前的二进制（`git show HEAD:backend/terminal.go` 编出来的 `./webssh`）：浏览器报
+    `WebSocket connection to 'ws://127.0.0.1:18080/app/WebSSH/api/terminal/ws?sid=…' failed:
+    Error during WebSocket handshake: Unexpected response code: 403`，收到 0 字节，后端日志与
+    用户现场逐字一致。
+  - 修复后：握手 101、终端拿到 `\x1b]tid;…\x07` + `\x1b]ready\x07` + shell 提示符，`echo E2E-OK-…`
+    的回显出现在帧里（见截图 `.tmp/origin/shot.png`）。
+  - 同一支脚本改 Origin 为 `http://evil.example:5666` 仍在后端被拒（403）。
+- 未做：**真机网关没能端到端复验**——线上那份 `0.4.1` 二进制没有这个修复，我也无法覆盖
+  `/vol1/@appcenter/WebSSH/bin/webssh`（属主是应用用户，当前登录用户不可写）。需要重新
+  `make` + 重新打包/升级 fpk 才能在真机上看到效果。间接证据：该网关的
+  `trim_http_cgi` 是 Go 的 `httputil.ReverseProxy`（二进制里有 `handleUpgradeResponse` /
+  `upgradeType` 符号），nginx 侧也显式转发了 `Upgrade` / `Connection: upgrade`，即 101 由网关
+  中继这一环是有支持的；本轮没在真机上验证的只有这一环。

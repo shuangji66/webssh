@@ -490,11 +490,23 @@ type terminalHandler struct {
 
 // originAllowed 判断一次 WebSocket 握手的 Origin 能不能放行（挡 CSWSH）。
 //
-// 判据是「Origin 的 host:port 与本次请求的 Host 一致」：
+// 判据是「Origin 里的宿主与本次请求的 Host 一致」：
 //   - 浏览器发起的 WebSocket 一定会带 Origin，而**跨站页面改不了它**（也不给 WebSocket 加
 //     自定义请求头），所以恶意页面拿不到一条「Origin 看起来像本站」的连接；
 //   - 反代改写 Host（nginx 的 `proxy_set_header Host` 不保证原样转发）时，再看它带过来的
 //     `X-Forwarded-Host`——那个头只有代理能加，浏览器里的脚本加不了。
+//
+// **端口只在「这一侧的权威值给了端口」时才比**（见 originHostMatches）。飞牛统一网关的配置是：
+//
+//	location /app/ { proxy_set_header Host $host; ... }   # $host = **不带端口**的主机名
+//
+// （`/usr/trim/nginx/conf/conf.d/trim_http_cgi.conf`，同一个 location 也不补
+// `X-Forwarded-Host`）。于是浏览器给的 `Origin: http://192.168.5.222:5666` 与后端看到的
+// `Host: 192.168.5.222` 永远差一个端口。早先的实现硬比较「host:port」（缺端口按 scheme 补
+// 80/443），结果这条链路上**终端 WS 全部 403**：文件管理（POST 接口，不校验 Origin）一切正常、
+// 一进会话终端就打印 `term_ws_error`（「WebSocket 错误或被飞牛关闭」），后端只留一行
+// 「拒绝来源不明的 WebSocket 握手」的日志（真机现场：Origin="https://192.168.5.222:5667"
+// Host="192.168.5.222" X-Forwarded-Host=""）。
 //
 // **没有 Origin 时直接放行**（调用方只在 Origin 非空时问这里）：curl / websocat 这类客户端
 // 不带它，而本服务的入口只有 unix socket + 网关，能连上它的进程本来就在同一台机器上
@@ -504,17 +516,21 @@ func originAllowed(origin string, r *http.Request) bool {
 	if err != nil || u.Host == "" {
 		return false
 	}
-	oHost, oPort := hostPortOf(u.Host, u.Scheme)
+	oHost, oPort := splitAuthority(u.Host)
 	if oHost == "" {
 		return false
 	}
-	if h, p := hostPortOf(r.Host, u.Scheme); h == oHost && p == oPort {
+	// Origin 不带端口 = 浏览器的默认端口（浏览器只在非默认端口时写出来）。
+	if oPort == "" {
+		oPort = defaultPortOf(u.Scheme)
+	}
+	if originHostMatches(oHost, oPort, r.Host) {
 		return true
 	}
 	// X-Forwarded-Host 可能是 "a, b" 这种列表形式（多级代理）。
 	for _, raw := range r.Header.Values("X-Forwarded-Host") {
 		for _, part := range strings.Split(raw, ",") {
-			if h, p := hostPortOf(part, u.Scheme); h == oHost && p == oPort && h != "" {
+			if originHostMatches(oHost, oPort, part) {
 				return true
 			}
 		}
@@ -522,23 +538,43 @@ func originAllowed(origin string, r *http.Request) bool {
 	return false
 }
 
-// hostPortOf 把 "host[:port]" 归一成 (host, port)：大小写不敏感、IPv6 方括号去掉，
-// 缺端口时按 scheme 补默认端口（否则 `https://nas` 与 `Host: nas` 会被判成不一致）。
-func hostPortOf(authority, scheme string) (string, string) {
+// originHostMatches 判断「本次请求被谁访问」（Host 或 X-Forwarded-Host 的一项）是不是 Origin
+// 里的那个宿主：主机名（大小写不敏感、IPv6 去方括号）必须相同；**端口这一侧带了就要求相等，
+// 没带就只比主机名**。
+//
+// 为什么允许「没带端口」：代理把 Host 改写成不带端口时（飞牛网关就是），那个外部端口在服务端
+// 已经不存在了，硬比等于把所有这类正常部署拒掉（现场见 originAllowed 的注释）。代价是这一档
+// 把「同一主机名、别的端口上的页面」也算作同源——换句话说，跨主机的页面（远程站点、别的域名）
+// 仍然挡得住，而主机名比较正是 CSWSH 的主要防线。
+func originHostMatches(oHost, oPort, authority string) bool {
+	h, p := splitAuthority(authority)
+	if h == "" || h != oHost {
+		return false
+	}
+	return p == "" || p == oPort
+}
+
+// splitAuthority 把 "host[:port]" 归一成 (host, port)：大小写不敏感、IPv6 方括号去掉。
+// **port 为空就表示这一侧没给端口**——刻意不在这里按 scheme 补默认端口：补了就无法区分
+// 「代理把端口丢了」与「端口就是 80/443」（见 originHostMatches）。
+func splitAuthority(authority string) (string, string) {
 	h := strings.ToLower(strings.TrimSpace(authority))
 	host, port, err := net.SplitHostPort(h)
 	if err != nil {
 		host, port = h, ""
 	}
-	if port == "" {
-		switch strings.ToLower(scheme) {
-		case "https", "wss":
-			port = "443"
-		case "http", "ws":
-			port = "80"
-		}
-	}
 	return strings.Trim(host, "[]"), port
+}
+
+// defaultPortOf 是 scheme 对应的默认端口，用来解释一个不带端口的 Origin。认不出 scheme 时返回空。
+func defaultPortOf(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "https", "wss":
+		return "443"
+	case "http", "ws":
+		return "80"
+	}
+	return ""
 }
 
 func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {

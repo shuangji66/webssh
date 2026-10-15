@@ -262,8 +262,10 @@ $WEBSSH_DATA_DIR/
 - ⚠️ **`X-Trim-Userid` / `X-Trim-Username` / `X-Trim-Isadmin` 是「信任头」，必须由反代覆写**：
   本服务直接采信它们（那是飞牛网关的身份透传约定），任何能直接连到 socket 的客户端都能伪造。
   不要让这些头从外部原样透传进来（反代上应显式 `proxy_set_header` 覆写）。
-- 终端 WebSocket 会校验 `Origin` 与本次请求的 Host 一致（挡跨站 WebSocket 劫持）；反代改写了
-  `Host` 时请让它带上 `X-Forwarded-Host`，否则浏览器侧的连接会被拒。
+- 终端 WebSocket 会校验 `Origin` 里的主机名与本次请求的 `Host` 一致（挡跨站 WebSocket 劫持）；
+  端口只在 `Host` 这一侧带了端口时才参与比较（飞牛统一网关的 `proxy_set_header Host $host;`
+  会把端口丢掉，属于支持的部署）。反代把 `Host` 改写成**别的名字**时请让它带上
+  `X-Forwarded-Host`，否则浏览器侧的连接会被拒。
 - 「上传飞牛文件」是以**本会话的登录用户**身份读本机路径（飞牛文件选择器里已授权的文件）：
   读之前会尽量用飞牛的 ACL 接口判一次权限，**飞牛不可用时跳过并记日志**——所以进程自身的
   OS 权限是唯一硬边界，**建议以非 root 运行本服务**。

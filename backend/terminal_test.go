@@ -507,9 +507,11 @@ func TestTerminalReplayTimeoutFreesHistMu(t *testing.T) {
 
 // TestOriginAllowed 钉住 WebSocket 握手的 Origin 判据（防 CSWSH）。
 //
-// 规则只有一条：**Origin 的 host:port 必须等于本次请求的 Host**（或缺端口时按 scheme 补默认
-// 端口）；反代改写 Host 时接受它带过来的 X-Forwarded-Host。没有 Origin 的请求走的是另一条
-// 分支（调用方只在 Origin 非空时问这里，curl/websocat 不带它）。
+// 规则两条：**Origin 里的主机名必须等于本次请求的 Host**；**端口只在 Host 这一侧带了端口时
+// 才要求相等**——`Host: 192.168.5.222` + `Origin: http://192.168.5.222:5666` 放行，因为飞牛
+// 统一网关的 `proxy_set_header Host $host;` 给的就是不带端口的主机名（这条链路上曾经整片 403，
+// 现场见 CONTRACT 第 31 节）。反代改写 Host 时接受它带过来的 X-Forwarded-Host。
+// 没有 Origin 的请求走的是另一条分支（调用方只在 Origin 非空时问这里，curl/websocat 不带它）。
 func TestOriginAllowed(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -524,9 +526,17 @@ func TestOriginAllowed(t *testing.T) {
 		{"大小写不敏感", "http://NAS:8080", "nas:8080", "", true},
 		{"端口不同", "http://nas:8080", "nas:9090", "", false},
 		{"主机不同", "http://evil.example", "nas:8080", "", false},
+		// 飞牛网关丢端口后的现场：192.168.5.222:5666 是 http、:5667 是 https。
+		{"反代丢掉了端口（飞牛网关 http）", "http://192.168.5.222:5666", "192.168.5.222", "", true},
+		{"反代丢掉了端口（飞牛网关 https）", "https://192.168.5.222:5667", "192.168.5.222", "", true},
+		{"反代丢掉了端口但主机不同", "http://evil.example:5666", "192.168.5.222", "", false},
 		{"反代改写了 Host，但转发了原 Host", "https://nas", "webssh-internal:80", "nas", true},
+		{"X-Forwarded-Host 带了端口并匹配", "https://nas:8443", "internal", "nas:8443", true},
+		{"X-Forwarded-Host 丢了端口", "https://nas:8443", "internal", "nas", true},
 		{"X-Forwarded-Host 是列表", "https://nas", "internal", "a.example, nas", true},
 		{"X-Forwarded-Host 也不匹配", "https://evil.example", "internal", "nas", false},
+		{"IPv6 同端口", "http://[::1]:8080", "[::1]:8080", "", true},
+		{"IPv6 的 Host 丢了端口", "http://[::1]:8080", "[::1]", "", true},
 		{"Origin 不是合法 URL", "null", "nas", "", false},
 		{"Origin 没有主机", "file:///etc/passwd", "nas", "", false},
 	}
@@ -545,6 +555,8 @@ func TestOriginAllowed(t *testing.T) {
 // TestTerminalWSRejectsForeignOrigin 覆盖端到端那一条：跨站 Origin 的握手必须被拒（403），
 // 而且是在 hijack **之前**就拒掉（不建立 WebSocket 连接、不碰任何会话状态）；
 // 同一份请求把 Origin 换成自己的 Host 时不该被这一道挡住（走的是后面「会话不存在」那条路）。
+// 另外钉住飞牛网关那一条：反代把 Host 的端口丢掉时（`Host: webssh` + `Origin:
+// http://webssh:5666`）必须放行——这条曾经让整条链路上的终端 WS 全部 403。
 func TestTerminalWSRejectsForeignOrigin(t *testing.T) {
 	a := newTestApp(t, appOptions{noSSH: true})
 	headers := func(origin string) map[string]string {
@@ -556,7 +568,7 @@ func TestTerminalWSRejectsForeignOrigin(t *testing.T) {
 			"Origin":                origin,
 		}
 	}
-	// 客户端连的是 http://webssh/...（见 harness 的 a.do），所以 Host = webssh
+	// 客户端连的是 http://webssh/...（见 harness 的 a.do），所以 Host = webssh（不带端口）
 	res, raw := a.do(t, http.MethodGet, "/api/terminal/ws?sid=whatever&tid=whatever", nil, headers("http://evil.example"))
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("跨站 Origin 的握手状态码 = %d，期望 403（%s）", res.StatusCode, snippetOf(raw))
@@ -564,5 +576,16 @@ func TestTerminalWSRejectsForeignOrigin(t *testing.T) {
 	res2, raw2 := a.do(t, http.MethodGet, "/api/terminal/ws?sid=whatever&tid=whatever", nil, headers("http://webssh"))
 	if res2.StatusCode == http.StatusForbidden {
 		t.Fatalf("同源 Origin 的握手被误拒：%d（%s）", res2.StatusCode, snippetOf(raw2))
+	}
+	// 反代（飞牛网关 `proxy_set_header Host $host;`）丢掉了端口：Origin 里带着外部端口，
+	// Host 里没有。这一条曾经 403。
+	res3, raw3 := a.do(t, http.MethodGet, "/api/terminal/ws?sid=whatever&tid=whatever", nil, headers("http://webssh:5666"))
+	if res3.StatusCode == http.StatusForbidden {
+		t.Fatalf("Host 被反代去掉端口后握手被误拒：%d（%s）", res3.StatusCode, snippetOf(raw3))
+	}
+	// 丢端口的口子只对「同一主机名」开：别的域名仍然拒。
+	res4, raw4 := a.do(t, http.MethodGet, "/api/terminal/ws?sid=whatever&tid=whatever", nil, headers("http://evil.example:5666"))
+	if res4.StatusCode != http.StatusForbidden {
+		t.Fatalf("跨站 Origin（别的域名 + 端口）状态码 = %d，期望 403（%s）", res4.StatusCode, snippetOf(raw4))
 	}
 }
