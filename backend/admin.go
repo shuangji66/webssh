@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/logx"
 	"webssh/backend/internal/secret"
 	"webssh/backend/internal/store"
 	"webssh/backend/internal/trimapi"
@@ -90,6 +91,13 @@ func newAdminMux(renv *RuntimeEnv) (*AdminMux, error) {
 	crypt, err := secret.Load(renv.DataDir, renv.MasterKeyEnv)
 	if err != nil {
 		return nil, err
+	}
+	// 一次性迁移：把第一轮留在磁盘上的**明文**命令内容加密（见 quickcmds.go）。
+	// 放在这里而不是等用户打开弹窗：前端只加载全局表与当前会话的表，别的会话的表可能几个月都
+	// 不被读一次，明文就会一直躺在磁盘上。失败只记日志、不拦住启动——应用起不来比一条指令
+	// 还是明文更糟，而用户真的打开那张表时 loadQuickCmds 会再迁移一次并报出明确原因。
+	if err := migrateAllQuickCmds(st, crypt); err != nil {
+		logx.Warnf("迁移明文快捷指令失败（打开对应的表时会重试）：%v", err)
 	}
 	hks, err := newHostKeyStore(st)
 	if err != nil {

@@ -91,7 +91,7 @@
 | --- | --- |
 | `internal/apierr/` | API 错误码与 JSON 响应：裸码契约、状态码映射、`ok/code/error` 信封 |
 | `internal/logx/` | 极简日志：只记异常/失败（不记例行启动停止） |
-| `internal/secret/` | `master.key` 管理与 AES-256-GCM 字段加解密（密码 / 私钥 / 口令） |
+| `internal/secret/` | `master.key` 管理与 AES-256-GCM 字段加解密（密码 / 私钥 / 口令 / 快捷指令内容） |
 | `internal/store/` | 数据目录布局、原子 JSON 读写（tmp + rename）、`Session`/`SessionView`/`SessionInput` |
 | `internal/trimapi/` | 飞牛开放 API 客户端（`trim.file.checkUserACL`） |
 | `internal/ws/` | WebSocket 帧编解码（含单帧/单消息上限） |
@@ -119,14 +119,19 @@ data/
 ├── history/<sid>/<tid>.log      终端会话历史（会话存活期间；会话关闭时删除整目录）
 ├── history/<sid>/meta.json      会话级元数据（终端标题等，可选）
 └── quickcmds/
-    ├── global.json              全局快捷指令
-    └── <sid>.json               会话专属快捷指令
+    ├── global.json              全局快捷指令（`content` 是密文，其余字段明文）
+    └── <sid>.json               会话专属快捷指令（同上）
 ```
 
 - **凭据加密**：`password` / `privateKey` / `passphrase` 三个字段以
   `{"v":1,"ct":"<base64(nonce||ciphertext)>"}` 落盘；AAD 绑定 `webssh:v1:<field>:<sid>`，
   避免密文被搬到别的会话/字段后仍能解出。读取时解密失败**必须报错**（不能静默当成空密码，
   否则表现为「密码莫名其妙失效」）。
+- **快捷指令的命令内容加密**（第十九轮，见第 29 节）：`content` 用同一套信封落盘，AAD 是
+  `webssh:v1:quickcmd:<指令 id>:<表作用域>`（全局表的作用域是空串、专属表是会话 id）；
+  `id` / `name` / `auto` 仍是明文。第一轮留下的**明文** `content` 会被主动迁移掉（读取时
+  就地加密重写 + 启动时扫一遍 `quickcmds/`），磁盘上不再有明文命令内容；内容为空或加密失败
+  的条目换成加密的占位文案（29.3）。解密失败同样必须报错（不能静默给一个空内容）。
 - **威胁模型要诚实写进 README/注释**：这层加密防的是「拿到磁盘快照/备份的人直接读到明文
   密码」，不防「已经能以同权限读取数据目录的攻击者」（master.key 就在旁边）。设置里可选
   用环境变量 `WEBSSH_MASTER_KEY`（32 字节 base64/hex）外部提供主密钥，避免密钥与密文同放。
@@ -250,6 +255,7 @@ FsInfo       FsEntry + { uid, gid, owner?, group?, dirCount, fileCount, countErr
 FsEditContent { path, size, content, encoding: "utf-8"|"utf-16le"|"utf-16be", bom, eol: "lf"|"crlf" }
              // 编辑页打开时的内容与元信息（见 26.2）：encoding/bom/eol 保存时原样带回去
 QuickCmd     { id, name, content, auto }
+             // content **明文收发、密文落盘**（见第 3 节 / 29）；内容原样保留，不 trim
 HostKeyRecord{ host, port, keyType, fingerprint, addedAt }
 AclEntry     { path, readable, writable, deletable }
 RuntimeInfo  { version, bootId, dataDir, adminSock, adminBaseURL, hostname,
@@ -688,7 +694,8 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 3. 弹窗里的 `<label>` 必须与输入框用 `id`/`for` 关联（否则输入框没有可访问名，屏幕阅读器与
    自动化只能靠猜 placeholder）。
 4. `SessionState.terminals[].title` 默认空串，由前端组合「终端 N / 终端 N：标题」。
-5. 快捷指令保存以**后端返回的那一份**为准（后端会补齐 id、去重、trim）。
+5. 快捷指令保存以**后端返回的那一份**为准（后端会补齐 id、去重、trim **名称**；
+   命令内容一律原样保留，只把「全是空白」判成空——第 29 节）。
 
 ### 10.3 端到端验证覆盖（已实测通过）
 
@@ -2552,3 +2559,123 @@ README 的安全边界（必须由反代覆写、客户端可伪造；`upload-fr
   `TestTerminalWSRejectsForeignOrigin`。
 - 未做：第 1 条的 Firefox / WebKit 复跑（只在 Chromium 上验过）、FIFO 卡死在真 OpenSSH 上的复跑
   （测试环境用的是进程内 SFTP 服务器）。
+
+---
+
+## 29. 第十九轮：快捷指令的命令内容加密落盘
+
+### 29.1 需求
+
+用户原话：「加密落盘用户添加的全局快捷指令和专属快捷指令的命令内容，命令名称不需要，
+加解密时不要破坏命令的内容和格式」。
+
+拆成三条：
+1. 用户自己添加的**全局**与**专属**快捷指令，`content` 加密落盘；`name`（以及 `id`/`auto`）
+   保持明文——名称是给人看的标签，加密它只会让文件没法排查；
+2. **加解密不得改动内容**：往返后逐字节相同（前导/行尾空格、tab、`\r\n`、多行、非 UTF-8
+   字节都要活下来）；
+3. 顺带修掉一个真的会改内容的 bug：后端 `sanitizeQuickCmds` 原本对 `content` 做
+   `strings.TrimSpace`（前端 `QuickCmdEditDialog` 早就只 trim 名称、并注释了「命令内容里的
+   空格/换行是有意义的」），两套口径不一致的症状是「保存时看到的和重新打开后看到的不一样」。
+   现在**只 trim 名称**，内容仅在「全是空白」时判为空（拒绝）。
+
+不做的事：不加密名称、不改 API（收发的 `content` 始终是明文）、不给密文加额外的用途。
+
+**同轮追加**（第 29.3 节）：老文件要**主动迁移**成密文，不允许再存在明文的命令内容——
+迁移不掉的那条内容清空成加密的占位文案。
+
+### 29.2 后端（`quickcmds.go`）
+
+- **磁盘形态**（文件版本 2）：
+  ```json
+  { "version": 2,
+    "commands": [ { "id": "…", "name": "数据库", "auto": true,
+                    "content": { "v": 1, "ct": "<base64(nonce||ciphertext)>" } } ] }
+  ```
+  加密走 `internal/secret`（与凭据同一把 `master.key`、同一套 AES-256-GCM 信封与威胁模型），
+  但**只在这一个落盘边界**：`loadQuickCmds` 解出明文、`saveQuickCmds` 加密后写。
+- **AAD** = `webssh:v1:quickcmd:<指令 id>:<表作用域>`（`secret` 的 `field` 那一格是
+  `quickcmd:<id>`，`sid` 那一格放作用域：全局 = 空串、专属 = 会话 id）。于是
+  「同一张表里两条指令的密文互换」与「把专属表改名成 `global.json`」都会在解密时失败——
+  否则按钮上写着乙的名字、点下去跑的是甲的命令。
+  指令 id 在 `sanitizeQuickCmds` 补齐之后才加密，所以 id 是稳定不变的。
+- **兼容第一轮**：老文件里 `content` 是**字符串**（明文）。`quickCmdStored.UnmarshalJSON`
+  按 JSON 类型分流（字符串 = v1 明文、对象 = 信封），两种形态不会歧义，并给明文条目打上
+  `legacy` 标记 → 由 29.3 的迁移就地加密重写。读这条路不能因为「格式旧」而失败
+  （失败的表现是用户的整个指令列表打不开）。
+- **解密失败必须报错**（`internal` + 指令名 + 原因），不能静默返回空内容：那会让用户以为
+  指令内容丢了，而他一点保存就把服务端那份覆盖成空的。
+- 每次保存都用新 nonce 重新加密（整表重写本来就会换掉整个文件，没有「复用旧密文」的意义）。
+
+### 29.3 明文内容的一次性迁移（同轮追加）
+
+用户追加要求：「向后兼容做一次老文件的迁移尝试，将明文的命令内容加密，迁移失败的命令内容就
+清除并替换为加密的『命令加密失败已清空，请重新添加』，反正不得再存在明文的命令内容。」
+
+- **两个触发点，缺一不可**（都走 `migrateQuickCmds` 这一份规则）：
+  - `loadQuickCmdsFile`（读一张表时）：读到明文内容就地加密重写（`WriteJSON` = 临时文件 +
+    rename，原子替换）。读接口因此带上了写副作用，这是「磁盘上不留明文」必须付的代价。
+  - `migrateAllQuickCmds`（`newAdminMux` 启动时）：`store.QuickCmdsScopes()` 扫
+    `quickcmds/*.json`，逐张表走同一条「读 → 迁移 → 需要时重写」。**只有这一步能覆盖
+    「没被打开过的会话」**——前端只加载全局表与当前会话的表，别的会话的表可能几个月都不被
+    读一次，明文就会一直躺着。（`QuickCmdsScopes` 按扩展名过滤，`WriteJSON` 的
+    `<名字>.json.tmp-*` 残渣天然不被当成表。）
+  - 启动那一遍失败只记日志（`logx.Warnf`）**不拦启动**：应用起不来比一条指令还是明文更糟；
+    用户真的打开那张表时读路径会再迁移一次并报出明确原因。
+- **迁移规则**（`migrateQuickCmds`）：
+  - 已经是信封的条目**原样保留**（不重新加密，少一次「解不开」的机会）；
+  - 明文内容加密成功 → 换信封：内容与格式**逐字节不变**，`id`/`name`/`auto` 不动；
+  - **明文内容为空**（`Encrypt("")` 返回 nil——空内容存不下来）**或加密失败** → 换成
+    `quickCmdMigrationPlaceholder`（「命令加密失败已清空，请重新添加」）的**密文**，并把
+    `auto` 关掉（一句中文提示不该被「点一下就自动回车」当成命令跑到远端 shell 上）；
+  - 连占位文案都加密不了（系统随机数不可用这一级）→ 返回错误、**一个字节都不写**：
+    写不出密文，也不能为了「看起来迁移成功」而留下明文。
+- **失败可见**：迁移写不进去（数据目录只读等）时读接口回 `internal`（「读取快捷指令失败：
+  加密重写 … 失败」），而不是「先把明文内容返回给用户、下次再说」——静默保留明文违背这条
+  改动的全部意义。占位替换会写进日志（用户只看到占位文案，原因必须能查）。
+- 占位文案是**落盘的数据**而不是界面文案，所以故意不进 i18n 字典：它是被存下来的一个字符串
+  值（用户以后把界面切成英文，磁盘上那句话也不该跟着变），字典又是构建期冻结的。
+
+### 29.4 冻结文件（本轮）
+
+`docs/CONTRACT.md`、`AGENTS.md`、`README.md`（只有文档改动；前端零改动——加密边界在落盘那一层，
+`src/stores/quickCmds.ts` 与 `QuickCmdsDialog` 完全不需要知道这件事）。
+
+### 29.5 本轮的验证
+
+- `go vet ./...` 干净；`go test -v -count=1 ./...`：**121 PASS / 11 SKIP / 0 FAIL**（132 个 Test
+  函数）——主包 126 个（116 PASS / 10 SKIP）、`internal/secret` 2 个、`internal/testssh` 4 个
+  （含 1 SKIP）。11 个 skip 里 **10 个是 `requirePTY`** 触发的 PTY 环境跳过（本次环境
+  `open /dev/ptmx: permission denied`，见第 7 节的提醒），另一个是 `TestFsInfoCountError`
+  （本卷的文件系统拦不住 `0000` 目录的读取，模拟不出「读不出子项」）。本轮新增的用例既不依赖
+  PTY、也不依赖那个文件系统特性。
+- `make check`（`vue-tsc` + `check:i18n`）无错误：zh/en 各 **438** key 双向一致
+  （本轮没有前端改动，也没有新文案）。
+- 新增测试 `backend/quickcmds_crypt_test.go`：
+  `TestQuickCmdsContentEncryptedAtRest`（内容原样往返 + 磁盘无明文内容 / 名称仍明文 + 信封形态
+  （`version: 2`、`content.v == 1`）+ 重启后仍能解密）、
+  `TestQuickCmdsLegacyPlaintextFile`（v1 明文文件读一次就被加密重写、内容与 `auto` 逐字节不变、
+  重启后可读）、
+  `TestQuickCmdsLegacyMigrationAtStartup`（**没有任何接口调用**的情况下重启一次，全局表 /
+  真实会话的专属表 / 目录里存在的孤儿表**三张都被迁移**，且内容与 `auto` 不变）、
+  `TestQuickCmdsLegacyEmptyContentBecomesPlaceholder`（空内容 → 占位文案的密文 + `auto` 关掉，
+  磁盘上连占位文案本身都不是明文）、
+  `TestQuickCmdsDecryptFailureIsReported`（字节被改 / 同表两条指令的密文互换 / 专属文件搬成
+  `global.json` → 都是带指令名的 `internal` 错误，而不是空内容）。
+  原有 `TestQuickCmdsGlobalAndSession` 一行未改地继续通过（含「内容全是空白 → invalid」）。
+- 真二进制手测（`make` 出的 `./webssh` + 临时数据目录 + `curl --unix-socket`）：
+  ① 存一条含密码与多行格式的指令 → `global.json` 是 `version: 2` + `id`/`name` 明文 +
+  `content` 密文信封，磁盘上搜不到 `mysql -uroot` / `pS3cret`；
+  ② 读回内容与提交的字符串**逐字节相同**；
+  ③ 手工写一份第一轮的明文文件 → 照常读出（行尾换行保留），**这次读取**就把它重写成了密文；
+  ④ 把密文改一个字符 → `500 {"code":"internal","error":"解密快捷指令「旧表」（legacy01）的命令内容失败：…"}`
+  （不是空内容）；
+  ⑤ 迁移（29.3）：手工放一份含「多行命令 + 空内容」的 v1 `global.json` 与一份孤儿表
+  `orphan01.json`，**启动后不问任何接口**，两个文件都已变成 `version: 2` 的密文：多行命令的
+  内容与 `auto: true` 原样保住，空内容那条换成占位文案的密文 + `auto: false`，
+  `grep` 明文内容一无所获；日志里只有一行
+  `快捷指令「空内容」（g2，global）的明文内容为空，已换成占位文案`。
+  验完已删临时目录与二进制。
+- 未做：无头浏览器里点一遍（本轮只动后端落盘格式，界面零改动；接口收发的仍是明文 `content`，
+  前端行为不变——`QuickCmdsDialog` 把内容发进终端时本来就把 `\r?\n` 转成 `\r`，多行内容是有意义的）。
+

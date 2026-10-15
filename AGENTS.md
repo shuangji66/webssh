@@ -167,6 +167,16 @@
 - 所有落盘写操作：互斥锁串行 + tmp 文件 + `rename` 原子替换。
 - 凭据三字段（password/privateKey/passphrase）用 AES-256-GCM 加密，AAD 绑定
   `webssh:v1:<field>:<sid>`；**解密失败必须报错**，绝不能静默当成空密码（表现为「密码莫名失效」）。
+- 快捷指令（`quickcmds.go`）的**命令内容**同样加密落盘（文件版本 2，`content` 是密文信封），
+  `id`/`name`/`auto` 保持明文；AAD 的 `field` 是 `quickcmd:<指令 id>`、`sid` 是表的作用域
+  （全局 = 空串），所以密文在同一张表里互换、或把专属文件改名成 `global.json` 都解不开。
+  第一轮的明文 `content` **不允许留在磁盘上**：读到就打标记（按 JSON 类型分流：字符串 = 明文、
+  对象 = 信封）并**就地加密重写**，启动时 `migrateAllQuickCmds` 还会扫一遍 `quickcmds/`
+  （前端只加载全局表与当前会话的表，没被打开过的会话靠读取时迁移兜不住）。迁移要保住内容与
+  `auto` 逐字节不变；内容为空（空内容存不下来）或加密失败时换成**加密的占位文案**
+  （`quickCmdMigrationPlaceholder`）并关掉 `auto`，写不进密文就报错、绝不退回留明文。
+  解密失败同样报错。命令内容**一律原样保留**（只把「全是空白」判成空，不 trim）——前导/行尾
+  空格与换行是命令的一部分，trim 掉就是改用户的命令。
 - `master.key` 必须 0600；支持 `WEBSSH_MASTER_KEY` 外部提供。在注释/文档里如实写明威胁模型：
   防的是「拿到磁盘快照的人读到明文」，不防「能读数据目录的攻击者」。
 - 主机密钥：未知 → 带上 fingerprint/keyType 报 `hostkey_unknown`（前端会引导用户确认）；

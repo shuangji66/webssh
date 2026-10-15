@@ -431,3 +431,33 @@ func (s *Store) DeleteQuickCmds(sid string) {
 		logx.Warnf("删除会话快捷指令 %s 失败：%v", sid, err)
 	}
 }
+
+// QuickCmdsScopes 列出磁盘上**已存在**的快捷指令表（"" = 全局，其余是会话 id）。
+//
+// 只给「启动时把第一轮留下的明文命令内容加密」那次一次性迁移用（见 main 包的
+// migrateAllQuickCmds）：前端只会加载全局表与**当前会话**的表，别的会话的表可能几个月都不被
+// 读一次，只靠读取时迁移的话，明文就会一直躺在磁盘上。目录不存在（还没有任何指令）返回空。
+func (s *Store) QuickCmdsScopes() ([]string, error) {
+	entries, err := os.ReadDir(s.quickcmdsDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		// WriteJSON 的临时文件是 `<名字>.json.tmp-<随机>`（扩展名不是 .json），这里天然被
+		// 过滤掉——它是「上次写到一半被杀」的残渣，不是一张表。
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		sid := strings.TrimSuffix(e.Name(), ".json")
+		if sid == "global" {
+			sid = ""
+		}
+		out = append(out, sid)
+	}
+	sort.Strings(out)
+	return out, nil
+}
