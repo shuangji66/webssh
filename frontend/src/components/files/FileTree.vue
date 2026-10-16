@@ -20,8 +20,9 @@
 //   - 首次进入会话自动展开到登录用户的家目录、高亮并滚进视野；
 //   - **点目录不再切换主区域**（也不 emit 任何事件）：只把「当前目录」改成它（与文件管理器
 //     共用同一个当前目录）并展开/高亮。从树里点一下就跳走会打断正在终端里干活的人；
-//   - 右键 / 「…」菜单补齐目录可用的全部动作（新建 / 上传 / 新终端 / 粘贴 / 重命名 / 删除 /
-//     压缩为 tar.gz / 压缩为 zip / 导出至飞牛 / 复制路径 / 刷新）。
+//   - 右键 / 「…」菜单补齐目录可用的全部动作（新建（目录/文件二合一，第二十三轮，见契约 33）/
+//     上传 / 新终端 / 粘贴 / 重命名 / 删除 / 压缩为 tar.gz / 压缩为 zip / 导出至飞牛 /
+//     复制路径 / 刷新）。
 //
 // 菜单里对 `/` 隐藏了重命名 / 删除 / 压缩 / 导出：根目录没有父目录可压缩、也不能被改名或
 // 删除（后端会拒），藏起来比给一个点了报错的项好。
@@ -39,6 +40,7 @@ import { baseName, joinPath, parentPath } from '@/utils/format'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import PromptDialog from '@/components/PromptDialog.vue'
 import InfoDialog from './InfoDialog.vue'
+import NewEntryDialog from './NewEntryDialog.vue'
 import PreviewDialog from './PreviewDialog.vue'
 import UploadDialog from './UploadDialog.vue'
 import { canEditPath, isArchivePath } from './fileKind'
@@ -377,25 +379,40 @@ function badName(name: string): 'empty' | 'invalid' | '' {
   return ''
 }
 
-function newHere(dir: boolean) {
-  const parent = menu.path
+/**
+ * 「新建」弹窗（第二十三轮：目录 / 文件二合一，见契约 33）。
+ *
+ * 父目录在**开弹窗那一刻**从菜单里取出来存下：`hideMenu()` 之后菜单状态不再是「用户右键的那
+ * 一个」，而弹窗可能开着好一会儿（还要输入名字、可能校验失败重来）。
+ */
+const newEntryVisible = ref(false)
+const newEntryParent = ref('')
+
+/** 打开「新建」弹窗（树里两个入口共用：行的「…」菜单与空白处右键菜单都是目录菜单）。 */
+function openNewEntry() {
+  newEntryParent.value = menu.path
   hideMenu()
-  askName({
-    title: dir ? t('files_new_dir_title') : t('files_new_file_title'),
-    initial: '',
-    run: (raw) => {
-      const bad = badName(raw)
-      if (bad === 'empty') {
-        toast(t('files_name_required'))
-        return
-      }
-      if (bad) {
-        toast(t('files_name_invalid'))
-        return
-      }
-      void createHere(parent, raw.trim(), dir)
-    }
-  })
+  newEntryVisible.value = true
+}
+
+/**
+ * 弹窗提交：两个按钮只是在「建目录还是建文件」上不同，校验与后续动作完全一样。
+ *
+ * 名字校验判据沿用原来那套 `badName`（原样搬过来，一个字没改）；校验不过时**弹窗不关**，
+ * 用户改个名字再点即可。
+ */
+function onCreateEntry(kind: 'file' | 'dir', raw: string) {
+  const bad = badName(raw)
+  if (bad === 'empty') {
+    toast(t('files_name_required'))
+    return
+  }
+  if (bad) {
+    toast(t('files_name_invalid'))
+    return
+  }
+  newEntryVisible.value = false
+  void createHere(newEntryParent.value, raw.trim(), kind === 'dir')
 }
 
 async function createHere(parent: string, name: string, dir: boolean) {
@@ -712,8 +729,7 @@ function exportItem(path: string): MenuItem {
 /** 目录菜单：顺序按契约 11.3；根目录下把「不存在父目录/不能改」的几项去掉。 */
 function dirMenuItems(path: string): MenuItem[] {
   const root = path === '/'
-  const items: MenuItem[] = [{ label: t('files_new_dir'), run: () => newHere(true) }]
-  items.push({ label: t('files_new_file'), run: () => newHere(false) })
+  const items: MenuItem[] = [{ label: t('files_new'), run: openNewEntry }]
   items.push({ label: t('files_upload_here'), run: uploadHere })
   items.push({ label: t('files_open_terminal_here'), run: openTerminalHere })
   const paste = pasteItem()
@@ -967,10 +983,20 @@ onBeforeUnmount(hideMenu)
       :dir="uploadDir"
       @update:visible="uploadVisible = $event"
     />
+    <!-- 新建（第二十三轮）：目录与文件共用这一个弹窗，父目录 = 菜单当时指向的目录 -->
+    <NewEntryDialog
+      :visible="newEntryVisible"
+      :label="t('files_new_name_prompt')"
+      @update:visible="newEntryVisible = $event"
+      @submit="onCreateEntry"
+      @cancel="newEntryVisible = false"
+    />
+    <!-- 这个 PromptDialog 现在**只**服务重命名（新建搬去 NewEntryDialog 了），所以标签用
+         「新名称」——原来为兼顾两个场景写的是「名称」，与文件管理器那边的重命名弹窗不一致。 -->
     <PromptDialog
       :visible="prompt.show"
       :title="prompt.title"
-      :label="t('files_new_name_prompt')"
+      :label="t('files_rename_prompt')"
       :initial-value="prompt.initial"
       @update:visible="prompt.show = $event"
       @confirm="onPromptConfirm"

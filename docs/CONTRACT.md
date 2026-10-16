@@ -599,7 +599,8 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 | `PreviewDialog.vue` [C] | `{ visible: boolean; sid: string; path: string; size?: number }` | `update:visible(v)`, `edit(path)` | 图片 / 文本两种模式；`size` 是列表里已知的体积（图片超限时用它把话说清楚）；`edit` 由调用方决定怎么进编辑页 |
 | `QuickAccessDialog.vue` [C] | `{ sid: string; visible: boolean }` | `update:visible(v)` | 快捷访问弹窗（第二十轮，见 30）：路径列表 + 手动输入添加 + 逐条删除；点一条 = 先探测再进那个目录。挂在 `SessionView` 上（显隐在 `stores/quickAccess.ts`） |
 | `ConfirmDialog.vue` [D] | `{ visible, title, message, confirmText?, cancelText?, danger? }` | `confirm()`, `cancel()`, `update:visible(v)` | 通用确认框 |
-| `PromptDialog.vue` [D] | `{ visible, title, label?, placeholder?, initialValue?, confirmText?, cancelText? }` | `confirm(value: string)`, `cancel()`, `update:visible(v)` | 通用输入框（重命名 / 新建） |
+| `PromptDialog.vue` [D] | `{ visible, title, label?, placeholder?, initialValue?, confirmText?, cancelText? }` | `confirm(value: string)`, `cancel()`, `update:visible(v)` | 通用输入框（重命名等） |
+| `NewEntryDialog.vue` [C] | `{ visible: boolean; label?: string; placeholder?: string }` | `submit(kind: 'file' \| 'dir', value: string)`, `cancel()`, `update:visible(v)` | 新建弹窗（第二十三轮，见 33）：一个输入框 + 「新建文件夹 / 新建文件」两个动作按钮；**提交不自我关闭**（校验在调用方，失败时弹窗留着） |
 | `SessionFormDialog.vue` [D] | `{ visible: boolean; session?: SessionView \| null }` | `update:visible(v)`, `saved(s: SessionView)` | 新增/编辑 + 测试连接 + 首次信任指纹 |
 | `UploadDialog` 的飞牛分组 | — | — | 用 `trim/sdk.ts` 的 `pickUserFiles`，把路径交给 `sftp.uploadFromNas` |
 
@@ -835,8 +836,10 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 - **点目录不再跳转文件管理**：只更新「当前目录」（与文件管理器**共用同一个当前目录**）
   并展开/高亮；主区域保持不动。
 - 树的右键/「…」菜单补全（目录可用的全部动作）：
-  新建文件夹 / 新建文件 / 上传到此目录 / 在此目录新建终端 / 粘贴 / 重命名 / 删除 /
+  新建 / 上传到此目录 / 在此目录新建终端 / 粘贴 / 重命名 / 删除 /
   压缩为 tar.gz / 导出至飞牛 / 复制完整路径 / 刷新。
+  → **第二十三轮把原来的「新建文件夹 / 新建文件」两项并成一项「新建」（打开同一个弹窗，
+  在弹窗里选建目录还是建文件），见第 33 节。**
 
 ### 11.4 文件管理器
 
@@ -1040,7 +1043,7 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
   （表头其余列照旧是三态排序，两件事别混在一起）。
 - **空白处右键菜单（桌面）**：在列表/网格的空白区域右键 → `粘贴 / 打开终端 / 复制路径`。
   → **第四轮在最前面补了「新建文件 / 新建文件夹 / 上传」（见 14.4），第五轮补「信息」（15.5），
-  第七轮补「刷新」（17.8）。**
+  第七轮补「刷新」（17.8）；第二十三轮把前两项并成一项「新建」（见第 33 节）。**
   - `打开终端` = 在当前目录新建终端（`terminals.openTerminalAt(sid, state.dir)`）；
   - `复制路径` = 复制当前目录的完整路径到剪贴板；
   - `粘贴` 在剪贴板为空或来自其它会话时置灰并说明原因（沿用现有规则）。
@@ -1137,6 +1140,8 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 - 「新建文件 / 新建文件夹」复用工具栏那套 `newEntry` + `PromptDialog`（父目录 = 当前目录，名字
   校验同前）；「上传」打开工具栏那个 `UploadDialog`（目标目录 = 当前目录）。
 - 行内「更多」菜单不变（11.4 / 13.4），粘贴的「置灰 + 说明原因」规则也不变。
+  → **第二十三轮把上面那两项并成一项「新建」，`PromptDialog` 换成专门的 `NewEntryDialog`，见
+  第 33 节（行内「更多」菜单里从来没有「新建」，不受影响）。**
 
 ### 14.5 修复网格视图的「整列悬停高亮」
 
@@ -3108,3 +3113,79 @@ location /app/ {
   ⑤ 再点「搜索」→ 请求数 3，在当前目录（`root/docs`）里重搜 `docs` → 0 项 +
   「没有找到匹配的项」，按钮变「结果：0 项」；⑥ 点「结果：0 项」→ 请求数仍是 3，回到那次空结果；
   ⑦ 点「取消」→ 搜索栏消失、工具栏那个搜索图标不再高亮。
+
+---
+
+## 33. 第二十三轮：新建目录 / 新建文件合并成一个「新建」
+
+### 33.1 需求（用户原话拆解）
+
+- 文件管理工具栏原来有**两个**图标（新建文件 / 新建文件夹）→ **只留新建文件那个图标，
+  改叫「新建」**；点开的那一个弹窗里，原来的「确定」换成**「新建目录」与「新建文件」两个按钮**，
+  名字校验沿用已有的那套。
+- 左栏目录树的「…」菜单与空白处右键菜单里的「新建文件夹 / 新建文件」也**并成一项「新建」**，
+  点它复用同一个弹窗。
+
+### 33.2 前端
+
+- **新增 `components/files/NewEntryDialog.vue`**（契约 6.2 组件表已登记）：一个输入框 +
+  `取消 / 新建文件夹 / 新建文件`。两个动作按钮**本身就是「要建什么」的开关**，不必先选类型
+  再点确定。
+- **两个入口合并成一个 `openNewEntry()`**，三处调用点共用：
+  - `FileManager`：工具栏（父目录 = 当前目录）、空白处右键菜单（父目录 = 当前目录）；
+  - `FileTree`：目录菜单（行的「…」与空白处右键共用同一份 `dirMenuItems`，父目录 = **开弹窗
+    那一刻**从菜单里快照下来的 `menu.path`——`hideMenu()` 之后菜单状态不再是「用户右键的那一个」，
+    而弹窗要一直开着等用户输名字、还可能校验失败重来）。
+- **校验逻辑原样复用**：两个组件各自的 `badName()`（非空、不含 `/`、不是 `.` / `..`）一个字
+  没改，toast 文案也还是 `files_name_required` / `files_name_invalid`。
+- **与 `PromptDialog` 的差别（刻意的，写在组件头注释里）**：`NewEntryDialog` 的提交**不自我
+  关闭**——校验在调用方，过不了只 toast 原因、弹窗留着（`PromptDialog` 那套「先关再报错」在这
+  个场景下要用户重新打开、重新输一遍）。所以它的 emits 是 `submit(kind, value)`，关不关由
+  调用方按校验结果决定。
+- 输入框里**回车 = 新建文件**（合并后保留下来的入口就是「新建文件」那个图标，回车给默认动作）；
+  Esc / 点遮罩 / 「取消」都是取消。
+- `PromptDialog` **仍然保留**（重命名、以及别的模块在用的场景），只是文件管理/目录树不再用它
+  来新建。
+- 多选态下点「新建」照旧先 `leaveMulti()`（19.4：任何工具栏动作都先收起多选）。
+- i18n（两套字典同步改）：
+  - 新增 `files_new`（`新建` / `New`）——工具栏 title/aria-label、两处菜单项、弹窗标题都用它；
+  - **下线** `files_new_file_title` / `files_new_dir_title`（唯一引用者就是被合并掉的那两个
+    弹窗标题）；
+  - `files_new_file` / `files_new_dir` 保留，改当弹窗里那两个按钮的文案。**用户说的「新建目录」
+    在本界面里一直叫「新建文件夹」**（14.4 起就是这个口径），不另造一套说法。
+
+### 33.3 同轮顺带修正
+
+- `FileTree` 那个 `PromptDialog` 现在**只**服务重命名了，标签从 `files_new_name_prompt`（名称）
+  换成 `files_rename_prompt`（新名称）——它原来为兼顾「新建」与「重命名」两个场景写的是「名称」，
+  与文件管理器那边的重命名弹窗不一致。
+
+### 33.4 冻结文件（本轮）
+
+- `frontend/src/i18n/zh.ts`、`frontend/src/i18n/en.ts`（新增 1 条、删除 2 条 key，两套字典一一
+  对应，见 33.2）。其余冻结文件未动。
+
+### 33.5 本轮的验证
+
+- `make check`：`vue-tsc` 无错误；`check:i18n` 双向 OK（**zh/en 各 468 个 key 一一对应**，
+  −2 +1），代码里静态引用的 key 全部存在。
+- `make test`：后端全绿（本轮没动后端）。
+- `make`：前端 dist → embed → `./webssh` 构建成功。
+- **真二进制 + 无头 Chromium**（`testsshd` + `socat` 桥到 127.0.0.1:18080，1280×720，会话用
+  `/api/sessions/{test,trust,save}` 建好，远端根目录里预置 `sub/` 与 `existing.txt`）：
+  1. 文件管理工具栏上**只有一颗**「新建」图标（原来 `新建文件` + `新建文件夹` 两颗），
+     `title`/aria-label 均为「新建」；
+  2. 点它 → 弹窗标题「新建」、标签「名称」、三个按钮 `取消 / 新建文件夹 / 新建文件`；
+  3. 输入 `bad/name` 点「新建文件夹」→ toast「名称不能包含 /」、**弹窗仍开着且保留输入**
+     （磁盘上没有产生任何东西）——校验与「失败不关弹窗」都对；
+  4. 改输入 `newdir1` 点「新建文件夹」→ toast「已创建「newdir1」」、弹窗关闭、列表出现
+     `newdir1`（`ls` 确认是目录）；
+  5. 再打开弹窗输入 `newfile1.txt` **回车** → 关闭并创建文件（`ls` 确认 0 字节普通文件）；
+  6. 文件管理**空白处右键** → 菜单是 `新建 / 上传 / 信息 / 打开终端 / 复制完整路径 /
+     添加快捷访问 / 刷新`（原来的两项并成了一项），点「新建」打开的就是同一个弹窗；
+  7. 左栏目录树的**行「…」菜单**（右键 `/tmp` 行）→ 第一项为单条「新建」，点它 → 同一个弹窗，
+     输 `webssh-tree-newdir` 点「新建文件夹」→ `/tmp/webssh-tree-newdir` 真的建出来了；
+  8. 目录树**空白处右键**（根菜单）同样只有一条「新建」；点别处菜单正常消失。
+- **没有被自动化点过**：网格视图下的空白菜单（与列表视图共用同一个 `blankMenuItems`，第 6 条
+  即覆盖它的取数逻辑）、移动端窄屏下弹窗三个按钮的换行表现（面板 `max-w-sm` + 三个按钮合计
+  约 252px，360px 宽屏下仍有余量，但没实机截图）。

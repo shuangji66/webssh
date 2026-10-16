@@ -48,7 +48,8 @@
 // 改回**上一次激活的终端**，左栏（面包屑 + 目录树）随之回来——与左栏那条按钮条里的「切换到
 // 文件管理」互为一对，两处共用同一个状态（契约 13.1 的「二选一」判据没变，也没有第二套开关）。
 //
-// 弹窗（重命名 / 新建 用 PromptDialog，删除与覆盖确认用 ConfirmDialog）由 shell 模块提供，见契约 6.2。
+// 弹窗：重命名用通用件 PromptDialog，删除与覆盖确认用 ConfirmDialog（见契约 6.2）；**新建**
+// 用文件管理自己的 NewEntryDialog——第二十三轮把「新建目录 / 新建文件」两个弹窗并成一个，见契约 33。
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import {
@@ -81,6 +82,7 @@ import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import PromptDialog from '@/components/PromptDialog.vue'
 import FileEditor from './FileEditor.vue'
 import InfoDialog from './InfoDialog.vue'
+import NewEntryDialog from './NewEntryDialog.vue'
 import PreviewDialog from './PreviewDialog.vue'
 import SearchBar from './SearchBar.vue'
 import SearchResults from './SearchResults.vue'
@@ -652,7 +654,7 @@ function askDeletePaths(paths: string[]) {
   )
 }
 
-// ---- 新建 / 重命名 / 删除（PromptDialog / ConfirmDialog） ----
+// ---- 新建 / 重命名 / 删除（NewEntryDialog / PromptDialog / ConfirmDialog） ----
 
 interface PromptJob {
   title: string
@@ -714,28 +716,41 @@ function badName(name: string): 'empty' | 'invalid' | '' {
   return ''
 }
 
-function newEntry(dir: boolean) {
+/**
+ * 「新建」弹窗的显隐（第二十三轮：原来两个按钮、两个入口、两套标题，现在共用一个弹窗）。
+ *
+ * 父目录 = **当前目录**：工具栏按钮与空白处右键菜单都是「对当前这个目录做事」。
+ */
+const newEntryVisible = ref(false)
+
+/** 打开「新建」弹窗（工具栏那个图标按钮 / 空白处右键菜单共用这一个入口）。 */
+function openNewEntry() {
   // 先把菜单收掉：菜单项的 pointerdown 落在菜单自己身上（见 onDocPointerDown），不会被「点别处」
   // 那条规则关掉，所以要在这里显式关——否则弹窗后面会一直挂着一个菜单。
   hideMenu()
+  // 多选态下点「新建」= 离开那批选择（9.4：任何工具栏动作都先收多选）
   leaveMulti()
-  askName({
-    title: dir ? t('files_new_dir_title') : t('files_new_file_title'),
-    label: t('files_new_name_prompt'),
-    initial: '',
-    run: (raw) => {
-      const bad = badName(raw)
-      if (bad === 'empty') {
-        toast(t('files_name_required'))
-        return
-      }
-      if (bad) {
-        toast(t('files_name_invalid'))
-        return
-      }
-      void createEntry(dir, raw.trim())
-    }
-  })
+  newEntryVisible.value = true
+}
+
+/**
+ * 弹窗提交：两个按钮只是在「建目录还是建文件」上不同，校验与后续动作完全一样。
+ *
+ * 名字校验判据沿用原来那套 `badName`（原样搬过来，一个字没改）；校验不过时**弹窗不关**
+ * （`newEntryVisible` 保持 true），用户改个名字再点即可。
+ */
+function onCreateEntry(kind: 'file' | 'dir', raw: string) {
+  const bad = badName(raw)
+  if (bad === 'empty') {
+    toast(t('files_name_required'))
+    return
+  }
+  if (bad) {
+    toast(t('files_name_invalid'))
+    return
+  }
+  newEntryVisible.value = false
+  void createEntry(kind === 'dir', raw.trim())
 }
 
 async function createEntry(dir: boolean, name: string) {
@@ -1108,18 +1123,20 @@ function multiMenuItems(): MenuItem[] {
 }
 
 /**
- * 空白处菜单（13.4 + 第四轮 + 第六轮 + 第二十轮）：新建文件 / 新建文件夹 / 上传 /
- * 粘贴到当前目录 / 信息 / 在当前目录开终端 / 复制当前目录路径 / 添加快捷访问 / 刷新。
+ * 空白处菜单（13.4 + 第四轮 + 第六轮 + 第二十轮 + 第二十三轮）：新建 /
+ * 上传 / 粘贴到当前目录 / 信息 / 在当前目录开终端 / 复制当前目录路径 / 添加快捷访问 / 刷新。
+ *
+ * 「新建」一项同时管目录与文件（第二十三轮合并，见契约 33）：点开那个弹窗再选用哪个按钮，
+ * 不再让用户先在菜单里二选一。
  *
  * 为什么把「新建 / 上传」也放这里：空白处右键是「对**这个目录**做事」最自然的入口，
- * 而这三件事（尤其是上传）在工具栏上都要先回到工具栏去点。粘贴仍然放在中间靠前的位置
+ * 而这两件事（尤其是上传）在工具栏上都要先回到工具栏去点。粘贴仍然放在中间靠前的位置
  * （它是使用频率最高的一项），粘不了时置灰并说明原因（13.4）。
  */
 function blankMenuItems(): MenuItem[] {
   const dir = state.value.dir
   const items: MenuItem[] = []
-  items.push({ label: t('files_new_file'), run: () => newEntry(false) })
-  items.push({ label: t('files_new_dir'), run: () => newEntry(true) })
+  items.push({ label: t('files_new'), run: openNewEntry })
   items.push({ label: t('files_upload'), run: uploadHere })
   const paste = pasteItem(dir)
   if (paste) items.push(paste)
@@ -1313,12 +1330,14 @@ onBeforeUnmount(hideMenu)
 
       <span class="mx-1 h-4 w-px shrink-0 bg-line dark:bg-line-dark" />
 
+      <!-- 新建（第二十三轮把这两个图标并成一个，见契约 33）：保留原来「新建文件」那个图标，
+           标题改成「新建」，点开的是只此一个的 NewEntryDialog，目录/文件在那个弹窗里选。 -->
       <button
         type="button"
         class="tree-tool"
-        :title="t('files_new_file')"
-        :aria-label="t('files_new_file')"
-        @click="newEntry(false)"
+        :title="t('files_new')"
+        :aria-label="t('files_new')"
+        @click="openNewEntry"
       >
         <svg
           class="h-4 w-4"
@@ -1331,26 +1350,6 @@ onBeforeUnmount(hideMenu)
         >
           <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
           <path d="M14 3v5h5" />
-          <path d="M12 11v6M9 14h6" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="tree-tool"
-        :title="t('files_new_dir')"
-        :aria-label="t('files_new_dir')"
-        @click="newEntry(true)"
-      >
-        <svg
-          class="h-4 w-4"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2z" />
           <path d="M12 11v6M9 14h6" />
         </svg>
       </button>
@@ -1908,6 +1907,14 @@ onBeforeUnmount(hideMenu)
       :sid="sid"
       :path="infoPath"
       @update:visible="infoVisible = $event"
+    />
+    <!-- 新建（第二十三轮）：目录与文件共用这一个弹窗，父目录 = 当前目录 -->
+    <NewEntryDialog
+      :visible="newEntryVisible"
+      :label="t('files_new_name_prompt')"
+      @update:visible="newEntryVisible = $event"
+      @submit="onCreateEntry"
+      @cancel="newEntryVisible = false"
     />
     <PromptDialog
       :visible="prompt.show"
