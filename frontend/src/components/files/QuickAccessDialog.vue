@@ -46,10 +46,19 @@ const adding = ref(false)
 /** 正在打开的那一条（点一下要等一次列目录：期间标出来，避免连点两次）。 */
 const opening = ref('')
 
-async function load() {
+/**
+ * 拉一次列表（弹窗每次打开、以及点「重试」）。
+ *
+ * `force` = 用户点的「重试」：走 `reload` 绕过「已加载」的幂等判断强制重拉，否则走 `ensure`
+ * （已成功加载过就不发请求）。两条路都从这里走，**原因与失败标志各归一处**：失败标志在 store
+ * 里（`isFailed` → 上面那个 failed，界面据此走「加载失败」分支而不是空态），原因留在这个
+ * `loadError` 里（store 不该管界面文案）。每次尝试前先清空它，避免重试成功后还挂着上一次的话。
+ */
+async function load(force = false) {
   loadError.value = ''
   try {
-    await qa.ensure(props.sid)
+    if (force) await qa.reload(props.sid)
+    else await qa.ensure(props.sid)
   } catch (e) {
     loadError.value = describeError(e)
   }
@@ -176,7 +185,9 @@ async function open(path: string) {
                 <p class="leading-relaxed break-all text-danger">
                   {{ t('files_quick_load_failed', { error: loadError }) }}
                 </p>
-                <button type="button" class="g-btn-ghost mt-1 h-8 text-danger" @click="load">
+                <!-- 显式传 true：写成 @click="load" 会把 MouseEvent 当作 force 传进去，
+                     虽然结果一样，但没人看得出这是「强制重拉」。 -->
+                <button type="button" class="g-btn-ghost mt-1 h-8 text-danger" @click="load(true)">
                   {{ t('common_retry') }}
                 </button>
               </div>

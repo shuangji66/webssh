@@ -11,6 +11,7 @@ import (
 	"path"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -211,13 +212,39 @@ func (r *sessionRuntime) sftpReady() bool {
 	return r.sftp != nil
 }
 
+// streamJoinTimeout 是「请求已取消、但闭包还在写响应」时等它退出的上限（见 withSFTPStream）。
+//
+// 5 秒：连接刚被丢掉，闭包里的 SFTP 调用会立刻失败返回，正常是毫秒级；这条时限只兜住
+// 「写卡在一个不收数据的客户端上」那种极端情况（http.Server 没有设 WriteTimeout）。
+const streamJoinTimeout = 5 * time.Second
+
 // withSFTP 串行化执行一次文件操作，并处理「连接坏了重连一次」与「客户端取消」。
 //
 // 取消的处理方式值得说明：文件操作本身不接受 context（pkg/sftp 的 API 没有），所以
 // 这里把操作放到协程里跑，ctx 结束时**关掉整条 SFTP 连接**——阻塞中的请求会因连接断开
 // 立刻失败返回，协程不会泄漏；代价是这条连接不能再用（下次操作会重拨），换来的是
 // 「关页面之后服务端不会一直挂在一个没人要的请求上」。
+//
+// 它**不等**协程退出：正确性依赖「闭包不碰响应」这条纪律。要在闭包里写响应的接口必须用
+// withSFTPStream（见那里）。
 func (r *sessionRuntime) withSFTP(ctx context.Context, fn func(*sftpSession) error) error {
+	return r.withSFTPJoin(ctx, fn, 0)
+}
+
+// withSFTPStream 与 withSFTP 相同，但供**在闭包里写响应**的接口使用（目前只有 /api/fs/search，
+// 它是流式 NDJSON：边搜边回）。
+//
+// 为什么必须单独一个：net/http 明确要求 Handler 返回之后不得再用 ResponseWriter，而搜索的闭包
+// 是直接往 w 里写的。withSFTP 在 ctx 结束时**立刻**返回，闭包却还在协程里跑——实测（中止请求后
+// 统计写入次数）handler 返回后又写了 41 次 / 453 KiB，等于把全部 2000 条结果写在一个已经收尾的
+// 响应上。所以这里丢掉连接之后**再等闭包退出**（最多 streamJoinTimeout），把「handler 返回时
+// 闭包早已结束」变成一条不变量。
+func (r *sessionRuntime) withSFTPStream(ctx context.Context, fn func(*sftpSession) error) error {
+	return r.withSFTPJoin(ctx, fn, streamJoinTimeout)
+}
+
+// withSFTPJoin 是两者的共同实现：join > 0 时在取消之后等闭包退出（理由见 withSFTPStream）。
+func (r *sessionRuntime) withSFTPJoin(ctx context.Context, fn func(*sftpSession) error, join time.Duration) error {
 	r.sftpMu.Lock()
 	defer r.sftpMu.Unlock()
 
@@ -240,6 +267,17 @@ func (r *sessionRuntime) withSFTP(ctx context.Context, fn func(*sftpSession) err
 		return err
 	case <-ctx.Done():
 		r.dropSFTPLocked()
+		if join > 0 {
+			// 等闭包退出，但**不能无限等**：它可能卡在一次写不上（客户端不收数据）上，而
+			// sftpMu 一直被本函数握着，同会话的其他文件操作会跟着排队。超时就记一条日志如实
+			// 说明可能还有协程在写响应——宁留一条日志，也不把锁无限期占住。
+			select {
+			case <-done:
+			case <-time.After(join):
+				logx.Warnf("会话 %s 的流式文件操作在取消后 %s 内仍未退出，可能有协程仍在写响应",
+					r.id, join)
+			}
+		}
 		return apierr.Aborted("请求已取消")
 	}
 }

@@ -139,8 +139,10 @@ export const TREE_FILE_LIMIT = 20
  *  1. 搜索栏本身（`open` / `query` / 进度与统计）；
  *  2. 结果列表（`results`，**边搜边追加**：搜到一点显示一点）；
  *  3. 列表区当前显示的是结果还是目录内容（`viewing`）——用户要求「点结果里的目录跳进去时
- *     搜索栏留着、再点搜索快速回到结果」，靠的就是结果在那段时间里一直缓存着
- *     （`results` + `scopeQuery` + `scopeDir` 就是那份缓存）。
+ *     搜索栏留着、再点『结果：x 项』回到那批结果」，靠的就是结果在那段时间里一直缓存着
+ *     （`results` + `scopeDir` 就是那份缓存）。这份缓存的生命周期**就是「这一次搜索」**：
+ *     只有 `closeSearch`（点「取消」）会清掉它，`runSearch`（点「搜索」）开新一轮时也会清空旧
+ *     的（换目录/换关键词之后两份结果的合集只会误导人）。
  */
 export interface SftpSearch {
   /** 搜索栏是否显示（只有「取消」会把它收起来） */
@@ -153,12 +155,10 @@ export interface SftpSearch {
   running: boolean
   /** 这一轮已经结束（含被截断）；running=false 且 done=true 才是「搜完了」 */
   done: boolean
-  /** 已收到的结果（缓存） */
+  /** 已收到的结果（缓存）：生命周期与「这一次搜索」相同，只有 closeSearch 清（见上面的说明） */
   results: FsEntry[]
   /** 这批结果是在哪个目录下搜出来的（后端解析后的**绝对**路径：结果靠它折成相对路径） */
   scopeDir: string
-  /** 这批结果对应的关键词（与输入框一致才算缓存命中） */
-  scopeQuery: string
   /** 已扫描的条目数 / 目录数（后端节流回传） */
   scanned: number
   dirs: number
@@ -181,7 +181,6 @@ function blankSearch(): SftpSearch {
     done: false,
     results: [],
     scopeDir: '',
-    scopeQuery: '',
     scanned: 0,
     dirs: 0,
     skipped: 0,
@@ -989,7 +988,7 @@ export const useSftpStore = defineStore('sftp', () => {
   /**
    * 退出搜索：收起搜索栏，**关键词与结果一起清掉**。
    *
-   * 缓存（结果 + 关键词 + 起点目录）只服务「从结果跳进目录之后再点搜索秒回」这一件事，
+   * 缓存（结果 + 起点目录）只服务「回到那批结果」这一件事（`showSearchResults`，见下），
    * 生命周期与「这一次搜索」相同。用户点「取消」就是在说这次搜索结束了，留着它下次打开
    * 搜索栏又冒出来，反而像没退出。正在跑的那一轮一并掐掉（后端也会停掉遍历）。
    */
@@ -1051,7 +1050,6 @@ export const useSftpStore = defineStore('sftp', () => {
     s.error = ''
     s.results = []
     s.scopeDir = st.dir
-    s.scopeQuery = query
     s.scanned = 0
     s.dirs = 0
     s.skipped = 0

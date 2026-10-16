@@ -426,8 +426,9 @@ func (m *sessionManager) save(in store.SessionInput) (*store.SessionView, *apier
 // boolPtr 取一个 bool 的地址（CredentialSaved 用指针表达「缺省 = true」）。
 func boolPtr(v bool) *bool { return &v }
 
-// delete 删除会话：先关掉运行时（终端 + SFTP），再删配置、专属快捷指令、快捷访问与历史目录
-// （前端的确认文案就是这么承诺的：「登录数据、专属快捷指令与该会话的历史都会一并删除」）。
+// delete 删除会话：先关掉运行时（终端 + SFTP），再删配置，**最后**删专属快捷指令、快捷访问与
+// 历史目录（前端的确认文案就是这么承诺的：「登录数据、专属快捷指令与该会话的历史都会一并删除」；
+// 配置必须排在附属数据之前，理由见函数内注释）。
 func (m *sessionManager) delete(id string) *apierr.Error {
 	if !store.ValidID(id) {
 		return apierr.NotFound("会话不存在")
@@ -446,15 +447,19 @@ func (m *sessionManager) delete(id string) *apierr.Error {
 	if rt != nil {
 		rt.close()
 	}
+	// **先删配置，成功之后再删附属数据**：反过来的顺序（先删历史/快捷指令/快捷访问、再删配置）
+	// 在最后一步失败时会留下「会话还在、附属表已经没了」的半删状态——用户看到的会话点开就少了
+	// 指令与历史，而且没有任何入口能把它恢复。配置先删掉之后，附属数据即使删不掉也只是孤儿文件
+	// （同名会话下次被删时会再碰一次，启动时也会扫到），不产生能观察到的坏状态，所以失败只记日志。
+	if err := m.st.DeleteSession(id); err != nil {
+		return apierr.Internal("删除会话失败：%v", err)
+	}
 	// 历史可能还在（会话没打开过、或上次没清理干净）
 	m.st.RemoveHistoryDir(id)
 	m.st.DeleteQuickCmds(id)
 	// 快捷访问的路径属于这台远程主机：会话没了，它们也就没有意义了（列表里的路径会在
 	// 别的会话上指向完全不同的目录，留着只会是一条条点了报错的项）。
 	m.st.DeleteQuickAccess(id)
-	if err := m.st.DeleteSession(id); err != nil {
-		return apierr.Internal("删除会话失败：%v", err)
-	}
 	return nil
 }
 

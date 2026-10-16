@@ -24,7 +24,7 @@ export const STATS_INTERVAL_MS = 5000
 export type StatLevel = 'ok' | 'warn' | 'danger'
 
 /**
- * 阈值（见 CONTRACT 23.6）。
+ * 阈值（见 CONTRACT 第 24 节；第十三轮的实现记在 23，阈值与理由在 24.1）。
  *
  * 取值理由：内存比 CPU 更早影响使用（开始换页就卡了，所以 70% 就转黄）；磁盘在 NAS 上后果最重
  * （写满会直接写失败，所以 75% 就转黄）；负载是「排队长度」，必须**除以核数**才有意义，

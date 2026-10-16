@@ -439,6 +439,9 @@ func (s *Store) DeleteQuickCmds(sid string) {
 // 只给「启动时把第一轮留下的明文命令内容加密」那次一次性迁移用（见 main 包的
 // migrateAllQuickCmds）：前端只会加载全局表与**当前会话**的表，别的会话的表可能几个月都不被
 // 读一次，只靠读取时迁移的话，明文就会一直躺在磁盘上。目录不存在（还没有任何指令）返回空。
+//
+// **文件名必须恰好是 `global.json` 或 `<合法会话 id>.json`**：作用域是密文 AAD 的一部分，
+// 名字不合法就不是一张能解释的表（见下面的过滤与告警）。
 func (s *Store) QuickCmdsScopes() ([]string, error) {
 	entries, err := os.ReadDir(s.quickcmdsDir())
 	if err != nil {
@@ -454,9 +457,21 @@ func (s *Store) QuickCmdsScopes() ([]string, error) {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		sid := strings.TrimSuffix(e.Name(), ".json")
-		if sid == "global" {
+		// 不能用「削掉 .json 后缀就算作用域」那种写法：名字叫 `.json` 时会削出空串（= 全局），
+		// 这个文件于是被当成全局表去迁移（而真正的 global.json 反过来被漏掉）；`a b.json` /
+		// `a:b.json` 这类名字又会带着空格/冒号被当成会话 id 参与迁移，让 AAD 产生歧义（作用域
+		// 与指令 id 之间只有一个冒号当分隔符）。只有手工编辑数据目录才造得出这些名字，跳过并
+		// 记一条日志——它不是一张我们能解释的表。
+		name := strings.TrimSuffix(e.Name(), ".json")
+		var sid string
+		switch {
+		case name == "global":
 			sid = ""
+		case ValidID(name):
+			sid = name
+		default:
+			logx.Warnf("快捷指令目录里的 %s 文件名不是合法作用域（只认 global.json 或 <会话 id>.json），已跳过", e.Name())
+			continue
 		}
 		out = append(out, sid)
 	}

@@ -29,6 +29,7 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { t } from '@/i18n'
 import { ApiError, describeError, type ArchiveFormat } from '@/serverapi'
+import { useAppTabsStore } from '@/stores/appTabs'
 import { useFileEditorStore } from '@/stores/fileEditor'
 import { usePaneControlsStore } from '@/stores/paneControls'
 import { useQuickAccessStore } from '@/stores/quickAccess'
@@ -56,6 +57,7 @@ const panes = usePaneControlsStore()
 const editor = useFileEditorStore()
 const quickAccess = useQuickAccessStore()
 const toastStore = useToastStore()
+const appTabs = useAppTabsStore()
 
 const state = computed(() => sftp.stateOf(sid))
 
@@ -394,6 +396,25 @@ function openNewEntry() {
   hideMenu()
   newEntryVisible.value = true
 }
+
+/**
+ * 切走这个会话标签时把「新建」弹窗关掉（与 SessionView 里快捷访问弹窗那条 watch 同一条规则）。
+ *
+ * 为什么需要这一句：弹窗 Teleport 到 body，而会话视图切应用标签只是 `v-show` 隐藏——Teleport
+ * 出去的节点**不在**那棵 display:none 的子树里，会一直浮在首页/另一个会话上面。它现在恰好被
+ * 自己的遮罩挡住了顶栏（`.app-header` 没有定位/z-index）、正常点不到标签切走，但这个「巧合」
+ * 不能当依赖；而它是个要输名字、可能停留较久的弹窗，与「点了立刻有结果」的重命名/确认框不同类
+ * （FileManager 那个宿主上也是同一句）。
+ *
+ * 判据只能是**应用级标签**（appTabs.activeId）：同一个会话里切终端/文件管理子标签时这个值不变，
+ * 弹窗该留着（用户可能只是切过去看一眼再回来接着输）。
+ */
+watch(
+  () => appTabs.activeId,
+  (active) => {
+    if (active !== sid) newEntryVisible.value = false
+  }
+)
 
 /**
  * 弹窗提交：两个按钮只是在「建目录还是建文件」上不同，校验与后续动作完全一样。

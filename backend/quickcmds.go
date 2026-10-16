@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"webssh/backend/internal/apierr"
 	"webssh/backend/internal/logx"
 	"webssh/backend/internal/secret"
@@ -111,6 +112,29 @@ type quickCmdsFile struct {
 // 按钮上（按钮上写的是 B 的名字，点下去跑的是 A 的内容）。
 func quickCmdAADField(id string) string { return "quickcmd:" + id }
 
+// quickCmdsLocks 是「读 → 迁移 → 重写」与「整表保存」**共用**的按作用域互斥锁
+// （key = sid，全局是空串），由 loadQuickCmdsFile / saveQuickCmds 各持一次。
+//
+// 为什么锁必须覆盖整段「读-改-写」而不只是单次写：loadQuickCmdsFile 遇到第一轮留下的明文时
+// 会就地加密重写，而 saveQuickCmds 是整表覆盖写；两者交错时，读那一侧手里那份**过期快照**
+// （迁移结果）会把用户刚保存的表整表覆盖掉，双方都不报错——用户看到的是「命令莫名消失」
+// （前端已乐观更新，直到下次 reload 才发现本地与服务端分叉）。store.WriteJSON 内部的锁
+// 只串行单次写，覆盖不了这个跨步序列，所以锁必须由调用方持有、一直持到重写完。
+//
+// 粒度按作用域而不是一把全局锁：不同会话的表互不相关，而读接口现在带写副作用（每次读都要
+// 拿锁），一把全局锁会让一个会话的迁移把别的会话的正常保存挡在后面。sync.Map 是因为作用域
+// 集合随会话增删而变，没有能预先枚举的固定大小。
+//
+// 唯一要守的纪律是**不许重入**：持锁的函数里不能再调另一个持锁的函数。迁移与保存互不调用
+// （migrateAllQuickCmds 只调 loadQuickCmdsFile，自己并不持锁），所以现在是安全的。
+var quickCmdsLocks sync.Map // map[string]*sync.Mutex
+
+// quickCmdsLock 取某个作用域的锁。
+func quickCmdsLock(sid string) *sync.Mutex {
+	mu, _ := quickCmdsLocks.LoadOrStore(sid, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
 // loadQuickCmdsFile 读一张表的磁盘形态，并**顺手做迁移**：文件里只要有第一轮的明文内容，
 // 就地加密重写（WriteJSON = 同目录临时文件 + rename，原子替换）。
 //
@@ -122,6 +146,12 @@ func quickCmdAADField(id string) string { return "quickcmd:" + id }
 // quickCmd 与 apierr.Error 都属于 API 层，store 包只提供通用的 ReadJSON/WriteJSON 与路径；
 // 加解密要主密钥，所以由调用方把 crypt 传进来。
 func loadQuickCmdsFile(st *store.Store, crypt *secret.Cryptor, sid string) (quickCmdsFile, error) {
+	// 「读 → 迁移 → 重写」整段持锁：迁出来的那份是**读那一刻**的快照，落盘前若别人整表保存过，
+	// 写回去就是覆盖（见 quickCmdsLocks 的注释）。
+	mu := quickCmdsLock(sid)
+	mu.Lock()
+	defer mu.Unlock()
+
 	var f quickCmdsFile
 	if err := st.ReadJSON(st.QuickCmdsPath(sid), &f); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -145,6 +175,8 @@ func loadQuickCmdsFile(st *store.Store, crypt *secret.Cryptor, sid string) (quic
 // migrateQuickCmds 把一张表里**第一轮的明文内容**加密成版本 2 的信封，返回是否发生了迁移。
 //
 // 规则：
+//   - id 非法（`store.ValidID`）或在本表里重复 → 重发一个 id，内容跟着重发后的 id 重新加密
+//     （见 reassignQuickCmdID），表内第一个出现的 id 保留；
 //   - 已经是信封的条目**原样保留**（不重新加密：没必要换密文，也就少一次「解不开」的机会）；
 //   - 明文内容加密成功 → 换成信封，内容与格式逐字节不变；
 //   - 明文内容为空（空内容存不下来，Encrypt 返回 nil）或加密失败 → 换成**加密后的占位文案**
@@ -154,8 +186,20 @@ func loadQuickCmdsFile(st *store.Store, crypt *secret.Cryptor, sid string) (quic
 //     写不出密文，也不能为了「看起来迁移成功」而留下明文。
 func migrateQuickCmds(crypt *secret.Cryptor, sid string, f *quickCmdsFile) (bool, error) {
 	changed := false
+	// seen 记录本表里已经出现过的 id：**第一个出现的保留**，后面的重发（与 sanitizeQuickCmds
+	// 对请求体的口径一致：前端按 id 做列表 key，重复 id 会让渲染错乱，而密文的 AAD 也认不出两
+	// 条同 id 的指令）。
+	seen := make(map[string]bool, len(f.Commands))
 	for i := range f.Commands {
 		e := &f.Commands[i]
+		reissued, err := reassignQuickCmdID(crypt, sid, e, seen)
+		if err != nil {
+			return false, err
+		}
+		if reissued {
+			changed = true
+		}
+		seen[e.ID] = true
 		if !e.legacy {
 			continue
 		}
@@ -191,6 +235,50 @@ func migrateQuickCmds(crypt *secret.Cryptor, sid string, f *quickCmdsFile) (bool
 	return changed, nil
 }
 
+// reassignQuickCmdID 在指令 id 非法（`store.ValidID`，例如含冒号）或在本表里已经出现过时，
+// 给它换一个全新且本表未用过的 id，返回是否改动了 id。
+//
+// 为什么必须重发：AAD 是 `webssh:v1:quickcmd:<指令 id>:<作用域>`，id 与作用域之间那个冒号
+// 没有长度前缀，所以含冒号的 id 会让 (id="x", sid="a:b") 与 (id="x:a", sid="b") 拼出**同一个**
+// AAD；而同一张表里两条指令 id 相同时，两条密文互换位置后照样解得开——界面上就是「按钮上写着
+// 乙的名字，点下去跑的是甲的命令」。这两种文件只有手工编辑数据目录才造得出来（接口那侧
+// sanitizeQuickCmds 会补 id / 去重），但代价只是重发一个 id，没有理由留着。
+//
+// 已经在信封形态（密文）的条目要**先解开、再用新 id 重新加密**：只换 id 不重新加密，AAD 就对
+// 不上了（那条指令立刻变成「解密失败」）。解不开（换了 master.key 等）时原样保留并记日志——
+// 那条内容本来就取不回来，此时改 id 只会把「读这张表报错」变成「内容悄悄错位」，反而更糟。
+func reassignQuickCmdID(crypt *secret.Cryptor, sid string, e *quickCmdStored, seen map[string]bool) (bool, error) {
+	if e.ID != "" && store.ValidID(e.ID) && !seen[e.ID] {
+		return false, nil
+	}
+	oldID := e.ID
+	newID := store.NewID()
+	for seen[newID] {
+		newID = store.NewID()
+	}
+	if e.Content != nil {
+		plain, err := crypt.Decrypt(quickCmdAADField(oldID), sid, e.Content)
+		if err != nil {
+			logx.Warnf("快捷指令「%s」（%s，%s）的 id 非法或重复，但密文解不开、无法按新 id 重新加密，保留原样（读这张表时会报错）：%v",
+				e.Name, oldID, scopeOf(sid), err)
+			return false, nil
+		}
+		sec, err := crypt.Encrypt(quickCmdAADField(newID), sid, plain)
+		if err != nil {
+			return false, fmt.Errorf("按新 id 重新加密快捷指令「%s」的命令内容失败：%w", e.Name, err)
+		}
+		if sec == nil {
+			return false, fmt.Errorf("按新 id 重新加密快捷指令「%s」的命令内容失败：内容为空", e.Name)
+		}
+		e.Content = sec
+	}
+	e.ID = newID
+	// 只写名字 / 旧 id / 作用域，**不写命令内容**（日志会进系统日志与用户贴出来的诊断信息）。
+	logx.Warnf("快捷指令「%s」（旧 id：%s，%s）的 id 非法或重复，已重发为 %s",
+		e.Name, oldID, scopeOf(sid), newID)
+	return true, nil
+}
+
 // migrateAllQuickCmds 在启动时把数据目录里**所有**快捷指令表的明文内容加密一次。
 //
 // 为什么不能只在读取时迁移：前端只加载全局表与**当前会话**的表，别的会话的表可能几个月都不被
@@ -206,6 +294,7 @@ func migrateAllQuickCmds(st *store.Store, crypt *secret.Cryptor) error {
 	var firstErr error
 	for _, sid := range scopes {
 		// 和读取走同一条路（读 → 迁移 → 需要时原子重写），迁移规则只有一处实现。
+		// 这条路**不自己持锁**：锁在 loadQuickCmdsFile 里取，启动扫描与请求路径才不会互相死锁。
 		if _, err := loadQuickCmdsFile(st, crypt, sid); err != nil {
 			logx.Warnf("迁移快捷指令（%s）失败，打开那张表时会重试：%v", scopeOf(sid), err)
 			if firstErr == nil {
@@ -252,7 +341,14 @@ func decryptQuickCmdContent(crypt *secret.Cryptor, sid string, e quickCmdStored)
 //
 // 每次保存都重新加密（GCM 每次的 nonce 都是新的）：整表重写本来就会换掉整个文件，没有
 // 「保留原密文」的意义，而解密再加密的往返反而多一次失败机会。
+//
+// 与 loadQuickCmdsFile 共用同一把按作用域的锁：整表覆盖写必须和「读 → 迁移 → 重写」互相
+// 排斥，否则迁移那份过期快照会把刚保存的表整表盖回去（见 quickCmdsLocks 的注释）。
 func saveQuickCmds(st *store.Store, crypt *secret.Cryptor, sid string, cmds []quickCmd) *apierr.Error {
+	mu := quickCmdsLock(sid)
+	mu.Lock()
+	defer mu.Unlock()
+
 	stored := make([]quickCmdStored, 0, len(cmds))
 	for _, c := range cmds {
 		sec, err := crypt.Encrypt(quickCmdAADField(c.ID), sid, c.Content)

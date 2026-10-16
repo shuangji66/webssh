@@ -89,9 +89,17 @@ export const useQuickAccessStore = defineStore('quickAccess', () => {
     busy.value[sid] = true
     failed.value[sid] = false
     const p = (async () => {
-      const res = await api.quickAccess(sid)
-      lists.value[sid] = res.paths ?? []
-      loaded.value[sid] = true
+      try {
+        const res = await api.quickAccess(sid)
+        lists.value[sid] = res.paths ?? []
+        loaded.value[sid] = true
+      } catch (e) {
+        // 失败必须与「空表」区分开：弹窗据此显示「读取失败：<原因> + 重试」，而不是
+        // 「还没有快捷访问路径」——后者会让用户以为自己加的条目被删了（契约 30.3 明令禁止）。
+        // loaded 保持 false，所以下次 ensure 会再拉一次，不会永远停在失败态。
+        failed.value[sid] = true
+        throw e
+      }
     })()
     const tracked = p.finally(() => {
       busy.value[sid] = false

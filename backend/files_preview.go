@@ -350,7 +350,9 @@ func (m *AdminMux) handleFsImage(w http.ResponseWriter, r *http.Request) *apierr
 		data, err = io.ReadAll(io.LimitReader(f, maxImageBytes+1))
 		if int64(len(data)) > maxImageBytes {
 			// 读了之后才变大（正在被写入的文件）：同样按超限处理。
-			return apierr.TooLarge("图片 %s 超过预览上限 %s", humanSize(int64(len(data))), humanSize(maxImageBytes))
+			// **不报「实际读到的体积」**：这个分支里读到的字节数恰好是「上限 + 1」，写进文案
+			// 就成了一句自相矛盾的话（「4.0 MB 超过预览上限 4.0 MB」——上轮 F-22 就漏修在这里）。
+			return apierr.TooLarge("图片在读的过程中变大，超过预览上限 %s", humanSize(maxImageBytes))
 		}
 		return err
 	})

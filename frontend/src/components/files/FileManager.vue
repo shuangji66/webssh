@@ -60,6 +60,7 @@ import {
   type UploadEntry,
   type UploadResult
 } from '@/serverapi'
+import { useAppTabsStore } from '@/stores/appTabs'
 import { useFileEditorStore } from '@/stores/fileEditor'
 import { usePaneControlsStore } from '@/stores/paneControls'
 import { useQuickAccessStore } from '@/stores/quickAccess'
@@ -99,6 +100,7 @@ const sessionUi = useSessionUiStore()
 const editor = useFileEditorStore()
 const quickAccess = useQuickAccessStore()
 const toastStore = useToastStore()
+const appTabs = useAppTabsStore()
 
 /** 统一的提示出口：文案一律走 i18n，失败必须说清原因（不能「点了没反应」）。 */
 function toast(msg: string, type: 'success' | 'error' | 'info' = 'error') {
@@ -722,6 +724,25 @@ function badName(name: string): 'empty' | 'invalid' | '' {
  * 父目录 = **当前目录**：工具栏按钮与空白处右键菜单都是「对当前这个目录做事」。
  */
 const newEntryVisible = ref(false)
+
+/**
+ * 切走这个会话标签时把「新建」弹窗关掉（与 SessionView 里快捷访问弹窗那条 watch 同一个理由）。
+ *
+ * 为什么需要这一句：弹窗 Teleport 到 body，而会话视图切应用标签只是 `v-show` 隐藏——Teleport
+ * 出去的节点**不在**那棵 display:none 的子树里，会一直浮在首页/另一个会话上面。当前它的遮罩
+ * 恰好盖住了顶栏（`.app-header` 没有定位/z-index），正常点不到标签切走；但这个「巧合」不能
+ * 当依赖——遮罩尺寸或层级一改，弹窗就会留在别的标签上（它是个要输名字、可能停留较久的弹窗，
+ * 与「点了立刻有结果」的重命名/确认框不是一类）。
+ *
+ * 判据只能是**应用级标签**（appTabs.activeId）：同一个会话里切终端/文件管理子标签时这个值不变，
+ * 弹窗该留着（用户可能只是切过去看一眼再回来接着输）。
+ */
+watch(
+  () => appTabs.activeId,
+  (active) => {
+    if (active !== sid) newEntryVisible.value = false
+  }
+)
 
 /** 打开「新建」弹窗（工具栏那个图标按钮 / 空白处右键菜单共用这一个入口）。 */
 function openNewEntry() {
@@ -1688,8 +1709,11 @@ onBeforeUnmount(hideMenu)
       @drop.prevent="onDrop"
       @contextmenu.prevent="onBlankContext($event)"
     >
-      <!-- 搜索结果（第二十二轮）：列表区的一种形态，与下面的目录内容互斥。表头 / 行 / 空态
-           都在 SearchResults 里（它自己一套列宽，因为结果里显示的是**相对路径**）。 -->
+      <!-- 搜索结果（第二十二轮）：列表区的一种形态，与下面的目录内容互斥。
+           SearchResults **只渲染结果区自己的那几行**（列表行 / 网格格 / 空态 / 收尾统计，
+           加上「结果来自别的目录」与失败原因两行）；**表头不在这里**——列表的表头只有
+           上面那一份（`v-if="state.view === 'list'"`），它在**滚动容器外面**，目录与结果共用，
+           所以看结果时它不跟着滚，三列排序与权限切换对两边行为一致。 -->
       <SearchResults
         v-if="searchViewing"
         :sid="sid"

@@ -71,6 +71,7 @@
 | `static.go` | SPA 回退、缓存头三分类、base href 注入、unix socket 绑定、网关身份 |
 | `sftp.go` | SFTP 会话生命周期、远程路径校验、SFTP 错误映射 |
 | `files.go` | 文件列表与信息（list / info，含属主名字的会话内缓存） |
+| `files_search.go` | 文件搜索（`/api/fs/search`，流式 NDJSON；上限、取消与写失败语义见第 32、34 节） |
 | `files_write.go` | 新建文件 / 新建目录 / 重命名 / 删除 |
 | `files_upload.go` | 上传（本地文件、目录、飞牛文件） |
 | `files_download.go` | 下载（单文件流 / 目录打包 zip） |
@@ -79,7 +80,8 @@
 | `fileops.go` | 复制 / 移动 |
 | `archive.go` | 压缩 / 解压 |
 | `exportnas.go` | 导出至飞牛共享目录 |
-| `quickcmds.go` | 全局 + 会话专属快捷指令的持久化与 API |
+| `quickcmds.go` | 全局 + 会话专属快捷指令的持久化与 API（命令内容加密 + 明文迁移，见 29） |
+| `quickaccess.go` | 快捷访问（`/api/quickaccess/*`，按会话存的远程目录路径，见 30） |
 | `trimapi.go` | `/api/trim/*` 的 HTTP 入口（客户端在 `internal/trimapi`） |
 | `credentials.go` | 「不保存凭据」会话的内存凭据 |
 | `remote_exec.go` | 远程命令 helper（exec 通道 + `shellQuote` + 超时 + ctx 取消） |
@@ -392,6 +394,9 @@ frontend/src/
 │   ├── terminal/TerminalPane.vue  [B] 一个终端标签（xterm + WS）
 │   ├── terminal/KeypadBar.vue     [B] 移动端辅助键条
 │   ├── files/FileManager.vue      [C] 文件管理面板（工具栏 + 面包屑 + 列表/网格 + 菜单）
+│   ├── files/SearchBar.vue        [C] 搜索栏（输入框 / 「结果：x 项」/ 搜索 / 取消，见 32）
+│   ├── files/SearchResults.vue    [C] 结果区（行 / 网格 + 收尾统计 + 空态 + 失败原因，见 32）
+│   ├── files/NewEntryDialog.vue   [C] 新建弹窗（目录 / 文件二合一，见 33）
 │   ├── files/FileTree.vue         [C] 左栏文件树
 │   ├── files/BreadcrumbBar.vue    [C] 左栏按钮条（刷新 / 快捷访问 / 隐藏面包屑）
 │   ├── files/QuickAccessDialog.vue [C] 快捷访问弹窗（列表 + 手动输入 + 删除，见 30）
@@ -438,7 +443,7 @@ useHomeStore(): {
   loadInfo(): Promise<void>
   runtime: RuntimeInfo | null             // 运行信息（归档目录 / 导出目标）
   renameSession(id: string, name: string): Promise<SessionView>   // **唯一**改名入口（只发 {id,name}）
-  forgetSession(sid: string): void        // 摘掉前端状态（appTabs/terminals/sftp/fileEditor/sessionUi）
+  forgetSession(sid: string): void        // 摘掉前端状态（appTabs/terminals/sftp/fileEditor/quickAccess/sessionUi）
   handleTerminalGone(sid: string, uid: string): void   // 后端说这个终端没了（\x1b]gone\x07）
   watchBackendRestart(): void             // WS 掉线后探测后端是否换了进程
   restore(): Promise<string[]>            // 启动时：把后端仍在运行的会话恢复成应用标签，返回 sid 列表
@@ -484,7 +489,8 @@ export interface SftpState { dir: string; home: string; entries: FsEntry[]; load
                              treeLoading: Record<string, boolean>; selected: string[];
                              search: SftpSearch }
 // SftpSearch（第二十二轮，契约 32）：{ open, query, viewing, running, done, results: FsEntry[],
-//   scopeDir, scopeQuery, scanned, dirs, skipped, truncated, elapsedMs, error }
+//   scopeDir, scanned, dirs, skipped, truncated, elapsedMs, error }
+//   （`scopeQuery` 在第二十四轮删除：32.7 之后它只写不读，缓存只服务「回到上次结果」）
 // PermMode = 'symbolic'|'octal'（权限列显示模式，点表头「权限」切换；localStorage 里存的也是 'octal'）
 // SortState = { key: 'name'|'size'|'mtime'|null; dir: 'asc'|'desc' }（null = 不排序，回到服务端顺序）
 useSftpStore(): {
@@ -528,12 +534,14 @@ useSftpStore(): {
   // 权限列模式 / 排序
   toggleMode(sid: string): void; cycleSort(sid: string, key: string): void
   sorted(sid: string): FsEntry[]
+  sortedResults(sid: string): FsEntry[]     // 结果区复用同一份排序偏好（32.6；key 为 null 时保持到达顺序）
   // 搜索（第二十二轮，见 32）：openSearch 只是把栏打开（幂等）；只有 closeSearch 退出搜索
-  // （关键词与结果一起清掉）；runSearch 一个入口两种语义——正在看结果时 = 在当前目录重搜，
-  // 否则缓存命中就秒回上次的结果
+  // （关键词与结果一起清掉）。两个动作各有一个控件（32.7）：runSearch = 在当前目录搜一次，
+  // showSearchResults = 回到上次那批结果（只切视图、不发请求）
   openSearch(sid: string): void; closeSearch(sid: string): void
   leaveSearchResults(sid: string): void      // 列表区切回目录内容（导航时由 store 自己调）
   runSearch(sid: string): Promise<void>      // 关键词为空 → 抛错（调用方 toast）
+  showSearchResults(sid: string): void       // 「结果：x 项」按钮（没搜过时不动）
   forget(sid: string): void
 }
 
@@ -553,11 +561,22 @@ useQuickAccessStore(): {
   listOf(sid: string): string[]
   isLoading(sid: string): boolean; isFailed(sid: string): boolean
   ensure(sid: string): Promise<void>              // 幂等；同一个 sid 上并发只发一次请求
-  reload(sid: string): Promise<void>
+  reload(sid: string): Promise<void>   // 强制重拉：弹窗的「重试」走它（失败态由 failed 记，
+                                       // 原因文案留在弹窗里）
   add(sid: string, path: string): Promise<'added' | 'exists'>   // 路径非法 → 抛 Error；否则乐观更新 + 失败回滚
   remove(sid: string, path: string): Promise<void>
   isDialogOpen(sid: string): boolean; setDialog(sid: string, open: boolean): void
   forget(sid: string): void                       // home.forgetSession 会调它
+}
+
+// [C] stores/fileEditor.ts（契约 26.3 / 27）
+useFileEditorStore(): {
+  stateOf(sid: string): FileEditorState     // 按 sid 分片；新建分片要「赋值后再从 ref 读一次」，见 18.4
+  open(sid: string, path: string): Promise<void>   // 先 edit-load 探写权限，成功才进编辑页
+  save(sid: string): Promise<void>; revert(sid: string): Promise<void>
+  close(sid: string): void
+  isDirty(sid: string): boolean             // 关闭会话标签时的「未保存会丢」提醒（见 2610 行附近）
+  forget(sid: string): void                 // home.forgetSession 会调它
 }
 
 // [D] stores/settings.ts
@@ -573,7 +592,10 @@ cpuLevel(pct): StatLevel; loadLevel(load1, cores): StatLevel
 memLevel(used, total): StatLevel; diskLevel(pct): StatLevel
 statLevelClass(level: StatLevel): string        // 'text-success' | 'text-warning' | 'text-danger'
 useSessionStatsStore(): { statsOf(sid: string): SessionStats | undefined
-                          sync(sids: string[], visible: boolean): void }
+                          sync(sids: string[], visible: boolean): void
+                          // 定时器的生死由调用方（HomeView）负责：sync 是唯一的开表入口，
+                          // stop/dispose 是唯一的关表出口（组件卸载时要调，见 23.6）
+                          stop(): void; dispose(): void }
 
 // [D] stores/toast.ts
 useToastStore(): { toasts: {id:number;msg:string;type:'success'|'error'|'info'}[];
@@ -675,14 +697,15 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 ## 9. 验收与自测
 
 - 后端：`make test` 全绿（含 `testssh` 集成测试）。
-  ⚠️ 无 PTY 的环境（多数 CI 容器：`open /dev/ptmx: permission denied`）会**静默跳过** 11 个
-  PTY 用例（`requirePTY` → `t.Skip`），包括终端收发 / 单挂载点顶号 / 历史回放。看到「全绿」
+  ⚠️ 无 PTY 的环境（多数 CI 容器：`open /dev/ptmx: permission denied`）会**静默跳过** 10 个
+  PTY 用例（`requirePTY` → `t.Skip`），包括终端收发 / 单挂载点顶号 / 历史回放；本机还会多跳 1 个
+  `TestFsInfoCountError`（它依赖「0000 目录读不出子项」这个权限前提，见 34.2）。看到「全绿」
   时要顺带看一眼 skip 数，别把「没跑」当成「跑过了」。
 - 前端：`make check`（= `vue-tsc` + `check:i18n`）无错误；`make dev` 能成功产出 `./webssh`。
   **完整门禁是 `make test check`**。
-- i18n key 数：**以 `npm run check:i18n` 的实际输出为准（当前 zh/en 各 438）**。下面各轮小节
+- i18n key 数：**以 `npm run check:i18n` 的实际输出为准（当前 zh/en 各 468）**。下面各轮小节
   括号里的 key 数是**那一轮当时的快照**，有增有删、不保证单调，不要拿它当基准（历史上有
-  396/397/398/400/402 几个数字并存）。
+  396/397/398/400/402/438/469/470 几个数字并存，第 24 轮把这一处与各轮小节一起对齐到 468）。
 - 端到端（Lead 负责）：用 `testssh` 起一个本地 SSH/SFTP 服务，走完整流程——建会话 → 测试连接
   （首次要信任指纹）→ 打开会话 → 自动出现 1 个终端标签 → 输入命令有回显 → 新建第 2 个终端
   标签 → 文件管理浏览、上传（本地文件/目录）、下载、新建、重命名、删除 → 快捷指令（全局 +
@@ -2578,7 +2601,7 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 | 19 | 孤立 `\r` 一并归一成 LF（同第 1 条）：镜像层与 textarea 的行数从此一致，行号不再整列下移 |
 | 20 | `scan()` 的大小写回退改成**查询词与正文一起退回**区分大小写：只退一半时 `needle` 与查询词长度不同，会把内容切坏 |
 | 21 | `FileTree` 去掉从未被传进来的 `mobile` prop（唯一调用方只传 `sid`，值恒为 false） |
-| 22 | 「读的过程中变大」的超限文案不再报一个恒等于上限的体积（原来会显示「4.0 MB 超过上限 4.0 MB」），`/api/fs/read` 与 `/api/fs/image` 同改 |
+| 22 | 「读的过程中变大」的超限文案不再报一个恒等于上限的体积（原来会显示「4.0 MB 超过上限 4.0 MB」）。⚠️ **第十八轮只修了 `/api/fs/read` 那一侧**（它本来就用 `tooLarge` 布尔、不带体积），image 那一处漏了——**第二十四轮才真正改掉**（`files_preview.go` 的文案改成「图片在读的过程中变大，超过预览上限 4.0 MB」，见 34.2） |
 | 23 | AVIF 识别改为解析 ftyp 盒的 **compatible_brands**（`avif` 只出现在那里、major brand 是别的，是合法且常见的形态），并容错盒长自述为 0 的情况。`TestSniffImageTypeAVIFCompatibleBrands` 钉住 |
 | 24 | 关会话的确认文案在**编辑页有未保存内容**时追加一句（`files_editor_close_warning`，`fileEditor.isDirty` 由此从死代码变成在用） |
 | 25 | 编辑区行号幽灵块加 `v-memo="[i, line]"`：打字时只重新打补丁改动过的那一行。**实测**（无头 Chromium，20000 行）：每键 87.1ms → **9.2ms** |
@@ -2644,6 +2667,11 @@ README 的安全边界（必须由反代覆写、客户端可伪造；`upload-fr
   「同一张表里两条指令的密文互换」与「把专属表改名成 `global.json`」都会在解密时失败——
   否则按钮上写着乙的名字、点下去跑的是甲的命令。
   指令 id 在 `sanitizeQuickCmds` 补齐之后才加密，所以 id 是稳定不变的。
+  ⚠️ 两处**已知的边角**（第二十四轮审计，见 34.4）：① AAD 用 `:` 拼三段，所以
+  `(id="x", 作用域="a:b")` 与 `(id="x:a", 作用域="b")` 会拼出**同一个** AAD 字符串——
+  没有改编码是因为改它会让磁盘上已有的密文全部解不开（要另做一次全量重加密），改用
+  「两个入口都堵死」替代：非法 id 在迁移里重发、非法作用域文件名在扫描里跳过；
+  ② 同一张表里 id 重复时密文仍可互换——迁移现在会把重复/非法的 id 重发掉（见 34.4）。
 - **兼容第一轮**：老文件里 `content` 是**字符串**（明文）。`quickCmdStored.UnmarshalJSON`
   按 JSON 类型分流（字符串 = v1 明文、对象 = 信封），两种形态不会歧义，并给明文条目打上
   `legacy` 标记 → 由 29.3 的迁移就地加密重写。读这条路不能因为「格式旧」而失败
@@ -2660,16 +2688,25 @@ README 的安全边界（必须由反代覆写、客户端可伪造；`upload-fr
 - **两个触发点，缺一不可**（都走 `migrateQuickCmds` 这一份规则）：
   - `loadQuickCmdsFile`（读一张表时）：读到明文内容就地加密重写（`WriteJSON` = 临时文件 +
     rename，原子替换）。读接口因此带上了写副作用，这是「磁盘上不留明文」必须付的代价。
-  - `migrateAllQuickCmds`（`newAdminMux` 启动时）：`store.QuickCmdsScopes()` 扫
-    `quickcmds/*.json`，逐张表走同一条「读 → 迁移 → 需要时重写」。**只有这一步能覆盖
-    「没被打开过的会话」**——前端只加载全局表与当前会话的表，别的会话的表可能几个月都不被
-    读一次，明文就会一直躺着。（`QuickCmdsScopes` 按扩展名过滤，`WriteJSON` 的
-    `<名字>.json.tmp-*` 残渣天然不被当成表。）
+    ⚠️ 正因为带写副作用，「读 → 迁移 → 重写」与整表保存必须**互斥**（第二十四轮加的
+    `quickCmdsLocks`，按作用域一把锁）：否则迁移那份**过期快照**会把用户刚保存的表整表覆盖
+    （静默数据丢失；复审探针真并发 200 轮命中 6–9 轮）。`store.WriteJSON` 的锁只串行单次写，
+    覆盖不了这个跨步序列，见 34.4。
+  - `migrateAllQuickCmds`（`newAdminMux` 启动时，**早于 `srv.Serve`**，所以启动路径上不存在
+    与请求的并发）：`store.QuickCmdsScopes()` 扫 `quickcmds/*.json`，逐张表走同一条
+    「读 → 迁移 → 需要时重写」。**只有这一步能覆盖「没被打开过的会话」**——前端只加载全局表
+    与当前会话的表，别的会话的表可能几个月都不被读一次，明文就会一直躺着。
+    `QuickCmdsScopes` 只认 `global.json` 与 `<合法会话 id>.json`（第二十四轮收紧，见 34.4）：
+    `.json` / `a b.json` / `a:b.json` 这类名字一律跳过并记日志，`WriteJSON` 的
+    `<名字>.json.tmp-*` 残渣仍按扩展名过滤。
   - 启动那一遍失败只记日志（`logx.Warnf`）**不拦启动**：应用起不来比一条指令还是明文更糟；
     用户真的打开那张表时读路径会再迁移一次并报出明确原因。
 - **迁移规则**（`migrateQuickCmds`）：
   - 已经是信封的条目**原样保留**（不重新加密，少一次「解不开」的机会）；
   - 明文内容加密成功 → 换信封：内容与格式**逐字节不变**，`id`/`name`/`auto` 不动；
+  - **非法或重复的 id**（第二十四轮）→ 用 `store.NewID()` 重发（同表第一个出现的保留），
+    并按新 id 重新加密（AAD 才与新 id 一致）；解不开的密文条目在重发 id 时会**原样保留 + warn**
+    ——那条内容本来就取不回来，改 id 只会把「读表报错」变成「内容悄悄错位」。见 34.4。
   - **明文内容为空**（`Encrypt("")` 返回 nil——空内容存不下来）**或加密失败** → 换成
     `quickCmdMigrationPlaceholder`（「命令加密失败已清空，请重新添加」）的**密文**，并把
     `auto` 关掉（一句中文提示不该被「点一下就自动回车」当成命令跑到远端 shell 上）；
@@ -2782,6 +2819,8 @@ README 的安全边界（必须由反代覆写、客户端可伪造；`upload-fr
 - `SessionView` 在**切走这个会话标签时**关掉弹窗：弹窗 Teleport 到 `body`，而会话视图切标签只是
   `v-show` 隐藏——Teleport 出去的节点不在那棵 `display:none` 的子树里，会一直浮在首页/另一个
   会话上面。
+  **同一条规则也用在 `NewEntryDialog` 的两个宿主上**（`FileManager` / `FileTree` 各自 watch
+  `appTabs.activeId`，第二十四轮补，见 33.6）：遮罩挡住顶栏只是巧合，不能当成「点不到就不用关」。
 
 ### 30.4 冻结文件（本轮）
 
@@ -2939,11 +2978,25 @@ location /app/ {
   **10 层**（`maxSearchDepth`）、**15 秒**（`searchDeadline`）。
   子树里某个目录读不出来（权限 / 遍历途中被删）→ **跳过并继续**，计入 `skipped`；只有**起点**
   读不出来才算这次搜索失败。
+  ⚠️ 第二十四轮的补强：① `collect` 内层**每 512 条**也查一次 ctx 与总时限（原来只有「一个目录」
+  这个粒度，单个巨大目录里三道上限都不生效）；② 关键词先 `TrimSpace`，所以**搜不到名字以空格
+  结尾的项**（路径侧刻意不 trim，见 12.2）——这是取舍，不是 bug；③ 条目名拼路径前过
+  `safeRemoteEntryName`（空串 / `.` / `..` / 含 `/` 一律忽略并记日志），避免远端给的怪名字把
+  子目录队列带出起点子树。详见第 34 节。
 - 攒批：够 50 条立刻回，或距上次回流超过 200ms 也回（命中稀疏时保证「搜到一点显示一点」）。
-- 取消：客户端 abort → `r.Context()` 结束 → 遍历每层看一眼 ctx 主动退出（`ReadDir` 不认识
-  context）。`withSFTP` 的既有语义不变：ctx 结束时整条 SFTP 连接被丢掉、下次操作重拨。
-- 硬约束不变：目标路径 `path.Clean` + 拒绝 `..`；SFTP 通道仍由 `withSFTP` 串行化（一次搜索
-  最多占住这条会话的 SFTP 通道 15 秒，与压缩 / 导出同类）。
+- 取消：客户端 abort → `r.Context()` 结束 → 遍历每层（以及每 512 条）看一眼 ctx 主动退出；
+  **读目录本身也受约束**（第二十四轮加固，见 34.2 第 3 条）：`readDirBounded` 把本次搜索的
+  **剩余时间**做成 `ReadDirContext` 的 deadline、把请求 ctx 传进去——`Client.ReadDir` 内部是
+  `context.Background()`，`ReadDirContext` 才在每次 readdir 往返之间看 ctx，超时时还会把
+  **已经读到的条目**一起返回（照常处理，只标 `truncated`）。
+  **关键纪律（第二十四轮）**：本闭包**直接写响应**，所以必须用
+  `withSFTPStream`——它在丢掉连接之后会**等遍历协程退出**再返回；用 `withSFTP` 会让 handler
+  返回后协程继续写 ResponseWriter（net/http 明令禁止，实测 abort 后又写了 2000 条结果）。
+  写失败（客户端走了）一律返回 `errStreamClosed` 并**立刻终止**，**不**计入 `skipped`、不写
+  「跳过目录」日志（那是「客户端走了」，不是「远端权限问题」）；取消引发的 `connection lost`
+  同理（是我们自己关的连接）。
+- 硬约束不变：目标路径 `path.Clean` + 拒绝 `..`；SFTP 通道仍由 `withSFTP`/`withSFTPStream`
+  串行化（一次搜索最多占住这条会话的 SFTP 通道 15 秒，与压缩 / 导出同类）。
 
 ### 32.3 前端
 
@@ -2954,8 +3007,9 @@ location /app/ {
     `showSearchResults`（搜索栏的「结果：x 项」按钮）= **回到上一次那批结果**（只切
     `viewing`，一个请求都不发）。两个动作各有一个控件——第三轮返工要求：早先它们挤在「搜索」
     一颗按钮上，要按「现在是不是正在看结果」猜这次点下去是搜还是回，用户明确要求拆开。
-  - 缓存 = `results` + `scopeQuery` + `scopeDir`（起点以后端 `start` 记录解析出的绝对路径为准），
+  - 缓存 = `results` + `scopeDir`（起点以后端 `start` 记录解析出的绝对路径为准），
     生命周期与「这一次搜索」相同：**只有 `closeSearch`（点取消）会清掉它**。
+    （`scopeQuery` 在第二十四轮删除：它只写不读，见 34.5。）
   - **列表区显示结果还是目录**由 `search.viewing` 决定。**目录导航**（`navigate` / `back` /
     `forward` / `jumpTo` / `refresh`）把它置回 false —— 这就是「点结果里的目录跳进去看到的是
     那个目录的内容，而搜索栏与结果缓存都还在」。写操作之后的 `refreshDir` **不**置回
@@ -3095,7 +3149,7 @@ location /app/ {
   眼里就变成了「在当前目录重搜」，看起来「回到结果的逻辑消失了」。两个意思一颗按钮，怎么调都
   会有一半场景别扭。
 - **现在**：`runSearch`（搜索 / 回车）**永远**在当前目录搜一次；`showSearchResults` 是**唯一**的
-  「回到结果」入口（不发任何请求）。缓存（`results` + `scopeDir` + `scopeQuery`）依旧在，直到
+  「回到结果」入口（不发任何请求）。缓存（`results` + `scopeDir`）依旧在，直到
   点「取消」退出搜索才清掉——「进结果里的目录 → 点『结果：x 项』回结果 → 点『搜索』在当前目录
   重搜」这三步互不干扰。
 - **数量变按钮**：`files_search_count` / `files_search_running` / `files_search_rerun` 三条文案
@@ -3160,6 +3214,14 @@ location /app/ {
   换成 `files_rename_prompt`（新名称）——它原来为兼顾「新建」与「重命名」两个场景写的是「名称」，
   与文件管理器那边的重命名弹窗不一致。
 
+### 33.6 第二十四轮补充：切走应用标签时关掉「新建」弹窗
+
+`NewEntryDialog` 同样 Teleport 到 `body`（在会话视图那棵 `v-show` 子树之外），所以它的两个宿主
+（`FileManager.vue` / `FileTree.vue`）各自 `watch(() => useAppTabsStore().activeId, …)`：**切走
+这个会话的应用级标签就 `visible = false`**；**同一会话内切子标签不关**（`activeId` 不变，弹窗要
+留着）。判据只能是应用级标签——这与 `SessionView` 给 `QuickAccessDialog` 写的那条 watch 是同一条
+规则（见 30.3），不要依赖「遮罩盖住了顶栏所以点不到」。
+
 ### 33.4 冻结文件（本轮）
 
 - `frontend/src/i18n/zh.ts`、`frontend/src/i18n/en.ts`（新增 1 条、删除 2 条 key，两套字典一一
@@ -3189,3 +3251,110 @@ location /app/ {
 - **没有被自动化点过**：网格视图下的空白菜单（与列表视图共用同一个 `blankMenuItems`，第 6 条
   即覆盖它的取数逻辑）、移动端窄屏下弹窗三个按钮的换行表现（面板 `max-w-sm` + 三个按钮合计
   约 252px，360px 宽屏下仍有余量，但没实机截图）。
+
+---
+
+## 34. 第二十四轮：审查问题的修复与取舍（`.tmp/审查报告-第二十四轮-2026-10-16.md`）
+
+**基线** `4cd9b35`。这一轮是「审查 + 修复」：4 路并行复审（搜索后端与协议 / 快捷指令加密与
+快捷访问 / 前端新代码 / 上轮结论逐条复核）+ 真二进制运行时探针（38 项断言全过）。
+下面只记**改动与取舍**；问题本身的描述留在报告里。
+
+### 34.1 门禁（修完后的实测）
+
+`go vet` 干净 · `make test` 主包 **129 PASS / 10 SKIP / 0 FAIL**（skip 全是 `requirePTY` +
+`TestFsInfoCountError`）· `CGO_ENABLED=1 go test -race .` 通过 · `npm run type-check` 0 错误 ·
+`check:i18n` zh/en 各 **468** · 前端构建 + `go build` 产出 `./webssh`。
+
+### 34.2 搜索后端（`files_search.go` / `sftp.go` / `files_preview.go`）
+
+1. **`withSFTPStream`（新增）+ handler 与遍历协程 join**：搜索是唯一在 `withSFTP` 闭包里写响应
+   的接口。`withSFTP` 在 ctx 结束时立刻返回、闭包还在协程里跑，于是 handler 返回后协程继续写
+   `ResponseWriter`（net/http 明令禁止；实测 abort 之后又写了 41 次 / 453 KiB = 全部 2000 条结果）。
+   现在 `withSFTPStream` 在丢掉连接后**等闭包退出**（最多 `streamJoinTimeout` = 5s，超时只记
+   日志——宁可留一条日志，也不为了等协程把 `sftpMu` 无限期攥住）。`withSFTP` 语义不变
+   （它**不等**，正确性依赖「闭包不碰响应」这条纪律），两者共用 `withSFTPJoin`。
+   回归用例：`TestFsSearchStopsWritingAfterCancel`。
+2. **`errStreamClosed` 哨兵**：闭包里的写失败（客户端走了）与「这个子目录读不出来」必须分开。
+   原来任何 error 都走 `skipped++` + `logx.Warnf("搜索跳过目录 …：connection lost")`——把「没人
+   读了」说成「远端权限问题」，统计里还多一个目录。现在：写失败 → `errStreamClosed` → 直接终止、
+   不记 `skipped`、不写「跳过目录」；取消引发的 `connection lost` 同理（是我们自己 `dropSFTP`
+   造成的，见 `run` 里 `w.ctx.Err() != nil` 那一档）。
+   回归用例：`TestFsSearchWriteFailureNotCountedAsSkipped`、`TestFsSearchCancelInducedReadFailureNotSkipped`。
+3. **目录读取本身也受 ctx/时限约束（`readDirBounded`，同轮加固）**：
+   - `collect` 内层每 512 条查一次 ctx 与总时限（原来只有「一个目录」这个粒度）；
+   - 读目录改用 **`Client.ReadDirContext(deadlineCtx, dir)`**：`Client.ReadDir` 内部是
+     `ReadDirContext(context.Background())`，所以「单个巨大目录」内部既取消不动、也不受 15 秒
+     限制（这条请求还占着会话的 `sftpMu`，一个几十万条目的目录会把整个文件管理拖住）。现在
+     **剩余时间**就是这次 `ReadDirContext` 的 deadline、**用户的取消**就是它的父 ctx；
+     超时时库会把**已经读到的条目**一起返回，我们照常处理这部分并标 `truncated`（界面照实说
+     「已截断」）。起点目录走同一条路（起点本身也可能是个巨大目录）。
+   - 回归用例：`TestFsSearchReadDirBoundedRespectsDeadline`（时间已用光 → 不真读、不报错、
+     `truncated=true`）、`TestFsSearchReadDirBoundedReportsClientGone`（已取消 → `errStreamClosed`）。
+   - **仍然存在的边界（如实写）**：`pkg/sftp` v1.13.11 没有分批读目录的接口，所以**内存峰值仍是
+     一个目录的完整列表**（现在受时间约束，且读完后立刻按 `maxSearchScanned` 的剩余预算截断）。
+     `pkg/sftp` 若将来提供分批 API，这是第一顺位。
+4. **`safeRemoteEntryName`**：条目名来自对端，拼路径前挡一道（空串 / `.` / `..` / 含 `/` 忽略并
+   记日志），避免远端给的怪名字把子目录队列带出起点子树（ReadDir 正常不会给出这种名字）。
+   回归用例：`TestSafeRemoteEntryName`。
+5. **图片预览的「读的过程中变大」文案**：上轮 F-22 只修了 `fs/read` 那一侧，image 那一处漏了
+   （它报的体积恒等于上限 + 1 字节，于是出现「图片 4.0 MB 超过预览上限 4.0 MB」）。现在改成
+   「图片在读的过程中变大，超过预览上限 4.0 MB」。
+6. **关键词 `TrimSpace` 的取舍写进 32.2**：搜不到「名字以空格结尾」的项（路径侧不 trim 是刻意的）。
+
+### 34.3 流式接口的两条纪律（写给下一个改搜索的人）
+
+- 在 `withSFTP` 闭包里写响应 → 必须用 **`withSFTPStream`**。
+- 闭包里的「写不出去」→ 返回 **`errStreamClosed`**，别混进 `skipped`。
+两条都记进了 AGENTS 第 5 节，一条是 net/http 的硬要求，一条是日志/统计的归因正确性。
+
+### 34.4 快捷指令（`quickcmds.go` / `internal/store/store.go`）
+
+1. **读路径与保存的互斥（`quickCmdsLocks`）**：`loadQuickCmdsFile` 的「读 → 迁移 → 重写」带写
+   副作用，与 `saveQuickCmds` 的整表写交错时，迁移那份**过期快照**会覆盖用户刚保存的表
+   （复审探针真并发 200 轮命中 6–9 轮，静默数据丢失）。现在两者各持同一把**按作用域**的锁
+   （`store.WriteJSON` 的锁只串行单次写，覆盖不了这个跨步序列）。`migrateAllQuickCmds` 不自己
+   持锁（锁在 `loadQuickCmdsFile` 里取），启动路径与请求路径不会死锁。
+   ⚠️ **触达前提要说清**：正常启动时 `migrateAllQuickCmds` 在 `srv.Serve` **之前**跑完，所以
+   「升级后第一次读某张表」这条常规路径上并不存在并发；真正会撞上的是「运行期数据目录里又出现
+   明文表」（手工从备份恢复 `quickcmds/*.json`、上一次迁移失败留下的重试）。锁仍然值得加：
+   它是 10 行，且这类残留在真实运维里出现过。回归用例：`TestQuickCmdsMigrationSaveLostUpdate`。
+2. **非法/重复 id 重发**：手工文件里 id 非法（含 `:` 等，`!store.ValidID`）或同表重复时，迁移
+   用 `store.NewID()` 重发（表内第一个出现的保留）并按新 id 重新加密；解不开的密文条目在重发
+   时**原样保留 + warn**（内容本来就取不回来，改 id 只会把「读表报错」变成「内容悄悄错位」）。
+   回归用例：`TestQuickCmdsReissuesDupAndInvalidIDs`。
+3. **`QuickCmdsScopes` 收紧**：只认 `global.json` 与 `<合法会话 id>.json`；`.json`（旧写法削成
+   空串 → 会被当成**全局**表去迁移）、`a b.json`、`a:b.json` 一律跳过并记日志。
+   回归用例：`TestQuickCmdsScopesOnlyAcceptsScopeFilenames`。
+4. **AAD 的残余歧义（记录，刻意不改）**：`webssh:v1:quickcmd:<id>:<作用域>` 用 `:` 拼段，
+   所以 `(id="x", sid="a:b")` 与 `(id="x:a", sid="b")` 拼出同一个 AAD、密文可互换（实测）。
+   **改编码会让磁盘上已有的密文全部解不开**（要另做一次全量重加密），所以本轮改用「把两个入口
+   堵死」：非法 id 重发（上一条）+ 非法作用域文件名跳过（上上条）。
+5. **删会话顺序**：改为**先删会话配置**，成功后再删历史 / 专属快捷指令 / 快捷访问（附属删除失败
+   只记日志）。反过来会在 `DeleteSession` 失败时留下「会话还在、附属表没了」且无法恢复。
+
+### 34.5 前端
+
+- **快捷访问加载失败可见**（`stores/quickAccess.ts`）：`failed` 原来唯一的写入点是 `false`，
+  于是 `isFailed` 恒假——`/api/quickaccess/list` 失败时弹窗显示「还没有快捷访问路径」，
+  原因与「重试」按钮全是死代码（违反 30.3 与 AGENTS「失败必须给原因」）。现在失败置 `true`
+  并保留 `loaded=false`（下次 `ensure` 会再拉），弹窗显示原因 + 可重试。
+- **`SftpSearch.scopeQuery` 删除**：32.7 之后没有读取者（缓存只服务「回到上次结果」，只切视图），
+  留着是死字段；`stores/sftp.ts` 里那句「与输入框一致才算缓存命中」的注释同步删掉。
+- **「新建」弹窗随切走会话标签关闭**：`NewEntryDialog` Teleport 到 body，不会被会话视图的
+  `v-show` 隐藏，与 `QuickAccessDialog` 同一条规则（`FileManager` / `FileTree` 各自 watch
+  `appTabs.activeId`）。
+- **注释纠偏**：`FileManager` 里「表头 / 行 / 空态都在 `SearchResults` 里」与实现相反
+  （32.6 起表头只有一份、在滚动容器外）；`stores/sessionStats.ts` 的「见 CONTRACT 23.6」改成
+  第 24 节；`serverapi/index.ts` 的搜索注释从「按相对路径匹配」改成「按名字匹配」（32.6）。
+
+### 34.6 本轮**刻意不做**的决定（避免下一轮重复审）
+
+1. **不给 POST 接口加 `Origin` 校验、也不要求 JSON `Content-Type`**。审查里曾把它列为加固项
+   （跨站 simple request 在协议层可用；是否成功取决于飞牛网关 cookie 的 SameSite，未能证实）。
+   用户明确：**终端 WS 校验 Origin 这件事不是问题，以后不要再验证，也不要尝试改动**。
+   → 后续任何一轮审查都不再把这条列为发现。
+2. **搜索结果区禁用右键菜单不补反馈**（用户明确：不需要反馈）。`FileManager.onBlankContext`
+   在 `searchViewing` 时提前返回，因此自定义菜单与原生菜单都不出现——**这是刻意的**，
+   别再当成「点了没反应」的缺陷。
+3. **单个大目录的 `ReadDir` 不改**（见 34.2 第 3 条的说明）。

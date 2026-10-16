@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path"
@@ -49,9 +51,11 @@ import (
 //
 // 隐藏文件**不过滤**：这是文件管理器，不是「找图片」的搜索框，`~/.bashrc` 该能搜到。
 //
-// 取消：客户端点「取消」→ fetch abort → `r.Context()` 结束。遍历每层都看一眼 ctx 主动退出
-// （ReadDir 不认识 context，靠它自己发现断开要等下一次往返）。已经开流时错误只能写成一行，
-// 而客户端已经走了——那行写不出去就算了。
+// 取消与超时：客户端点「取消」→ fetch abort → `r.Context()` 结束。遍历每层、`collect` 内层每
+// 512 条都看一眼 ctx；**读目录本身也受约束**（`readDirBounded` 把剩余时间做成 deadline、把请求
+// 的 ctx 传进 `ReadDirContext`，所以「单个巨大目录」内部也能被取消、也会撞上 15 秒上限）。
+// 已经开流时错误只能写成一行，而客户端已经走了——那行写不出去就算了（见 errStreamClosed）。
+// 在闭包里写响应这条路的纪律见 `withSFTPStream`（sftp.go）。
 // ---------------------------------------------------------------------------
 
 const (
@@ -118,12 +122,27 @@ type searchRecord struct {
 // 响应头，状态码就定死成 200，再报错只能在正文里说。所以这里懒写头：`wrote` 就是「这次错误
 // 还能不能用普通 JSON 回」的判据。
 type searchStream struct {
-	w     http.ResponseWriter
+	// ctx 是本次请求的 context：每次写之前先看它。客户端走了（点取消 / 关页面）之后**一个字节
+	// 都不要再写**——理由见 withSFTPStream（net/http 要求 Handler 返回后不得再用 ResponseWriter，
+	// 而遍历协程可能比 handler 多活一会儿）。
+	ctx context.Context
+	w   http.ResponseWriter
+	// wrote 表示响应头已经写出去（= 这次错误只能写正文，不能用状态码表达）
 	wrote bool
 }
 
-// line 写一行记录并 flush；返回错误说明客户端已经走了（写失败）。
+// errStreamClosed 表示「客户端已经走了、响应写不出去了」。
+//
+// 它必须与「目录读不出来」区分开：跑批循环原来把任何 error 都算成「跳过这个目录」，
+// 于是一次 abort 会在日志里留下 `搜索跳过目录 …：connection lost`、`skipped` 还多一个
+// ——把「没人要了」说成「远端权限问题」，排查的人会被带到错的方向。
+var errStreamClosed = errors.New("响应已不可写（客户端已断开）")
+
+// line 写一行记录并 flush；返回 errStreamClosed 说明客户端已经走了（ctx 结束或写失败）。
 func (s *searchStream) line(rec searchRecord) error {
+	if err := s.ctx.Err(); err != nil {
+		return errStreamClosed
+	}
 	if !s.wrote {
 		h := s.w.Header()
 		h.Set("Content-Type", searchContentType)
@@ -140,7 +159,8 @@ func (s *searchStream) line(rec searchRecord) error {
 	}
 	raw = append(raw, '\n')
 	if _, err := s.w.Write(raw); err != nil {
-		return err
+		// 写不出去 = 客户端走了（连接被 reset / 关掉）。按「流已关闭」处理，别当服务端故障。
+		return fmt.Errorf("%w：%v", errStreamClosed, err)
 	}
 	if f, ok := s.w.(http.Flusher); ok {
 		f.Flush()
@@ -217,7 +237,7 @@ func (m *AdminMux) handleFsSearch(w http.ResponseWriter, r *http.Request) *apier
 		return apiErr
 	}
 
-	out := &searchStream{w: w}
+	out := &searchStream{ctx: r.Context(), w: w}
 	walk := &searchWalk{
 		ctx:     r.Context(),
 		out:     out,
@@ -226,7 +246,10 @@ func (m *AdminMux) handleFsSearch(w http.ResponseWriter, r *http.Request) *apier
 	}
 	walk.buf = &searchBuf{stream: out, lastFlush: time.Now()}
 
-	opErr := rt.withSFTP(r.Context(), func(sess *sftpSession) error {
+	// withSFTPStream 而不是 withSFTP：本闭包直接往响应里写（流式 NDJSON），而 withSFTP 在 ctx
+	// 结束时**不等**闭包退出——handler 返回之后协程还在写 ResponseWriter 是 net/http 明令
+	// 禁止的（实测 abort 后又写了 2000 条结果）。withSFTPStream 会等闭包退出再返回。
+	opErr := rt.withSFTPStream(r.Context(), func(sess *sftpSession) error {
 		root, err := resolveRemotePath(sess, req.Path)
 		if err != nil {
 			return err
@@ -236,9 +259,13 @@ func (m *AdminMux) handleFsSearch(w http.ResponseWriter, r *http.Request) *apier
 		// 字节都还没出去，可以走普通的 JSON 错误响应（带 403/404/502 与裸码），前端据此显示
 		// 「读取目录失败：权限不足」这种明确提示。开流之后再报错，状态码只能钉死 200，界面
 		// 只能显示正文里的一句话——差的不是一点。
-		rootInfos, err := sess.client.ReadDir(root)
+		// 起点也可能是个几十万条目的目录，所以同样走 readDirBounded（上限/取消在目录内部生效）。
+		rootInfos, rootTruncated, err := walk.readDirBounded(root)
 		if err != nil {
 			return err
+		}
+		if rootTruncated {
+			walk.truncated = true
 		}
 		// start 是流里的第一行：前端据此把每条结果的 path 折成相对路径，也据此记住这批结果
 		// 属于哪个目录（跨目录时的提示、以及「再点搜索秒回」的判据都要它）。
@@ -257,9 +284,13 @@ func (m *AdminMux) handleFsSearch(w http.ResponseWriter, r *http.Request) *apier
 			// 一个字节都没出去：按普通 JSON 错误回（带状态码），前端走 ApiError 那条路。
 			return fsError("搜索失败", opErr)
 		}
+		if errors.Is(opErr, errStreamClosed) || r.Context().Err() != nil {
+			// 客户端已经走了（点取消 / 关页面）：这行错误没有读者，写它只是白写一次。
+			// 此刻遍历协程已经被 withSFTPStream 等回来了，返回是安全的。
+			return nil
+		}
 		// 已经开流：状态码早就发出去了，错误只能作为一行写回去。裸码必须照 fsError 的口径
-		// 翻译（permission → 界面「权限不足」），不能一律 internal。客户端自己断开时这一行
-		// 也写不出去（写失败），那就没什么可做的了——那次请求已经结束。
+		// 翻译（permission → 界面「权限不足」），不能一律 internal。
 		apiErr := fsError("搜索失败", opErr)
 		_ = out.line(searchRecord{Type: "error", Code: apiErr.Code, Error: apiErr.Message})
 		return nil
@@ -291,9 +322,11 @@ func (w *searchWalk) run(rootInfos []os.FileInfo) error {
 	queue := children
 	for len(queue) > 0 {
 		// 客户端点「取消」/ 关页面 → ctx 结束。协作式退出：这里主动停下，而不是等某个 SFTP
-		// 调用失败（ReadDir 不认识 context，一个卡住的远方目录会一直等下去）。
+		// 调用失败（读目录虽然已经带 ctx，但一次调用仍可能跨多个往返，见 readDirBounded）。
+		// 返回 errStreamClosed（而不是 ctx 的 error）：调用方据此知道「是客户端走了」，
+		// 不必再往一个没人读的响应里写错误行。
 		if err := w.ctx.Err(); err != nil {
-			return err
+			return errStreamClosed
 		}
 		if time.Since(w.started) > searchDeadline {
 			w.truncated = true
@@ -303,6 +336,18 @@ func (w *searchWalk) run(rootInfos []os.FileInfo) error {
 		queue = queue[1:]
 		children, err := w.scanDir(node.path, node.depth)
 		if err != nil {
+			// 「写不出去」不是「这个目录读不出来」：前者说明客户端已经走了，直接终止；
+			// 记成 skipped 会在日志里留下 `跳过目录 …：connection lost`，把排查的人引到
+			// 「远端权限」那个错方向，统计里还会凭空多一个目录。
+			if errors.Is(err, errStreamClosed) {
+				return err
+			}
+			// 同理：ctx 已经结束（用户点了取消）时这条错误多半是**我们自己**造成的——
+			// withSFTP 在取消的瞬间会关掉整条 SFTP 连接，正在飞的 ReadDir 于是报
+			// `connection lost`/`EOF`。那不是远端的问题，别记 skipped、别写「跳过目录」。
+			if w.ctx.Err() != nil {
+				return errStreamClosed
+			}
 			// 子树里某个目录读不出来（权限 / 遍历途中被删）**跳过并继续**：一个没权限的
 			// 目录不该让整次搜索失败。跳过了几个目录，界面在收尾统计里会说。
 			w.skipped++
@@ -323,11 +368,54 @@ func (w *searchWalk) run(rootInfos []os.FileInfo) error {
 
 // scanDir 读一个子目录（起点那一层由 run 直接用已经读好的内容，走 collect）。
 func (w *searchWalk) scanDir(dir string, depth int) ([]searchDirNode, error) {
-	infos, err := w.sess.client.ReadDir(dir)
+	infos, truncated, err := w.readDirBounded(dir)
 	if err != nil {
 		return nil, err
 	}
+	if truncated {
+		w.truncated = true
+	}
 	return w.collect(dir, depth, infos)
+}
+
+// readDirBounded 读一个目录，并让**本次搜索的 ctx 与 15 秒上限作用到目录内部**。
+// 返回 (条目, 是否因超时截断, err)；err = errStreamClosed 表示客户端已经走了。
+//
+// 为什么不能直接用 `sess.client.ReadDir`：`pkg/sftp` v1.13.11 的 `Client.ReadDir` 内部就是
+// `ReadDirContext(context.Background(), p)`，而且**整个包没有分批读目录的接口**
+// （只有 `Client.ReadDir` / `Client.ReadDirContext` 两个）。于是「一个目录里有几十万条目」
+// 这种情形下：取消点不动（ctx 是 Background）、15 秒上限要等整目录读完才轮得到、20 万条上限
+// 也在读完才检查——三道上限在**目录内部**全部失效，而这条请求还占着该会话的 `sftpMu`。
+//
+// `ReadDirContext` 会在每次 readdir 往返之间检查 ctx（`clientConn.sendPacket` 的 ctx 分支），
+// 所以：把**剩余时间**做成它的 deadline、把**用户的取消**做成它的父 ctx，取消与超时就都能
+// 在目录内部生效。超时时它会**把已经读到的条目一起返回**（库的注释与实现都这么写），
+// 我们照常处理这部分结果，只把 `truncated` 标上——界面会说「已截断」，而不是假装搜完了。
+//
+// 仍然存在的边界（如实写清）：内存峰值仍是「一个目录的完整列表」（库没有分批接口，改不了），
+// 但它现在受**时间**约束，且读完之后立刻按 `maxSearchScanned` 的剩余预算截断
+// （见 collect 里那一档），不会把几十万条全带进遍历。
+func (w *searchWalk) readDirBounded(dir string) ([]os.FileInfo, bool, error) {
+	if w.ctx.Err() != nil {
+		return nil, false, errStreamClosed
+	}
+	// 不新增限制：deadline 就是本次搜索的总时限（searchDeadline）减去已经用掉的时间。
+	ctx, cancel := context.WithDeadline(w.ctx, w.started.Add(searchDeadline))
+	defer cancel()
+	infos, err := w.sess.client.ReadDirContext(ctx, dir)
+	switch {
+	case err == nil:
+		return infos, false, nil
+	case w.ctx.Err() != nil:
+		// 用户点了取消 / 关了页面：withSFTPStream 会把整条连接丢掉，这里如实报「客户端走了」
+		// （不当成「这个目录读不出来」，否则日志与 skipped 都会指错方向）。
+		return nil, false, errStreamClosed
+	case errors.Is(err, context.DeadlineExceeded):
+		// 到 15 秒上限：用已经读到的部分继续（truncated 由调用方记）。
+		return infos, true, nil
+	default:
+		return nil, false, err
+	}
 }
 
 // collect 处理一个目录的内容：命中的写进缓冲，返回要接着遍历的子目录。
@@ -342,14 +430,34 @@ func (w *searchWalk) collect(dir string, depth int, infos []os.FileInfo) ([]sear
 		return infos[i].Name() < infos[j].Name()
 	})
 	var children []searchDirNode
-	for _, fi := range infos {
+	for i, fi := range infos {
+		// 每 512 条看一次 ctx 与总时限：外层循环的检查粒度是「一个目录」，而一个巨大目录
+		// （几万条）够跑很久——这里补一道批内检查，至少让「读完之后的那段遍历」能停下。
+		// 取 512 是因为它比 ReadDir 的往返批次（约 100 条）粗、又远小于一次遍历的量：
+		// 检查本身的成本可以忽略。
+		if i%512 == 0 {
+			if w.ctx.Err() != nil {
+				return children, errStreamClosed
+			}
+			if time.Since(w.started) > searchDeadline {
+				w.truncated = true
+				return children, nil
+			}
+		}
 		w.scanned++
 		if w.scanned > maxSearchScanned {
 			w.truncated = true
 			return children, nil
 		}
-		full := path.Join(dir, fi.Name())
-		if matchSearch(fi.Name(), w.needle) {
+		name := fi.Name()
+		// 名字来自对端，拼路径前按最小信任原则挡一道：`..` 会让子目录队列走出起点子树
+		// （ReadDir 正常不会给出这种名字，真给了也只影响这次搜索，不会越权读别的路径）。
+		if !safeRemoteEntryName(name) {
+			logx.Warnf("搜索忽略形态异常的条目名 %q（目录 %s）", name, dir)
+			continue
+		}
+		full := path.Join(dir, name)
+		if matchSearch(name, w.needle) {
 			// 与列目录用同一个构造函数：软链接的指向、失效标记、mode/mtime 的口径只有一份
 			// （软链接会多两次往返，但软链接本来就少，一致性比这点开销值）。
 			w.hits++
@@ -368,6 +476,15 @@ func (w *searchWalk) collect(dir string, depth int, infos []os.FileInfo) ([]sear
 		}
 	}
 	return children, nil
+}
+
+// safeRemoteEntryName 判断远端给的条目名能不能拼进路径。
+//
+// 正常情况下 ReadDir 不会给出空串 / `.` / `..` / 含 `/` 的名字（那是目录项自己），但名字毕竟
+// 来自对端：`..` 段会让子目录队列走出起点子树。挡在这里，症状也清楚（日志里一条，且不会
+// 变成一个指向起点之外的“结果”）。
+func safeRemoteEntryName(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsRune(name, '/')
 }
 
 // matchSearch 判断一个条目**自己的名字**是否命中关键词。
