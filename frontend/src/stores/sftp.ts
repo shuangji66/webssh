@@ -31,6 +31,12 @@
 //   jumpTo（第二十轮）                       「先探测、成功了才切过去」的跳转（快捷访问的点击）：
 //                                          列目录失败时**不动任何展示状态**，把异常抛给调用方去报错，
 //                                          所以它不取代 navigate（普通导航仍然「先切、再显示错误」）
+//   state.search / openSearch / closeSearch / runSearch / showSearchResults /
+//   leaveSearchResults / sortedResults
+//                                          （第二十二轮，契约 32）搜索：搜索栏 + 结果 + 「列表区显示
+//                                          的是结果还是目录内容」。runSearch 只管「在当前目录搜一次」，
+//                                          回到上次的结果走 showSearchResults（缓存，不发请求）；
+//                                          sortedResults 让结果与目录共用同一份排序偏好。
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { t } from '@/i18n'
@@ -114,6 +120,8 @@ export interface SftpState {
    * 用户想选三个文件还得先全选再逐个取消。
    */
   multi: boolean
+  /** 搜索（第二十二轮）：搜索栏 + 结果 + 「列表区显示的是结果还是目录」。 */
+  search: SftpSearch
 }
 
 /**
@@ -123,6 +131,65 @@ export interface SftpState {
  * 多一行「···更多文件」，点它去文件管理打开该目录（契约 26.4）。
  */
 export const TREE_FILE_LIMIT = 20
+
+/**
+ * 搜索的展示状态（第二十二轮，契约 32）：一次「搜索」的生命周期。
+ *
+ * 它同时管三件事，所以放在一份状态里而不是撒成几个 ref：
+ *  1. 搜索栏本身（`open` / `query` / 进度与统计）；
+ *  2. 结果列表（`results`，**边搜边追加**：搜到一点显示一点）；
+ *  3. 列表区当前显示的是结果还是目录内容（`viewing`）——用户要求「点结果里的目录跳进去时
+ *     搜索栏留着、再点搜索快速回到结果」，靠的就是结果在那段时间里一直缓存着
+ *     （`results` + `scopeQuery` + `scopeDir` 就是那份缓存）。
+ */
+export interface SftpSearch {
+  /** 搜索栏是否显示（只有「取消」会把它收起来） */
+  open: boolean
+  /** 输入框里的文本（回车 / 点「搜索」才真的开搜） */
+  query: string
+  /** 列表区当前显示的是搜索结果（false = 显示当前目录的内容） */
+  viewing: boolean
+  /** 正在搜：结果还在往里追加 */
+  running: boolean
+  /** 这一轮已经结束（含被截断）；running=false 且 done=true 才是「搜完了」 */
+  done: boolean
+  /** 已收到的结果（缓存） */
+  results: FsEntry[]
+  /** 这批结果是在哪个目录下搜出来的（后端解析后的**绝对**路径：结果靠它折成相对路径） */
+  scopeDir: string
+  /** 这批结果对应的关键词（与输入框一致才算缓存命中） */
+  scopeQuery: string
+  /** 已扫描的条目数 / 目录数（后端节流回传） */
+  scanned: number
+  dirs: number
+  /** 读不出来被跳过的目录数（权限等），收尾统计里说明 */
+  skipped: number
+  /** 触到上限提前结束：界面必须说「已截断」 */
+  truncated: boolean
+  /** 用时（毫秒） */
+  elapsedMs: number
+  /** 失败原因（空 = 正常）；已经搜到的部分照常显示 */
+  error: string
+}
+
+function blankSearch(): SftpSearch {
+  return {
+    open: false,
+    query: '',
+    viewing: false,
+    running: false,
+    done: false,
+    results: [],
+    scopeDir: '',
+    scopeQuery: '',
+    scanned: 0,
+    dirs: 0,
+    skipped: 0,
+    truncated: false,
+    elapsedMs: 0,
+    error: ''
+  }
+}
 
 /** 视图偏好（列表 / 网格）的持久化键。纯界面偏好：跟随浏览器，不落后端、不随会话走。 */
 const VIEW_KEY = 'webssh-files-view'
@@ -193,7 +260,8 @@ function blankState(): SftpState {
     expanded: [],
     treeLoading: {},
     selected: [],
-    multi: false
+    multi: false,
+    search: blankSearch()
   }
 }
 
@@ -466,6 +534,10 @@ export const useSftpStore = defineStore('sftp', () => {
       if (st.dir) st.back.push(st.dir)
       st.forward = []
     }
+    // 目录导航一律把列表切回「目录内容」（搜索栏与结果缓存留着，点「搜索」就回来）：
+    // 点结果里的目录、点面包屑、后退/上一层都是同一个动作——用户要看的是那个目录，
+    // 而继续显示搜索结果等于「点了没反应」。见 leaveSearchResults 的说明。
+    leaveSearchResults(sid)
     await loadDir(sid, target)
   }
 
@@ -474,6 +546,7 @@ export const useSftpStore = defineStore('sftp', () => {
     const prev = st.back.pop()
     if (prev === undefined) return
     if (st.dir) st.forward.push(st.dir)
+    leaveSearchResults(sid)
     await loadDir(sid, prev)
   }
 
@@ -499,6 +572,7 @@ export const useSftpStore = defineStore('sftp', () => {
       st.forward = []
     }
     st.error = ''
+    leaveSearchResults(sid)
     applyListing(sid, st, res)
   }
 
@@ -507,11 +581,15 @@ export const useSftpStore = defineStore('sftp', () => {
     const next = st.forward.pop()
     if (next === undefined) return
     if (st.dir) st.back.push(st.dir)
+    leaveSearchResults(sid)
     await loadDir(sid, next)
   }
 
   /** 强制重新拉当前目录（外部的改动、别的设备写的文件靠它看到）。 */
   async function refresh(sid: string): Promise<void> {
+    // 「刷新」是用户显式地要重读**这个目录**：连同列表一起切回目录内容（不然刷新在结果视图
+    // 里完全看不见，等于点了没反应）。搜索栏与结果缓存照旧留着。
+    leaveSearchResults(sid)
     await loadDir(sid, stateOf(sid).dir, true)
   }
 
@@ -552,6 +630,21 @@ export const useSftpStore = defineStore('sftp', () => {
     const { key, dir } = st.sort
     if (!key) return st.entries
     return [...st.entries].sort((a, b) => compareEntries(a, b, key, dir))
+  }
+
+  /**
+   * 排好序的**搜索结果**（模板用）：与目录列表共用同一份排序偏好与同一套比较规则
+   * （用户要求「复用排序」——表头点一下两边都跟着变）。
+   *
+   * 未启用排序（`sort.key === null`）时保持**到达顺序**：后端按 BFS 边搜边回，顺序是「先近
+   * 后远」，而且每来一批就往里追加——这正是「搜到一点显示一点」要的样子。一旦用户点了表头，
+   * 就按他选的那一列排（新到的批次也参与，重排是用户自己要的）。
+   */
+  function sortedResults(sid: string): FsEntry[] {
+    const st = stateOf(sid)
+    const { key, dir } = st.sort
+    if (!key) return st.search.results
+    return [...st.search.results].sort((a, b) => compareEntries(a, b, key, dir))
   }
 
   /** 展开 / 收起树节点；展开时才懒加载子目录。 */
@@ -859,11 +952,147 @@ export const useSftpStore = defineStore('sftp', () => {
   function forget(sid: string) {
     delete states.value[sid]
     inited.delete(sid)
+    abortSearch(sid)
+    searchAbort.delete(sid)
+    searchSeq.delete(sid)
     for (const key of [...loadedDirs]) {
       if (key.startsWith(`${sid}\u0000`)) loadedDirs.delete(key)
     }
     // 剪贴板里的路径属于这个会话的远程主机：会话没了，路径也就没有意义了。
     if (clipboard.value?.sid === sid) clipboard.value = null
+  }
+
+  // ---------- 搜索（第二十二轮，契约 32） ----------
+
+  /**
+   * 搜索的中断控制与轮次账本（闭包账本，不进 SftpState——它是请求记账，不是展示状态）。
+   *
+   * 一个会话同时只可能有一次在跑的搜索（再点一次「搜索」就是重搜，前一次会被中断），所以
+   * 每个 sid 一个 controller 就够。`seq` 是给**迟到的那一轮**用的：被取代的那次请求回来时
+   * 不能再往状态里写（否则新结果会被旧结果覆盖，或者 running 被旧的清掉）。
+   */
+  const searchAbort = new Map<string, AbortController>()
+  const searchSeq = new Map<string, number>()
+
+  /** 掐掉正在跑的那一轮（如有），并让它的后续回调全部失效。 */
+  function abortSearch(sid: string) {
+    searchAbort.get(sid)?.abort()
+    searchAbort.delete(sid)
+    searchSeq.set(sid, (searchSeq.get(sid) ?? 0) + 1)
+  }
+
+  /** 打开搜索栏（工具栏的搜索图标）。幂等：不清关键词、也不清上一次的结果。 */
+  function openSearch(sid: string) {
+    stateOf(sid).search.open = true
+  }
+
+  /**
+   * 退出搜索：收起搜索栏，**关键词与结果一起清掉**。
+   *
+   * 缓存（结果 + 关键词 + 起点目录）只服务「从结果跳进目录之后再点搜索秒回」这一件事，
+   * 生命周期与「这一次搜索」相同。用户点「取消」就是在说这次搜索结束了，留着它下次打开
+   * 搜索栏又冒出来，反而像没退出。正在跑的那一轮一并掐掉（后端也会停掉遍历）。
+   */
+  function closeSearch(sid: string) {
+    abortSearch(sid)
+    stateOf(sid).search = blankSearch()
+  }
+
+  /**
+   * 回到上一次的搜索结果（搜索栏里「结果：x 项」那个按钮）：只切视图，**一个请求都不发**。
+   *
+   * 用户从结果里跳进某个目录之后，列表区显示的是那个目录的内容，这一下就是「回到刚才那批
+   * 结果」——与「在当前目录重新搜索」彻底分开，两个动作各有一个控件，不用再互相猜。
+   * 还没有任何结果（没搜过）时按钮不出现，这里再兜一次底：没东西可回就不动。
+   */
+  function showSearchResults(sid: string) {
+    const s = stateOf(sid).search
+    if (!s.running && !s.done) return
+    s.viewing = true
+  }
+
+  /**
+   * 把列表区切回「当前目录的内容」（搜索栏与结果缓存都留着）。
+   *
+   * 只由**目录导航**触发（点面包屑 / 前进后退 / 上一层 / 刷新 / 点结果里的目录），见 navigate
+   * 等函数的调用点；写操作之后的刷新（refreshDir）**不**调用它——用户要求「点别的按钮不退出
+   * 搜索」，上传完还停在结果里是刻意的（结果是那次搜索的快照，想更新点一下就重新搜）。
+   */
+  function leaveSearchResults(sid: string) {
+    stateOf(sid).search.viewing = false
+  }
+
+  /**
+   * 「搜索」按钮 / 输入框回车：**在当前目录搜一次**，永远是这一个意思。
+   *
+   * 早先这一颗按钮兼任「回到上次的结果」（看结果时点 = 重搜、没看结果时点 = 回结果），要按
+   * 处境猜它这次是什么意思——用户返工明确要求拆开：搜索只管搜，「回到结果」交给下面那个
+   * `showSearchResults`（搜索栏里的「结果：x 项」按钮）。
+   *
+   * 结果**边到边追加**（onBatch → `results.push`），所以「搜到一点显示一点」；搜索过程中再点
+   * 一次会掐掉正在跑的那一轮重新开始（新结果替换旧缓存）。
+   *
+   * @throws 关键词为空时抛错（调用方 toast 出原因，不能「点了没反应」）
+   */
+  async function runSearch(sid: string): Promise<void> {
+    const st = stateOf(sid)
+    const s = st.search
+    const query = s.query.trim()
+    if (!query) throw new Error(t('files_search_need_query'))
+
+    abortSearch(sid)
+    const seq = searchSeq.get(sid) ?? 0
+    const ctl = new AbortController()
+    searchAbort.set(sid, ctl)
+    // 新一轮一律清空旧结果与旧统计：换目录/换关键词之后，两份结果的合集只会误导人
+    s.viewing = true
+    s.running = true
+    s.done = false
+    s.error = ''
+    s.results = []
+    s.scopeDir = st.dir
+    s.scopeQuery = query
+    s.scanned = 0
+    s.dirs = 0
+    s.skipped = 0
+    s.truncated = false
+    s.elapsedMs = 0
+    /** 这一轮还是「当前那一轮」吗（被取消或被取代之后，回调一律不再写状态）。 */
+    const fresh = () => searchSeq.get(sid) === seq
+    try {
+      const summary = await api.fsSearch(sid, st.dir, query, {
+        onStart: (root) => {
+          if (fresh()) s.scopeDir = root
+        },
+        onBatch: (entries) => {
+          if (fresh()) s.results.push(...entries)
+        },
+        onProgress: (scanned, dirs) => {
+          if (fresh()) {
+            s.scanned = scanned
+            s.dirs = dirs
+          }
+        },
+        signal: ctl.signal
+      })
+      if (!fresh()) return
+      s.scanned = summary.scanned
+      s.dirs = summary.dirs
+      s.skipped = summary.skipped
+      s.truncated = summary.truncated
+      s.elapsedMs = summary.elapsedMs
+      s.done = true
+    } catch (e) {
+      // 被新的一轮取代、或者用户点了「取消」：状态已经由那一方处理过了（这一轮什么都不做）
+      if (!fresh()) return
+      s.error = describeError(e)
+      s.done = true
+    } finally {
+      if (fresh()) {
+        s.running = false
+        searchAbort.delete(sid)
+      }
+    }
   }
 
   return {
@@ -884,6 +1113,7 @@ export const useSftpStore = defineStore('sftp', () => {
     toggleMode,
     cycleSort,
     sorted,
+    sortedResults,
     expandPath,
     refreshTree,
     toggleExpand,
@@ -907,6 +1137,11 @@ export const useSftpStore = defineStore('sftp', () => {
     clearSelection,
     setMulti,
     exitMulti,
+    openSearch,
+    closeSearch,
+    leaveSearchResults,
+    showSearchResults,
+    runSearch,
     forget
   }
 })

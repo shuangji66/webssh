@@ -370,6 +370,25 @@ export const en: Record<string, string> = {
   files_quick_invalid: 'The path must be absolute (start with /) and must not contain ..',
   files_quick_open_failed: 'Could not open the directory: {error}',
 
+  // ===== search (round 22) =====
+  files_search: 'Search',
+  files_search_placeholder: 'Search names under this directory',
+  files_search_run: 'Search',
+  files_search_results: 'Results: {n}',
+  files_search_results_title: 'Back to the search results',
+  files_search_run_title: 'Search in the current directory',
+  files_search_cancel: 'Cancel',
+  files_search_scanning: 'Searching… ({scanned} scanned)',
+  files_search_empty: 'No matching items',
+  files_search_need_query: 'Enter a search term',
+  files_search_failed: 'Search failed: {error}',
+  files_search_incomplete: 'Search did not finish properly (response interrupted); please retry',
+  files_search_bad_response: 'Malformed search response: {line}',
+  files_search_scope: 'Results from {dir} (click Search again to search the current directory)',
+  files_search_summary: 'Scanned {scanned} items in {dirs} dirs in {seconds}s',
+  files_search_summary_skipped: ', {n} unreadable dirs skipped',
+  files_search_summary_truncated: ', truncated at the result limit',
+
   // ===== upload dialog =====
   upload_title: 'Upload to {path}',
   upload_tab_local: 'Local files',

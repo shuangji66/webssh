@@ -223,6 +223,7 @@ data/
 | POST | `/api/fs/image` | `{sid, path}` | 图片**原始字节**（`Content-Type` = 按内容嗅探出的类型 + `nosniff`）；不是图片 → `invalid`，超过 4 MiB → `too_large`（见 25.2） |
 | POST | `/api/fs/edit-load` | `{sid, path}` | `{ok, path, size, content, encoding, bom, eol}`（打开编辑器：先验证登录用户可写，见 26.2） |
 | POST | `/api/fs/edit-save` | `{sid, path, content, encoding, bom, eol}` | `{ok, size}`（按原编码 / BOM / 换行写回；见 26.2） |
+| POST | `/api/fs/search` | `{sid, path, query}` | **流式 NDJSON**（一条记录一行）：`start` → `batch`* → （`progress`*）→ `done`，开流之后出错回一行 `error`；开流**之前**的失败（关键词为空 / 会话没了 / 起点打不开）仍是普通 JSON 错误 + 状态码。见第 32 节 |
 | POST | `/api/quickcmds/list` | `{sid}`（空 = 全局） | `{ok, scope, commands:[QuickCmd]}` |
 | POST | `/api/quickcmds/save` | `{sid, commands:[QuickCmd]}` | `{ok, scope, commands}` |
 | POST | `/api/quickaccess/list` | `{sid}`（**必填**，没有全局表） | `{ok, paths:[string]}`（第二十轮，见第 30 节） |
@@ -480,7 +481,10 @@ export interface SftpState { dir: string; home: string; entries: FsEntry[]; load
                              treeChildren: Record<string, FsEntry[]>;
                              treeFileTotal: Record<string, number>;   // 每个目录的文件总数（树只列前 20 个）
                              expanded: string[];
-                             treeLoading: Record<string, boolean>; selected: string[] }
+                             treeLoading: Record<string, boolean>; selected: string[];
+                             search: SftpSearch }
+// SftpSearch（第二十二轮，契约 32）：{ open, query, viewing, running, done, results: FsEntry[],
+//   scopeDir, scopeQuery, scanned, dirs, skipped, truncated, elapsedMs, error }
 // PermMode = 'symbolic'|'octal'（权限列显示模式，点表头「权限」切换；localStorage 里存的也是 'octal'）
 // SortState = { key: 'name'|'size'|'mtime'|null; dir: 'asc'|'desc' }（null = 不排序，回到服务端顺序）
 useSftpStore(): {
@@ -524,6 +528,12 @@ useSftpStore(): {
   // 权限列模式 / 排序
   toggleMode(sid: string): void; cycleSort(sid: string, key: string): void
   sorted(sid: string): FsEntry[]
+  // 搜索（第二十二轮，见 32）：openSearch 只是把栏打开（幂等）；只有 closeSearch 退出搜索
+  // （关键词与结果一起清掉）；runSearch 一个入口两种语义——正在看结果时 = 在当前目录重搜，
+  // 否则缓存命中就秒回上次的结果
+  openSearch(sid: string): void; closeSearch(sid: string): void
+  leaveSearchResults(sid: string): void      // 列表区切回目录内容（导航时由 store 自己调）
+  runSearch(sid: string): Promise<void>      // 关键词为空 → 抛错（调用方 toast）
   forget(sid: string): void
 }
 
@@ -2880,3 +2890,221 @@ location /app/ {
   `trim_http_cgi` 是 Go 的 `httputil.ReverseProxy`（二进制里有 `handleUpgradeResponse` /
   `upgradeType` 符号），nginx 侧也显式转发了 `Upgrade` / `Connection: upgrade`，即 101 由网关
   中继这一环是有支持的；本轮没在真机上验证的只有这一环。
+
+---
+
+## 32. 第二十二轮：文件管理器的搜索（书签右侧的搜索图标 + 地址栏下的搜索栏）
+
+### 32.1 需求（用户原话拆解）
+
+- 文件管理工具栏**书签按钮右侧**加一个搜索图标按钮，点击后在**目录地址栏下方**显示搜索栏；
+- 搜索栏内：输入框 + 数量 + 搜索按钮 + 取消；输入框支持回车（与点「搜索」同一个动作）；
+- **点「取消」退出搜索并隐藏搜索栏**；点其他功能按钮**不退出搜索**；
+- **仅在当前目录下搜索**（用户确认：**递归当前目录的整棵子树**）；
+- **搜到一点显示一点**；**缓存搜索到的结果**；
+- 点结果里的**目录**跳进那个目录，**不隐藏搜索栏**；**再点「搜索」快速回到搜索结果**；
+- 点结果里的**文件**在搜索结果里预览；**编辑**也是在搜索结果里打开 / 退出编辑页；
+- 面包屑（左栏目录树）**不需要**搜索功能。
+
+### 32.2 后端（`backend/files_search.go` + `admin_routes.go` 一条路由）
+
+- `POST /api/fs/search`，请求 `{sid, path, query}`：`path` 空 = 家目录（与 `fs/list` 同一套
+  `resolveRemotePath`）；`query` 去首尾空白后为空 → `invalid`（400）。匹配的是条目**自己的
+  名字**的不区分大小写**子串**（不含通配符 / 正则 / 内容搜索）。**不匹配路径**（同轮返工：
+  按路径匹配时输入 `logs` 会把那个目录下的每一个文件都命中，一个常见的目录名就能刷出几千条
+  ——那不是用户要找的东西）；相对路径仍由前端拼出来**显示**（让用户知道命中的项在哪一层），
+  只是不参与匹配。隐藏文件不过滤。
+- **流式 NDJSON**（`Content-Type: application/x-ndjson`，一条记录一行，写一行 flush 一次）：
+  `{"type":"start","path":<起点绝对路径>}` → `{"type":"batch","entries":[...]}`* →
+  `{"type":"progress","scanned","dirs"}`*（节流 400ms）→
+  `{"type":"done","total","scanned","dirs","skipped","truncated","elapsedMs"}`。
+  响应头带 `Cache-Control: no-store` 与 **`X-Accel-Buffering: no`**——网关（nginx）默认会把
+  整条响应缓冲下来，不显式关掉的话「边搜边回」到浏览器就变成「搜完一次性到达」。
+- **响应头懒写**（`searchStream.wrote`）：起点目录**先读出来**再开流，所以「起点打不开 /
+  会话没了 / 关键词为空」这些失败都在写第一行**之前**发生，能走普通的 JSON 错误响应 + 正确的
+  状态码（403 permission / 404 / 502），前端那条路是 `ApiError`。开流之后才失败的（遍历途中
+  出错、客户端断流）只能作为一行 `{"type":"error","code","error"}` 写回去——裸码照样按
+  `fsError` 的口径翻译（`permission` → 界面「权限不足」）。
+- 遍历：**BFS**（先近后远，命中也先出现在近处），每层目录内按名字排序（顺序可复现）。
+  **软链接不递归进去**：`ReadDir` 给的是 lstat 属性，指向目录的链接 `IsDir()` 为 false，
+  所以不会走进死循环（`self -> .`、`/proc/self/root`）；链接自己仍会作为结果出现（口径与列表
+  一致，`symlink` / `broken` 由同一个 `buildFsEntry` 填）。
+- 上限（任一触顶即停止遍历并 `truncated: true`，界面说「已截断」，不假装搜完）：
+  **2000 条结果**（`maxSearchResults`）、**20 万条目**（`maxSearchScanned`）、
+  **10 层**（`maxSearchDepth`）、**15 秒**（`searchDeadline`）。
+  子树里某个目录读不出来（权限 / 遍历途中被删）→ **跳过并继续**，计入 `skipped`；只有**起点**
+  读不出来才算这次搜索失败。
+- 攒批：够 50 条立刻回，或距上次回流超过 200ms 也回（命中稀疏时保证「搜到一点显示一点」）。
+- 取消：客户端 abort → `r.Context()` 结束 → 遍历每层看一眼 ctx 主动退出（`ReadDir` 不认识
+  context）。`withSFTP` 的既有语义不变：ctx 结束时整条 SFTP 连接被丢掉、下次操作重拨。
+- 硬约束不变：目标路径 `path.Clean` + 拒绝 `..`；SFTP 通道仍由 `withSFTP` 串行化（一次搜索
+  最多占住这条会话的 SFTP 通道 15 秒，与压缩 / 导出同类）。
+
+### 32.3 前端
+
+- `stores/sftp.ts`：`state.search`（`SftpSearch`，见 6.1）+ `openSearch / closeSearch /
+  runSearch / showSearchResults / leaveSearchResults / sortedResults`；中断控制与轮次（`AbortController` + `seq`）
+  放在闭包账本里（同 `inited` / `loadedDirs` 的写法），**不进 SftpState**。
+  - `runSearch`（搜索栏的「搜索」按钮 / 回车）= **永远在当前目录搜一次**；
+    `showSearchResults`（搜索栏的「结果：x 项」按钮）= **回到上一次那批结果**（只切
+    `viewing`，一个请求都不发）。两个动作各有一个控件——第三轮返工要求：早先它们挤在「搜索」
+    一颗按钮上，要按「现在是不是正在看结果」猜这次点下去是搜还是回，用户明确要求拆开。
+  - 缓存 = `results` + `scopeQuery` + `scopeDir`（起点以后端 `start` 记录解析出的绝对路径为准），
+    生命周期与「这一次搜索」相同：**只有 `closeSearch`（点取消）会清掉它**。
+  - **列表区显示结果还是目录**由 `search.viewing` 决定。**目录导航**（`navigate` / `back` /
+    `forward` / `jumpTo` / `refresh`）把它置回 false —— 这就是「点结果里的目录跳进去看到的是
+    那个目录的内容，而搜索栏与结果缓存都还在」。写操作之后的 `refreshDir` **不**置回
+    （用户要求「点别的按钮不退出搜索」；那批结果是那次搜索的快照，想更新再点一次「搜索」）。
+  - 结果**边到边追加**（`onBatch` → `results.push`），迟到的轮次靠 `seq` 丢弃（否则新一轮的
+    结果会被旧一轮覆盖、或者 `running` 被旧的清掉）。
+- `serverapi/index.ts`：新增 `requestStream()`（fetch + `ReadableStream` + 流式 `TextDecoder`，
+  按 `\n` 分帧；开流前失败按 `res.ok` / Content-Type 判成 `ApiError`，流里的 `error` 记录也抛
+  `ApiError`）与 `api.fsSearch(sid, path, query, {onStart, onBatch, onProgress, signal})`。
+- `components/files/SearchBar.vue`：输入框 + **「结果：x 项」按钮** + 搜索 + 取消（左边**没有**
+  放大镜图标——第三轮返工删掉，输入框自己就说明了这里能搜）；挂载即聚焦输入框；回车与「搜索」
+  同一个动作（`runSearch` 抛错时 toast，比如关键词为空）。「结果：x 项」按钮只在这次搜索开始过
+  之后出现（没东西可回时不显示，与剪贴板那一行同一个口径），点它就是回到那批结果（搜索中
+  也在长，点它看已搜到的部分）；它的 title 在搜索中是「搜索中…（已扫描 {m} 项）」。失败原因
+  在栏里给一行截断的红色文案，完整的在结果区。
+- `components/files/SearchResults.vue`：结果区（行 / 网格 + 收尾统计 + 空态 + 失败原因 +
+  「结果来自 <别的目录>」的提示）。四条刻意的规矩：
+  1. **跟随「视图」偏好**（列表 / 网格，与目录内容同一套形态）：第一列是**名字 + 灰色的所在
+     目录**（递归结果散在不同层，只给文件名没有上下文）。名字在前、截断先截目录，所以第一列
+     仍叫「名称」——**表头标签与排序都不必为结果单开一套**；
+  2. **行内没有「···」菜单**：行菜单的动作（删除 / 重命名 / 压缩 / 导出…）都以「这一项在当前
+     目录的列表里」为前提（`removePaths` / `menuItems` 拿 `state.entries` 查表），而结果可能在
+     别的目录下——所以结果的交互只有两条：文件 → 预览，目录 → 进入；
+  3. **排序复用目录那一份偏好**（`stores/sftp.ts` 的 `sortedResults`，与 `sorted` 共用同一个
+     `compareEntries` 与同一个 `sort`）：没点表头时保持**到达顺序**（后端 BFS 先近后远、边搜
+     边追加——「搜到一点显示一点」要的就是这个顺序），点了表头就按那一列排（新到的批次也参与）；
+  4. 所在目录由 `path` 裁出 `scopeDir` 前缀，**不 trim**（名字以空格结尾合法）。
+- `FileManager.vue`：工具栏「快捷访问」右侧的搜索图标（`openSearchBar`：先 `leaveMulti` 再
+  `openSearch`，幂等、不做开关——退出搜索的入口只有搜索栏里的「取消」）；搜索栏插在面包屑
+  下方、剪贴板栏上方；列表区在 `searchViewing` 时渲染 `SearchResults`。
+  **列表的表头只有一份**（在滚动容器**外面**，目录与结果共用）：它不跟着内容滚，三列排序
+  （结果同样生效）与权限显示切换在两边行为一致——同轮返工要求「列表视图时标题栏不参与滚动，
+  复用排序和权限显示切换」。结果区**不弹空白处右键菜单、不接拖拽上传**（那两个动作的对象都是
+  「当前目录」，而结果可能来自别的目录）；`toggleMulti` 进多选前先 `leaveSearchResults`
+  （多选是对当前目录挑一批，与结果区不是一回事）。
+  点结果的两种走法：目录 → `go(path)`（= 现有导航，顺带切回目录视图）；文件 → 现有的预览弹窗
+  （编辑走预览里的按钮 → 编辑页覆盖在文件管理上，进出都不碰文件管理器的状态，所以退出编辑
+  回到的正是搜索结果）。
+- 文案：zh/en 各新增 19 条 `files_search_*`。左栏 `FileTree` **没有任何搜索入口**（用户要求）。
+
+### 32.4 冻结文件（本轮）
+
+`backend/files_search.go`（新）、`backend/admin_routes.go`（一条路由）、
+`frontend/src/serverapi/index.ts`（`requestStream` + `fsSearch` + 三个类型）、
+`frontend/src/stores/sftp.ts`、`frontend/src/components/files/{SearchBar,SearchResults}.vue`（新）、
+`frontend/src/components/files/FileManager.vue`、`frontend/src/i18n/*`（19 条 `files_search_*`）、
+`docs/CONTRACT.md`。
+
+### 32.5 本轮的验证
+
+- 后端 `backend/files_search_test.go`（真链路：进程内 SSH/SFTP + unix socket HTTP）：
+  `TestFsSearchSubtree`（递归命中与顺序「先近后远」、相对路径匹配 `docs/`、大小写不敏感、
+  隐藏文件能搜到、目录作为结果、软链接**不递归**（扫描数断言 12 项 / 5 个目录，跟进去会翻倍）、
+  空 path = 家目录、相对 path 按家目录解析、没命中回完整统计）、
+  `TestFsSearchStreamsInBatches`（150 个命中分 ≥3 批、不重不漏）、
+  `TestFsSearchErrors`（空关键词 / `..` / 会话不存在 / 拿文件当起点：都是「开流之前」的普通 JSON
+  错误）、`TestFsSearchPermission`（起点 0000 → 403 permission 且**不开流**；子树里 0000 →
+  跳过并继续，`skipped=1`）。
+- `make test` 全绿（主包 **122 PASS / 10 SKIP / 0 FAIL**，本机无 PTY：10 个 PTY 用例按设计跳过，
+  `TestFsInfoCountError` 在本机文件系统上拦不住 0000 目录也跳过）。
+- `make check`（`vue-tsc` + `check:i18n`）无错误：zh/en 各 **470** key 双向一致。
+- **真二进制 + 真 unix socket + socat 转发 + 内嵌 SSH/SFTP 服务器**（`.tmp/e2e_search.py`，
+  13 项断言全过）：`Content-Type: application/x-ndjson`、`X-Accel-Buffering: no`、`start` 是
+  第一行且 path 正确、命中顺序 `['APP.log','deep-app.log']`、150 个命中分 3 批到达、
+  2100 个命中在 2000 条处截断（`truncated=true`）、没命中回完整统计、
+  空关键词 400 `invalid`、起点无权限 403 `permission`、子树里一个目录被跳过（`skipped=1`）。
+  （脚本在 `.tmp/` 下，gitignore，clone 出来没有——与第 12.3 节的 e2e 脚本同一处境。）
+- **真二进制 + 无头 Chromium 点了一遍**（1280×720，`socat` 转发 unix socket，临时数据目录）：
+  ① 工具栏「快捷访问」右侧出现搜索图标，点击后**地址栏下方**出现搜索栏（图标 / 输入框 / 「0 项」/
+  「搜索」/「取消」）、输入框自动聚焦；② 输入 `app` + **回车** → 结果区出现 `notes/APP.log`、
+  `docs/sub/deep-app.log`（相对路径），数量变「2 项」，收尾统计「已扫描 2263 项、5 个目录，
+  用时 0.1 秒，1 个目录读取失败已跳过」（那个目录是被 chmod 000 的）；
+  ③ 点文件行 → 预览弹窗（内容正确）；弹窗里点「编辑」→ 编辑页覆盖在文件管理上；点「退出」→
+  **回到搜索结果的同一屏**；④ 搜 `docs/` → 结果含目录 `docs/sub`；点它 → 面包屑进到
+  `…/root/docs/sub`、列表显示该目录内容，**搜索栏与「3 项」都还在**；⑤ 再点「搜索」→
+  一次请求都不发就回到那 3 条结果；⑥ 看结果时再点「搜索」→ 在**当前目录**（docs/sub）重搜
+  → 0 项 +「没有找到匹配的项」；⑦ 点「上一层」→ 列表切回目录内容、搜索栏仍在；再点「搜索」→
+  结果回来并出现「结果来自 …/docs/sub（再点「搜索」在当前目录重新搜索）」（当前目录已不在那棵
+  子树里了）；⑧ 点「取消」→ 搜索栏消失、图标不再高亮、列表是目录内容。
+  验完已停掉进程、删掉临时目录；`./webssh` 是最后的 `make` 产物（`.gitignore` 里有它，留着方便直接
+  拿去部署 / 复验）。
+- 浏览器实测抓到并修掉一个真 bug：结果区上方**还画着目录那份表头**（「名称 / 大小 / 修改时间 /
+  权限」），与结果的「路径 / 大小 / 修改时间 / 权限」叠成两行——目录表头加 `!searchViewing`。
+- 未做：**移动端（窄视口）点一遍**——搜索栏与结果区是桌面同一套 DOM（`mobile` prop 只影响
+  权限列），没有移动端专属分支；未验证的是窄屏下「输入框 + 数量 + 两个按钮」那一行的挤压表现。
+  另外未验证：**两个设备同时对同一会话搜索**（第二个请求会等第一个跑完，SFTP 串行化的既有
+  语义），以及长搜索过程中点「取消」后下一次文件操作的**重拨延迟**（与既有的
+  「取消上传 / 关页面」同一条路径）。
+
+### 32.6 同轮返工：结果跟随视图 + 复用表头 + 只按名字匹配
+
+用户两条要求：① 搜索结果**跟随当前的文件管理显示视图**（列表 / 网格），列表视图时**标题栏不参与
+滚动**，并**复用排序和权限显示切换**；② 匹配机制改成**只匹配名字**——「只显示含搜索词的文件和
+目录，而不是把含搜索词的路径的所有文件和目录都显示，那样量太大了」。
+
+- **后端只匹配名字**：`matchSearch(name, needle)`（`files_search.go`），不再拿相对路径去匹配
+  （`relOf` 随之下线，成了死代码）。效果：搜 `docs` 只出目录 `docs` 自己，`docs/readme.md`、
+  `docs/sub/…` 一条都不出；路径里含关键词而名字里不含的（`docs/sub/deep-app.log` 搜 `docs/sub`）
+  也不再命中。递归范围、顺序（BFS 先近后远）、上限与流式形态都没变。
+  测试相应改成断言新口径（`TestFsSearchSubtree`：`docs` 只命中目录本身、`docs/sub` 命中 0 条、
+  `readme` 仍能递归命中；以及目录仍以 `dir=true` 出现）。
+- **表头一份、且不滚动**：`FileManager` 里那份列表表头重新变回 `v-if="state.view === 'list'"`
+  （目录与结果共用），它本来就在滚动容器**外面**，所以「标题栏不参与滚动」是结构上就成立的；
+  `SearchResults` 删掉了自己那份表头（原来它画在滚动容器里，会跟着内容滚）。
+  第一列的标签**没有**换成「路径」：结果行的第一列改成「**名字** + 灰色所在目录」（名字在前，
+  截断时先截目录），所以「名称」这一列名、三列排序与权限切换（`sftp.toggleMode`）全部原样复用。
+  行尾补一个 `w-6` 空档对齐表头最后一列（表头那列是行内「···」的位置，结果行没有菜单但列宽
+  必须一致，否则 `flex-1` 一宽一窄、后面几列整体错位）。
+- **网格视图**：`SearchResults` 增加与目录网格同一套形态的分支（图标 + 名字两行 + 灰色所在目录
+  + 大小/目录），`content-start` 照旧不能省（契约 14.5 那个「整列悬停高亮」的坑）。
+- **排序复用**：`stores/sftp.ts` 新增 `sortedResults(sid)`——与目录的 `sorted(sid)` 共用
+  `state.sort` 与 `compareEntries`；`sort.key === null` 时返回**到达顺序**（不重排），点了表头
+  就按那一列排（新到的批次也参与重排，这是用户自己要的）。
+- 文案：`files_search_placeholder` 由「名称或路径」改成「名称」（中英各一处），
+  `files_search_path`（只给结果表头用的「路径」标签）随之下线，zh/en 回到 **469** key。
+- 验证：`make test` 全绿（主包 122 PASS / 10 SKIP / 0 FAIL）；`make check` 无错误（469 key）。
+  **真二进制 + 无头 Chromium 又点了一遍**：① 搜 `app` → 结果第一列是「APP.log notes/」这样的
+  「名字 + 灰色所在目录」，表头是「名称 / 大小 / 修改时间 / 权限」且**滚动结果列表时标题栏不动**
+  （表头在滚动容器外）；② 点表头「大小 升序」→ 结果按大小重排（表头箭头出现）；点「权限」列 →
+  结果的权限列在符号 / 八进制之间切换；③ 点工具栏「网格视图」→ 结果变成网格（名字 + 灰色目录 +
+  大小/DIR 三行），点回列表视图恢复；④ 搜 `docs` → 只有目录 `docs` 一条（不再把
+  `docs/readme.md`、`docs/sub/…` 一起倒出来）。同一支脚本还断言了 `docs/sub` 命中 0 条
+  （路径里含关键词、名字里不含）。
+  另：点表头「大小」→ `aria-label` 在「升序 / 降序」之间循环（排序对结果生效）；滚动结果列表
+  800px 前后表头 `top` 都是 205（**标题栏不跟着滚**）；点「权限」列 → 结果行的权限变成 `0705`
+  （符号 ↔ 八进制切换对结果同样生效）。验完停进程、删临时目录。
+
+### 32.7 同轮三轮返工：「回到结果」与「在当前目录重搜」拆成两个控件
+
+用户原话：「进入搜索结果里的目录之后点搜索回到搜索结果的逻辑消失了，把搜索结果的数量改成按钮
+形式『结果：x项』，缓存搜索结果，这样进入搜索结果中的目录之后与当前在结果目录中再搜索的逻辑也
+就不冲突了；删掉搜索栏左侧的搜索图标」。
+
+- **根因**：上一版把「开搜」和「回到上次的结果」挤在**同一颗「搜索」按钮**上（看结果时点 = 在
+  当前目录重搜、没看结果时点 = 缓存命中就秒回），于是用户想「回到结果」时点它，得先判断自己
+  此刻在不在看结果——从结果跳进某个目录之后（列表区显示的是那个目录），那颗按钮的含义在用户
+  眼里就变成了「在当前目录重搜」，看起来「回到结果的逻辑消失了」。两个意思一颗按钮，怎么调都
+  会有一半场景别扭。
+- **现在**：`runSearch`（搜索 / 回车）**永远**在当前目录搜一次；`showSearchResults` 是**唯一**的
+  「回到结果」入口（不发任何请求）。缓存（`results` + `scopeDir` + `scopeQuery`）依旧在，直到
+  点「取消」退出搜索才清掉——「进结果里的目录 → 点『结果：x 项』回结果 → 点『搜索』在当前目录
+  重搜」这三步互不干扰。
+- **数量变按钮**：`files_search_count` / `files_search_running` / `files_search_rerun` 三条文案
+  下线，换成 `files_search_results`（`结果：{n} 项`）、`files_search_results_title`（`回到搜索结果`）、
+  `files_search_run_title`（`在当前目录搜索`），`files_search_scanning` 改为同时做「搜索中」的
+  title 与结果区空态文案。没有可回的结果（还没搜过）时那个按钮不出现。
+- **删掉搜索栏左侧的放大镜图标**（输入框的 `aria-label` 保留，那是可访问名，不是可见装饰）。
+- 验证：`make test` 全绿（主包 122 PASS / 10 SKIP / 0 FAIL）；`make check` 无错误
+  （zh/en 各 469 key：−3 +3）。**真二进制 + 无头 Chromium**（`performance` 里的
+  `/api/fs/search` 条目数就是「发没发请求」的硬证据）：
+  ① 刚打开搜索栏时一排只有「输入框 / 搜索 / 取消」（左侧没有图标，也还没有结果按钮）；
+  ② 搜 `app` → 出现「结果：2 项」（那一排变成四个控件）；③ 搜 `docs` 后点结果里的目录行
+  `docs` → 面包屑进到 `…/root/docs`、列表显示那个目录的内容，**「结果：1 项」按钮还在**；
+  ④ 点「结果：1 项」→ 请求数 2 → **2**（一个请求都不发）回到那 1 条结果；
+  ⑤ 再点「搜索」→ 请求数 3，在当前目录（`root/docs`）里重搜 `docs` → 0 项 +
+  「没有找到匹配的项」，按钮变「结果：0 项」；⑥ 点「结果：0 项」→ 请求数仍是 3，回到那次空结果；
+  ⑦ 点「取消」→ 搜索栏消失、工具栏那个搜索图标不再高亮。

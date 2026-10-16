@@ -94,6 +94,84 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return body as T
 }
 
+/**
+ * 发一个**流式**（NDJSON：一行一条记录）请求，每读到完整的一行就交给 onRecord。
+ *
+ * 为什么单独一条路：搜索的响应是**边搜边回**的（见 backend/files_search.go），而 `request()`
+ * 会把整个 body 读完再解析——那就等于等整次遍历结束，「搜到一点显示一点」就没了。
+ *
+ * 分帧：一行一条 JSON（`\n` 结尾）。块边界可能落在行中间，所以按块 decode（`{stream:true}`，
+ * 跨块被切开的半个 UTF-8 字符会拼回来）后留在 buffer 里，读到换行才解析。
+ *
+ * 错误同样分两种（与后端一致）：
+ *  - **开流之前**：普通的 JSON 错误响应（状态码非 2xx，或 Content-Type 不是 NDJSON），
+ *    这里按 ApiError 抛（判据与 `request()` 完全一致）；
+ *  - **开流之后**：流里出现 `{"type":"error", code, error}`，也抛 ApiError——调用方只有一条
+ *    错误通道，不必分两处处理。
+ */
+async function requestStream(
+  path: string,
+  json: unknown,
+  onRecord: (rec: Record<string, unknown>) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const res = await fetch(apiURL(path), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(json),
+    signal
+  })
+  const ctype = res.headers.get('Content-Type') ?? ''
+  if (!res.ok || !res.body || !ctype.includes('application/x-ndjson')) {
+    const body = (await parseBody(res)) as Record<string, unknown> | null
+    const code = (body?.code as string) || (res.ok ? 'internal' : `http_${res.status}`)
+    const message =
+      (body?.error as string) || (body?.__raw as string) || `${res.status} ${res.statusText}`
+    throw new ApiError(res.status, code, message)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  const handle = (line: string) => {
+    let rec: Record<string, unknown>
+    try {
+      rec = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      // 只在「后端坏了 / 中间层改写了正文」时才会走到：如实报出来，别当成「没有结果」
+      throw new Error(t('files_search_bad_response', { line: line.slice(0, 80) }))
+    }
+    if (rec.type === 'error') {
+      throw new ApiError(res.status, String(rec.code ?? 'internal'), String(rec.error ?? ''))
+    }
+    onRecord(rec)
+  }
+  // flush = true 时把残留的最后一行也处理掉（后端每行都带换行，这里只是不假设）
+  const consume = (chunk: string, flush = false) => {
+    buf += chunk
+    for (let at = buf.indexOf('\n'); at >= 0; at = buf.indexOf('\n')) {
+      const line = buf.slice(0, at).trim()
+      buf = buf.slice(at + 1)
+      if (line) handle(line)
+    }
+    if (flush && buf.trim()) {
+      handle(buf.trim())
+      buf = ''
+    }
+  }
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      consume(decoder.decode(value, { stream: true }))
+    }
+  } finally {
+    // 中途退出（错误 / 取消）时把 body 交回去，别让连接悬着
+    void reader.cancel().catch(() => {})
+  }
+  consume(decoder.decode(), true)
+}
+
 // ===== 类型 =====
 
 export type AuthType = 'password' | 'key'
@@ -280,9 +358,39 @@ export interface FsListing {
   entries: FsEntry[]
 }
 
+/**
+ * 一次搜索的收尾统计（`/api/fs/search` 的 `done` 记录，契约 32）。
+ *
+ * 界面上用来说明「为什么慢 / 结果全不全」：扫描了多少条目、多少个目录、用时多久、有没有触到
+ * 上限被截断、有多少个目录因为读不出来被跳过。数值全部来自后端，前端不自己数。
+ */
+export interface FsSearchSummary {
+  /** 结果条数 */
+  total: number
+  /** 扫描过的条目数 */
+  scanned: number
+  /** 读过的目录数 */
+  dirs: number
+  /** 读不出来被跳过的目录数（权限 / 遍历途中被删） */
+  skipped: number
+  /** 触到上限提前结束：界面必须说「已截断」，不能装作搜完了 */
+  truncated: boolean
+  elapsedMs: number
+}
+
+/** `/api/fs/search` 的流式回调。 */
+export interface FsSearchHandlers {
+  /** 起点（后端解析后的**绝对**路径）：结果的 path 用它折成相对路径 */
+  onStart: (path: string) => void
+  /** 每收到一批结果回调一次（「搜到一点显示一点」） */
+  onBatch: (entries: FsEntry[]) => void
+  /** 扫描进度（后端节流，约 400ms 一次） */
+  onProgress?: (scanned: number, dirs: number) => void
+  signal?: AbortSignal
+}
+
 /** 支持的压缩格式：tar.gz（默认）与 zip。 */
 export type ArchiveFormat = 'tar.gz' | 'zip'
-
 /** 压缩结果：压缩包落在 archiveDir 里。 */
 export interface ArchiveResult {
   path: string
@@ -591,6 +699,53 @@ export const api = {
    */
   fsInfo: (sid: string, path: string) =>
     request<{ ok: boolean; info: FsInfo }>('/api/fs/info', { json: { sid, path } }),
+
+  /**
+   * 搜索（第二十二轮，契约 32）：在 `path`（空 = 家目录）的**整棵子树**里，按相对路径做
+   * 不区分大小写的子串匹配，结果**边搜边回**（流式 NDJSON，见 requestStream）。
+   *
+   * 上限都在后端（2000 条结果 / 20 万条目 / 10 层 / 15 秒），触顶时 `truncated` 为真——
+   * 界面要照实说「已截断」，不能假装搜完了。没命中也**不是错误**：返回一份 total=0 的统计。
+   *
+   * `signal` 用于「取消」和「换关键词重搜」时中断请求（后端据此停掉遍历）。
+   */
+  fsSearch: async (sid: string, path: string, query: string, h: FsSearchHandlers) => {
+    const summary: { value: FsSearchSummary | null } = { value: null }
+    await requestStream(
+      '/api/fs/search',
+      { sid, path, query },
+      (rec) => {
+        switch (rec.type) {
+          case 'start':
+            h.onStart(String(rec.path ?? ''))
+            break
+          case 'batch':
+            h.onBatch((rec.entries as FsEntry[] | undefined) ?? [])
+            break
+          case 'progress':
+            h.onProgress?.(Number(rec.scanned ?? 0), Number(rec.dirs ?? 0))
+            break
+          case 'done':
+            summary.value = {
+              total: Number(rec.total ?? 0),
+              scanned: Number(rec.scanned ?? 0),
+              dirs: Number(rec.dirs ?? 0),
+              skipped: Number(rec.skipped ?? 0),
+              truncated: rec.truncated === true,
+              elapsedMs: Number(rec.elapsedMs ?? 0)
+            }
+            break
+          default:
+            // 认不出的记录类型：忽略（前向兼容），但不会静默吞掉错误——error 由 requestStream 抛
+            break
+        }
+      },
+      h.signal
+    )
+    // 流正常结束却没有 done：这次搜索的结论不可信（结果可能只有一半），不能当成功
+    if (!summary.value) throw new Error(t('files_search_incomplete'))
+    return summary.value
+  },
 
   fsMkdir: (sid: string, path: string) =>
     request<{ ok: boolean }>('/api/fs/mkdir', { json: { sid, path } }),

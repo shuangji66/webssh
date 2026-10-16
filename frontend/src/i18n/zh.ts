@@ -364,6 +364,25 @@ export const zh: Record<string, string> = {
   files_quick_invalid: '路径必须是绝对路径（以 / 开头），且不能包含 ..',
   files_quick_open_failed: '打开目录失败：{error}',
 
+  // ===== 搜索（第二十二轮）=====
+  files_search: '搜索',
+  files_search_placeholder: '在当前目录下搜索名称',
+  files_search_run: '搜索',
+  files_search_results: '结果：{n} 项',
+  files_search_results_title: '回到搜索结果',
+  files_search_run_title: '在当前目录搜索',
+  files_search_cancel: '取消',
+  files_search_scanning: '搜索中…（已扫描 {scanned} 项）',
+  files_search_empty: '没有找到匹配的项',
+  files_search_need_query: '请输入搜索关键词',
+  files_search_failed: '搜索失败：{error}',
+  files_search_incomplete: '搜索没有正常结束（响应被中断），请重试',
+  files_search_bad_response: '搜索响应格式不正确：{line}',
+  files_search_scope: '结果来自 {dir}（再点「搜索」在当前目录重新搜索）',
+  files_search_summary: '已扫描 {scanned} 项、{dirs} 个目录，用时 {seconds} 秒',
+  files_search_summary_skipped: '，{n} 个目录读取失败已跳过',
+  files_search_summary_truncated: '，结果过多已截断',
+
   // ===== 上传弹窗 =====
   upload_title: '上传到 {path}',
   upload_tab_local: '本地文件',

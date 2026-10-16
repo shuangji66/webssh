@@ -69,6 +69,9 @@ func (m *AdminMux) buildHandler() http.Handler {
 			m.route(m.handleFsList)(w, r)
 		case p == "/api/fs/info":
 			m.route(m.handleFsInfo)(w, r)
+		case p == "/api/fs/search":
+			// 流式响应（NDJSON，边搜边回）：实现在 files_search.go
+			m.route(m.handleFsSearch)(w, r)
 		case p == "/api/fs/mkdir":
 			m.route(m.handleFsMkdir)(w, r)
 		case p == "/api/fs/create":

@@ -37,6 +37,13 @@
 //   不弹窗；文件没有这一项）。点弹窗里的路径走 `sftp.jumpTo`（先探测、成功了才切过去），
 //   没权限时只报错、不进入目录、也不切子标签。
 //
+// 第二十二轮新增一件事（契约 32）：
+//   工具栏书签按钮**右侧**的搜索图标打开搜索栏（地址栏下方：输入框 + 数量 + 搜索 + 取消），
+//   在当前目录的**整棵子树**里边搜边显示结果。搜索栏、结果、以及「列表区现在显示的是结果还是
+//   目录内容」都在 stores/sftp.ts 的 `state.search` 里（见那里的说明与 runSearch）。这个组件
+//   负责的只有三件事：那个图标按钮、把搜索栏/结果插到列表区，以及结果的两种点击（目录 = 进去，
+//   文件 = 预览）。**面包屑上面的目录树不做搜索**（用户明确说了不需要）。
+//
 // 切回终端由工具栏最左侧的「返回终端」按钮负责（第四轮新增）：它只把 sessionUi 的激活子标签
 // 改回**上一次激活的终端**，左栏（面包屑 + 目录树）随之回来——与左栏那条按钮条里的「切换到
 // 文件管理」互为一对，两处共用同一个状态（契约 13.1 的「二选一」判据没变，也没有第二套开关）。
@@ -75,6 +82,8 @@ import PromptDialog from '@/components/PromptDialog.vue'
 import FileEditor from './FileEditor.vue'
 import InfoDialog from './InfoDialog.vue'
 import PreviewDialog from './PreviewDialog.vue'
+import SearchBar from './SearchBar.vue'
+import SearchResults from './SearchResults.vue'
 import UploadDialog from './UploadDialog.vue'
 import { canEditEntry, isArchivePath } from './fileKind'
 
@@ -97,6 +106,10 @@ function toast(msg: string, type: 'success' | 'error' | 'info' = 'error') {
 const state = computed(() => sftp.stateOf(sid))
 /** 展示用条目：排序（若启用）在 store 里算，这里拿到的已经是最终顺序。 */
 const entries = computed(() => sftp.sorted(sid))
+/** 搜索状态（搜索栏 + 结果 + 「列表区显示的是结果还是目录内容」）。 */
+const search = computed(() => state.value.search)
+/** 列表区当前显示的是搜索结果（搜索栏还开着，只是暂时在看目录内容时它是 false）。 */
+const searchViewing = computed(() => search.value.viewing)
 const selected = computed(() => state.value.selected)
 const selecting = computed(() => selected.value.length > 0)
 /** 多选模式（第九轮）：进入后点行是「选中/取消选中」，不再是打开。 */
@@ -174,6 +187,10 @@ function toggleView() {
 }
 
 function toggleMulti() {
+  // 多选是「对当前目录里的东西挑一批」：正在看搜索结果时先把列表切回目录内容（搜索栏与结果
+  // 缓存都留着）。否则用户会在结果区里点选，而选择集与结果、当前目录三者对不上（删除/压缩
+  // 那些动作都按「当前目录的列表」查表，见 removePaths）。
+  if (!multi.value) sftp.leaveSearchResults(sid)
   sftp.setMulti(sid, !multi.value)
 }
 
@@ -217,6 +234,8 @@ function openTerminalHere(dir: string) {
 
 /** 表头：key 用来排序，宽度类必须与列表行一致，否则表头与内容会错位。 */
 const headers = computed<{ key: SortKey; label: string; cls: string }[]>(() => [
+  // 第一列叫「名称」对目录与搜索结果都成立：结果行显示的是「名字 + 灰色的所在目录」，
+  // 名字在前、截断时先截目录，所以标签与排序行为不需要为结果单开一套（用户要求复用）。
   { key: 'name', label: t('files_name'), cls: 'min-w-0 flex-1 justify-start' },
   { key: 'size', label: t('files_size'), cls: 'w-16 shrink-0 justify-end' },
   { key: 'mtime', label: t('files_modified'), cls: 'w-24 shrink-0 justify-end' }
@@ -294,6 +313,9 @@ function openMenu(entry: FsEntry, event: MouseEvent) {
  * 用「落点不在任何一行里」来判定，这些情况一次全覆盖（空目录里最想做的事恰恰是粘贴）。
  */
 function onBlankContext(event: MouseEvent) {
+  // 结果区不弹空白处菜单：那份菜单是对**当前目录**做事的（新建 / 上传 / 粘贴到这里 / 在这个
+  // 目录开终端），而结果可能来自另一个目录——两件事摆在一起只会让人误操作。
+  if (searchViewing.value) return
   const target = event.target as HTMLElement | null
   if (target?.closest('[data-fs-entry]')) return
   openBlankMenu(event)
@@ -408,6 +430,44 @@ async function addQuickAccess(path: string) {
 function openQuickAccess() {
   leaveMulti()
   quickAccess.setDialog(sid, true)
+}
+
+// ---- 搜索（第二十二轮，契约 32） ----
+
+/**
+ * 工具栏的搜索图标：打开搜索栏（幂等，不切换）。
+ *
+ * 刻意不做成「点一下开、再点一下关」的开关：退出搜索的入口是搜索栏里的「取消」（用户要求），
+ * 那个按钮的位置就在输入框旁边，比工具栏这一头更近；而且图标做成开关之后，用户想「重新聚焦
+ * 输入框」会误触把它关掉，连结果一起丢。
+ *
+ * 先 leaveMulti：多选是「选一批 → 做一个动作」的短暂状态，而搜索的入口在工具栏上（与其他
+ * 工具栏动作同一条纪律，见 leaveMulti 的说明）。
+ */
+function openSearchBar() {
+  leaveMulti()
+  sftp.openSearch(sid)
+}
+
+/**
+ * 点搜索结果里的一行：目录 = 进入该目录（搜索栏留着，再点「搜索」快速回到结果），
+ * 文件 = 就地预览（退出预览回到结果——预览弹窗/编辑页都不动文件管理器的状态）。
+ *
+ * 不提供行内菜单（结果里的项可能不在当前目录下，而行菜单的动作都以「当前目录列表」为前提，
+ * 见 SearchResults 的说明）。多选模式在这一行上**不生效**：进多选时已经切回目录视图了
+ * （见 toggleMulti），所以结果区里点行永远是「打开」。
+ */
+function openSearchEntry(entry: FsEntry) {
+  hideMenu()
+  if (entry.dir) {
+    // navigate 会同时把列表切回目录内容（见 store 的 leaveSearchResults）——搜索栏与结果缓存
+    // 都还在，点「搜索」就回来
+    go(entry.path)
+    return
+  }
+  previewPath.value = entry.path
+  previewSize.value = entry.size
+  previewVisible.value = true
 }
 
 // ---- 剪贴板栏 ----
@@ -904,6 +964,9 @@ const dragging = ref(false)
 let dropController: AbortController | null = null
 
 function onDragOver(event: DragEvent) {
+  // 结果区不接拖拽上传：上传的落点是**当前目录**，而结果可能来自别的目录（用户以为拖进了
+  // 搜索结果里那个目录，实际落在了别处——这种误会不该有机会发生）。
+  if (searchViewing.value) return
   // 只认「拖文件进来」：在列表上拖选文本也会触发 dragover，不该把投放区点亮
   if (!event.dataTransfer?.types.includes('Files')) return
   dragging.value = true
@@ -915,6 +978,7 @@ function onDragLeave(event: DragEvent) {
 }
 
 async function onDrop(event: DragEvent) {
+  if (searchViewing.value) return
   dragging.value = false
   const files = Array.from(event.dataTransfer?.files ?? [])
   if (!files.length) {
@@ -1392,6 +1456,30 @@ onBeforeUnmount(hideMenu)
           <path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z" />
         </svg>
       </button>
+
+      <!-- 搜索（第二十二轮）：紧挨着书签按钮（用户要求「书签按钮右侧」），打开地址栏下方
+           那条搜索栏（见 SearchBar）。在当前目录的整棵子树里边搜边显示结果，见契约 32。 -->
+      <button
+        type="button"
+        class="tree-tool"
+        :class="search.open ? '!bg-brand/10 !text-brand' : ''"
+        :title="t('files_search')"
+        :aria-label="t('files_search')"
+        @click="openSearchBar"
+      >
+        <svg
+          class="h-4 w-4"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" />
+        </svg>
+      </button>
       <!-- 权限显示模式不再是独立按钮：点列表表头里的「权限」就能切（见下面的表头区），
            工具栏只留「做什么」的动作按钮。 -->
     </div>
@@ -1440,6 +1528,11 @@ onBeforeUnmount(hideMenu)
         </button>
       </template>
     </div>
+
+    <!-- 搜索栏（第二十二轮）：就在目录地址栏下方（用户要求）。只有「取消」会收起它——
+         点别的功能按钮都不退出搜索，跳进结果里的目录时它也留着，再点「搜索」就回到上次的结果。
+         整块状态在 store 的 state.search 里，这里只负责插在正确的位置。 -->
+    <SearchBar v-if="search.open" :sid="sid" />
 
     <!-- 常驻剪贴板栏（第五轮）：复制之后一直在，直到点「取消」；剪切的在粘完那一刻就消失
          （第十一轮：剪切是「搬走」，搬完就结束，见 sftp.paste）。
@@ -1526,6 +1619,11 @@ onBeforeUnmount(hideMenu)
     <!--
       列表的表头：名称 / 大小 / 修改时间三列可点排序（循环 升序 → 降序 → 取消）；
       「权限」列点一下切换显示形态（符号 ↔ 八进制），它不参与排序。
+
+      这一份表头**目录列表与搜索结果共用**（第二十二轮返工要求「复用排序和权限显示切换」）：
+      它在滚动容器**外面**，所以看结果时它不跟着内容滚；三列排序（对结果同样生效，见
+      stores/sftp.ts 的 sortedResults）与权限切换的行为一个字都不变，连标签都不用换——结果行
+      的第一列是「名字 + 灰色的所在目录」，名字在前，仍属「名称」。
       目录恒在文件前面由 compareEntries 保证，与点哪一列无关。
       权限列在移动端省掉（列宽不够）：没有这一列，也就没有切换形态的入口。
     -->
@@ -1591,7 +1689,16 @@ onBeforeUnmount(hideMenu)
       @drop.prevent="onDrop"
       @contextmenu.prevent="onBlankContext($event)"
     >
-      <div v-if="state.loading" class="px-3 py-6 text-center text-sm text-ink-faint">
+      <!-- 搜索结果（第二十二轮）：列表区的一种形态，与下面的目录内容互斥。表头 / 行 / 空态
+           都在 SearchResults 里（它自己一套列宽，因为结果里显示的是**相对路径**）。 -->
+      <SearchResults
+        v-if="searchViewing"
+        :sid="sid"
+        :mobile="mobile"
+        @open="openSearchEntry"
+      />
+
+      <div v-else-if="state.loading" class="px-3 py-6 text-center text-sm text-ink-faint">
         {{ t('files_loading') }}
       </div>
 
