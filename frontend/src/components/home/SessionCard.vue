@@ -103,18 +103,18 @@ const stats = computed(() => (isOpen.value ? sessionStats.statsOf(props.session.
         </svg>
       </button>
 
-      <!-- 关闭用红色（第七轮要求）：它是「中断连接」这类破坏性动作，和「打开」共用一格时
-           靠颜色区分当前是哪一个；删除按钮本来就是红的，两者并排也不冲突。 -->
+      <!-- 打开/关闭共用这一格与同一个电源图标（第二十八轮用户要求）：
+           未打开 = 绿色（启动会话），已打开 = 红色（中断连接）。
+           颜色就是状态，不再靠两个不同图标区分；hover 底色也跟着状态走。 -->
       <button
         class="g-btn-ghost !h-8 !w-8 shrink-0 !px-0"
-        :class="isOpen ? '!text-danger hover:!bg-danger/10' : ''"
+        :class="isOpen ? '!text-danger hover:!bg-danger/10' : '!text-success hover:!bg-success/10'"
         :disabled="busy"
         :title="isOpen ? t('home_close') : t('home_open')"
         :aria-label="isOpen ? t('home_close') : t('home_open')"
         @click="isOpen ? emit('close') : emit('open')"
       >
         <svg
-          v-if="isOpen"
           viewBox="0 0 24 24"
           fill="none"
           stroke="currentColor"
@@ -125,20 +125,6 @@ const stats = computed(() => (isOpen.value ? sessionStats.statsOf(props.session.
         >
           <path d="M18.36 6.64A9 9 0 1 1 5.64 6.64" />
           <line x1="12" y1="2" x2="12" y2="12" />
-        </svg>
-        <svg
-          v-else
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-4 w-4"
-        >
-          <path d="M15 3h6v6" />
-          <path d="M10 14 21 3" />
-          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
         </svg>
       </button>
 
