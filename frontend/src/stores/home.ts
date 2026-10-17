@@ -74,6 +74,11 @@ export const useHomeStore = defineStore('home', () => {
     return s ? sessionLabel(s) : undefined
   }
 
+  /** 在飞的加载请求（并发调用共享它，见 load 的注释）。 */
+  let inflight: Promise<void> | null = null
+  /** 本次在飞请求失败时是否写整页错误：任一等待者要求显示错误就算（quiet 的差异）。 */
+  let inflightShowsError = false
+
   /**
    * 拉一次会话配置 + 实时状态。
    *
@@ -82,26 +87,42 @@ export const useHomeStore = defineStore('home', () => {
    * 网络抖动不该让用户正看着的会话卡片被「加载失败 + 重试」替换掉。
    */
   async function load(force = false, quiet = false): Promise<void> {
-    // 并发去重：启动流程与首页挂载都会调，打两次没有意义（后到的请求结果还会互相覆盖）
-    if (loading.value) return
+    // 并发去重：已有请求在飞就**等它**，不能直接 return——`restore()` 依赖 `await load()`
+    // 之后的 `openStates`，旧实现在这里直接返回，启动时 HomeView 的挂载加载先发、restore
+    // 后到，后者遍历的还是空 openStates：顶栏没有会话标签、卡片没有子终端列表，要等窗口
+    // 获得焦点（或切回首页）再同步一次才补上。桌面端最容易撞上（窗口在后台时没有 focus），
+    // 移动端启动即有 visibility/focus，所以「移动端没发现」。
+    if (inflight) {
+      if (!quiet) inflightShowsError = true
+      return inflight
+    }
     if (loaded.value && !force) return
     loading.value = true
+    inflightShowsError = !quiet
     if (!quiet) error.value = ''
+    inflight = (async () => {
+      try {
+        const res = await api.sessions()
+        sessions.value = res.sessions ?? []
+        const next: Record<string, SessionState> = {}
+        for (const state of res.open ?? []) next[state.id] = state
+        openStates.value = next
+        loaded.value = true
+        // 后台同步成功也要把上一次的错误清掉：否则「启动时失败 → 回到前台同步成功」会一直
+        // 停在那块「加载失败 + 重试」上，尽管卡片数据已经是最新的。
+        error.value = ''
+      } catch (e) {
+        // 这里不抛：调用方是启动流程与首页，两者都要「显示错误但继续渲染」。
+        // 等待者里有非 quiet 的（比如用户点了重试）就写错误，见 inflightShowsError。
+        if (inflightShowsError) error.value = describeError(e)
+      } finally {
+        loading.value = false
+      }
+    })()
     try {
-      const res = await api.sessions()
-      sessions.value = res.sessions ?? []
-      const next: Record<string, SessionState> = {}
-      for (const state of res.open ?? []) next[state.id] = state
-      openStates.value = next
-      loaded.value = true
-      // 后台同步成功也要把上一次的错误清掉：否则「启动时失败 → 回到前台同步成功」会一直
-      // 停在那块「加载失败 + 重试」上，尽管卡片数据已经是最新的。
-      error.value = ''
-    } catch (e) {
-      // 这里不抛：调用方是启动流程与首页，两者都要「显示错误但继续渲染」
-      if (!quiet) error.value = describeError(e)
+      await inflight
     } finally {
-      loading.value = false
+      inflight = null
     }
   }
 

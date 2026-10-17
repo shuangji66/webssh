@@ -3504,3 +3504,48 @@ location /app/ {
   关闭码必须是 4002。
 - `make test`、`make check` 全绿；前端表单提示用 mock 数据在开发服务器上人工点过
   （真实 PTY 受本机 `/dev/ptmx` 限制未跑）。
+
+## 37. 第二十八轮：启动恢复的并发加载竞态（没有会话标签 / 子终端列表）
+
+### 37.1 用户报告
+
+桌面端进入前端时，顶栏只有「会话」标签，卡片上也没有子终端列表（卡片本身、系统信息都正常）；
+鼠标随便点一下（窗口获得焦点）之后才补出来。移动端没有复现。
+
+### 37.2 根因
+
+`home.load()` 的并发去重是「有人正在加载就直接 return」，而**不是等那一份结果**：
+
+1. `HomeView.onMounted` 先调 `home.load()`，`loading = true`，`/api/sessions` 在飞；
+2. `App.onMounted` 先 `await loadInfo()`，再调 `home.restore()`；`restore()` 里
+   `!loaded.value` 成立 → `await load(...)`，但此时 `loading` 为真，`load` 立即返回；
+3. `restore()` 继续遍历**还是空的** `openStates`，于是不建标签、不 `terminals.ensure`；
+4. 稍后列表请求返回，卡片画出来了（所以看起来「会话是打开的、CPU 也有」），但已经没有
+   任何东西再把 `open` 列表投影成标签。要等 `syncOpenSessions()` 被 `focus` /
+   `visibilitychange` / 切回首页触发时才补上——桌面端从后台打开时窗口没有焦点，正是用户
+   说的「鼠标随便点一下才显示」；移动端启动即有可见性/焦点事件，所以没暴露。
+
+同一根因的另一条路径：启动那一次加载失败（网络/后端暂不可用），首页点「重试」只调
+`home.load(true)`——卡片会出来，标签与子终端列表仍然不会。
+
+### 37.3 修复
+
+- `stores/home.ts` 的 `load()`：并发调用改为**共享同一个 in-flight promise**，后到者
+  `await` 它（`force`/`quiet` 的差异不值得再打一次请求）；失败时只要**任一**等待者是非
+  `quiet` 的（比如用户点重试）就写 `error`，后台同步仍然保持「失败不覆盖卡片」的语义。
+- `HomeView` 新增 `retryLoad()`：`await home.load(true)` 成功后再 `await home.restore(true)`。
+  `load` 负责把失败原因显示出来（`restore` 的加载是 quiet 的），`restore` 幂等地补齐标签
+  与子终端列表；多一次请求只发生在点重试时。
+
+### 37.4 验证
+
+- Playwright（真实后端，构造「已打开会话」+ `page.route` 把 `GET /api/sessions` 延迟 2.5s）：
+  - 修复前：启动后 `header .app-tab` = `["会话"]`，卡片正常；派发 `focus` 后变成
+    `["会话", "冒烟测试"]`（复现用户描述）；
+  - 修复后：延迟期间启动完成，`["会话", "冒烟测试"]` 已就位，`focus` 后不重复、不变化。
+- 失败-重试路径：`route.abort()` 所有 `GET /api/sessions` → 错误块 + 只有「会话」标签；
+  放行后点「重试」→ 卡片与会话标签同时出现。
+- 无延迟的正常启动无回归（标签与卡片都在）。
+- `npm run check` 通过；`make test` 全绿（本轮未改后端）。
+- 未验证真实子终端列表：本机沙箱打不开 `/dev/ptmx`（`open /dev/ptmx: permission denied`），
+  无法通过 WS 建出终端；标签与 `terminals.ensure` 在 `restore()` 的同一个循环里，共享同一竞态。

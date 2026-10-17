@@ -90,6 +90,20 @@ const list = computed(() => {
 /** 只有一个会话时排序没有意义，按钮不显示（用户要求）；零会话与加载失败（不渲染卡片）时也不显示。 */
 const canSort = computed(() => !home.error && home.sessions.length >= 2)
 
+/**
+ * 加载失败后的重试。
+ *
+ * 不能只 `load(true)`：首页自己拉成功只够画出卡片，会话标签与卡片上的子终端列表由
+ * `home.restore` 投影（启动时在 App.vue 里做）。启动那一次 restore 若因网络失败没建出
+ * 标签，之后没有任何东西会再补——用户看到「卡片在、标签没了」（第二十八轮用户报告，
+ * 与启动竞态同一个症状）。`load` 负责把失败原因显示出来（restore 的加载是 quiet 的），
+ * 成功后 restore 幂等补齐；多拉一次请求只在点重试时发生。
+ */
+async function retryLoad(): Promise<void> {
+  await home.load(true)
+  if (!home.error) await home.restore(true)
+}
+
 onMounted(() => {
   if (!home.loaded) void home.load()
 })
@@ -411,7 +425,7 @@ async function onDelete(session: SessionView) {
       <!-- 加载失败要显示原因 + 重试：失败也走空态的话，用户会以为自己的会话被删光了 -->
       <div v-if="home.error" class="g-panel p-8 text-center">
         <p class="break-all text-sm text-danger">{{ t('home_load_failed', { error: home.error }) }}</p>
-        <button class="g-btn-secondary mt-4" @click="home.load(true)">{{ t('common_retry') }}</button>
+        <button class="g-btn-secondary mt-4" @click="retryLoad()">{{ t('common_retry') }}</button>
       </div>
 
       <div
