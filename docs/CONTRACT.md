@@ -679,7 +679,7 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   （15.2/16.2 删的，见 16.2）。操作：打开（或关闭）、**进入**（仅已打开时）、编辑、删除。
   已打开时「关闭」按钮要显眼；「进入」是第二十五轮补的入口——后端开着但本机还没有标签
   （另一台设备开的会话、或页面停在旧快照上）时，用户不必先关掉再打开。
-  **打开/关闭共用同一个按钮与同一个电源图标**（第二十八轮）：未打开时绿色（`text-success`，
+  **打开/关闭共用同一个按钮与同一个电源图标**（第二十九轮）：未打开时绿色（`text-success`，
   点击 = 打开会话），已打开时红色（`text-danger`，点击 = 关闭会话）；hover 底色同色系。
   不再用「外链箭头」表示打开——状态只由颜色表达，图标不随状态变。
 - **首页排序**（第二十七轮）：工具条「设置」左侧有一个排序切换按钮，**仅当会话数 ≥ 2**
@@ -3424,8 +3424,13 @@ location /app/ {
   （`load(force, true)`）：失败保留现有卡片，不把首页换成「加载失败 + 重试」。
 - `SessionView.onMounted`：进入时 `terminals.ensure`，仍无终端就 `terminals.add`——
   「进入恢复的会话落在终端 1」这条 15.3 的体验保留，只是时点从「启动」挪到「进入」。
+  **state 缺失或已不再是 `open` 时也要兜底建一个终端**（评审补充）：另一台设备关掉
+  会话、本地快照又还没同步时，用户点进标签会看到一个没有任何终端的面板（连「重连」都没有
+  入口）；补一个终端后它连上去会拿到 `gone` / 创建失败的控制帧，标签保留并给出原因。
 - `terminals.ensure` 不再预置 `restoring: true`：恢复的视图可能不挂载，预置会让卡片状态点
-  永远停在「恢复中」的琥珀色；真正的置位在 `TerminalPane.openSocket`。
+  永远停在「恢复中」的琥珀色；真正的置位在 `TerminalPane` 的 `onMounted` / `reconnect`，
+  按 `tid` 判定（只有已有 tid 的终端才会回放并等 READY；新建终端没有回放，置位会让提示条
+  永远挂着）。
 - 卡片新增「进入」按钮（仅 `state.open === true`）：走 `home.openSession`（后端幂等）→
   激活标签 → `ensure` / `add`。这是「本机没有标签/子终端」时的兜底入口，不必先关再开。
 - i18n：新增 `home_enter`（进入会话 / Enter session）。
@@ -3470,6 +3475,13 @@ location /app/ {
   认证方式变了则不 carry over（类型不匹配的缓存会让下一次拨号报出与原因不符的
   no_credential）。API 调用方传空密码不会覆盖内存里那份能用的（前端表单不会发空串）。
   「保存凭据」关掉仍只影响持久化，不影响当前已打开会话的可用性。
+- **旧密文解不开时照常保存**（评审补充，`sessions.go` 的 carry over 分支）：carry over
+  需要解密落盘的那份，而它可能已经解不开（master.key 换过、密文损坏）。这时**不**返回 500：
+  这次保存的目的就是清掉那份密文，因为「读不出一个马上要被丢弃的字段」而失败等于把用户锁死
+  ——开关关不掉，之后每次 open 也都会在同一处解密失败（前端只看到一句 internal），唯一出路
+  是删掉会话重建。处置是记一条 `logx.Warnf`、跳过 carry over，保存照常完成（密文被清掉）。
+  代价：内存里没有可用凭据，新建子终端报 `no_credential`（终端里有「重新打开会话以重新输入
+  凭据」的指引）。**不要**把它降级成「拿空密码去连」：那会把数据损坏说成认证失败。
 - **WS 错误分流**（`terminal.go` + `protocol.go` + `serverapi/index.ts`）：
   - 新建终端失败且 `apiErr.Status == 404`（会话/运行时不存在）→ 仍发 `gone`；
   - 其余失败（`no_credential` / `auth_failed` / `hostkey_*` / `shell_failed` / 拨号超时…）→
@@ -3494,6 +3506,8 @@ location /app/ {
   说了「已打开的终端仍是旧连接」，需要全部生效时用户自己重新打开会话。
 - **不改 `saveCredential=false` 的持久化语义**：carry over 只到 close；关闭/进程退出后
   仍然要求重新输入。
+- **解不开的旧凭据不阻止「关掉保存凭据」**：见 36.3 最后一条。丢掉的只是本来就读不出来的
+  那一份，用户重新输入一次即可；反过来（报错、拒绝保存）没有任何补救路径。
 
 ### 36.5 验证
 
@@ -3502,6 +3516,9 @@ location /app/ {
   close 后缓存消失、open 回到 `credential_required`。
 - `TestCredentialSaveOffKeepsVerifiedMemoryCredential`（新增）：内存里有一份「本次 open
   验证成功」的凭据时，关掉保存开关不能被磁盘上的旧密码覆盖；API 传空密码也不能把它清空。
+- `TestCredentialSaveOffWithUndecryptableStored`（新增）：把落盘密文换成一串解不开的值后
+  关掉保存开关——保存必须成功、`credentialSaved=false`、配置里不再有密文、内存里也没有凭据
+  （不 carry over）。
 - `TestTerminalCreateFailureIsNotGone`（新增，不需要 PTY）：抹掉内存凭据后新建终端，
   收到的文本要包含「没有可用的凭据」与「请重新打开会话」，**不能**包含 `\x1b]gone\x07`，
   关闭码必须是 4002。
@@ -3536,9 +3553,12 @@ location /app/ {
 - `stores/home.ts` 的 `load()`：并发调用改为**共享同一个 in-flight promise**，后到者
   `await` 它（`force`/`quiet` 的差异不值得再打一次请求）；失败时只要**任一**等待者是非
   `quiet` 的（比如用户点重试）就写 `error`，后台同步仍然保持「失败不覆盖卡片」的语义。
-- `HomeView` 新增 `retryLoad()`：`await home.load(true)` 成功后再 `await home.restore(true)`。
+- `HomeView` 新增 `retryLoad()`：`await home.load(true)` 成功后再 `await home.restore()`
+  （**不带 force**——刚拉过的那份就是最新的，force 会让 restore 内部再拉一次）。
   `load` 负责把失败原因显示出来（`restore` 的加载是 quiet 的），`restore` 幂等地补齐标签
-  与子终端列表；多一次请求只发生在点重试时。
+  与子终端列表。
+- 评审补齐：`load()` 共享的那份 in-flight 请求若**失败**且调用者是 `force`（用户点了
+  「重试」/手动刷新），会自己再发一次；否则点重试只是把同一句失败原因再显示一遍，要点第二次。
 
 ### 37.4 验证
 
@@ -3549,6 +3569,32 @@ location /app/ {
 - 失败-重试路径：`route.abort()` 所有 `GET /api/sessions` → 错误块 + 只有「会话」标签；
   放行后点「重试」→ 卡片与会话标签同时出现。
 - 无延迟的正常启动无回归（标签与卡片都在）。
-- `npm run check` 通过；`make test` 全绿（本轮未改后端）。
+- `npm run check` 通过；`make test` 全绿（该轮未改后端；评审补充的后端改动见 36.3）。
 - 未验证真实子终端列表：本机沙箱打不开 `/dev/ptmx`（`open /dev/ptmx: permission denied`），
   无法通过 WS 建出终端；标签与 `terminals.ensure` 在 `restore()` 的同一个循环里，共享同一竞态。
+
+### 37.5 评审补充：同步快照会复活刚关闭的会话（幽灵标签）
+
+`restore()` 只加标签、从不删。`/api/sessions` 响应里的 `open` 是**请求发出那一刻的快照**，
+于是出现这样一条路径：后台同步（`focus` / 回到首页）的请求在飞时用户关掉了会话，响应回来
+`openStates` 被整表替换，`restore()` 把那个已经关掉的会话重新投影成标签与「已打开」卡片。
+这个标签点进去只会拿到 `gone`，而且没有任何逻辑会再把它摘掉。
+
+竞态的另一半是「关闭流程看不见请求在飞」，所以判据不能放在关闭一侧。做法：`stores/home.ts`
+维护一个**本地改动代 `openGen`**（`openSession` / `closeSession` / `forgetSession` / `remove`
+成功改本地状态时 `+1`）；`load()` 在发请求前记下代次，响应回来若代次变了就**只更新配置列表、
+丢弃 `open` 部分**（本地状态更新鲜，下一次同步会拿到一致的快照）。删掉这个守卫就会重现
+幽灵标签——它不是可以顺手简化的防御性代码。
+
+验证（`make check` 通过；这种竞态没有单元测试基建，用 Playwright + `page.route` 构造）：
+mock `/api/info`、`/api/sessions`、`/api/sessions/close`——首次 `GET` 回「会话 s1 已打开」，
+派发 `focus` 触发后台同步并让这次 `GET` 延迟 800ms 返回**请求发出时**的快照，期间点卡片上的
+「关闭」。结果：
+
+- 带守卫：关闭后 `header .app-tab` = `["会话"]`，卡片按钮回到「打开 / 编辑 / 删除」；
+- 把 `gen === openGen` 改成恒真（模拟修复前）：标签与「已打开」卡片都会被迟到的快照复活
+  （`["会话", "冒烟测试"]`，按钮回到「进入会话 / 关闭 / …」）——说明这条用例确实能抓到该 bug。
+
+同一次改造还要保住正常路径：本机没有任何标签时，`focus` 后的同步必须把另一台设备新开的
+会话补成标签与卡片子终端（实测 `["会话", "冒烟测试 1"]`，卡片出现子终端行）。
+改这一处时两条路径都要走一遍。

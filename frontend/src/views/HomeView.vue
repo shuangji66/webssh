@@ -96,12 +96,14 @@ const canSort = computed(() => !home.error && home.sessions.length >= 2)
  * 不能只 `load(true)`：首页自己拉成功只够画出卡片，会话标签与卡片上的子终端列表由
  * `home.restore` 投影（启动时在 App.vue 里做）。启动那一次 restore 若因网络失败没建出
  * 标签，之后没有任何东西会再补——用户看到「卡片在、标签没了」（第二十八轮用户报告，
- * 与启动竞态同一个症状）。`load` 负责把失败原因显示出来（restore 的加载是 quiet 的），
- * 成功后 restore 幂等补齐；多拉一次请求只在点重试时发生。
+ * 与启动竞态同一个症状）。
+ *
+ * `load`（非 quiet）负责把失败原因显示出来；成功后用**不带 force** 的 `restore()` 只做
+ * 投影——`force` 会让它再拉一次 /api/sessions，刚拉过的那份就是最新的，没有理由打两次。
  */
 async function retryLoad(): Promise<void> {
   await home.load(true)
-  if (!home.error) await home.restore(true)
+  if (!home.error) await home.restore()
 }
 
 onMounted(() => {

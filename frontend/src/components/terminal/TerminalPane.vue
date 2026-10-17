@@ -1429,6 +1429,10 @@ watch(
 
 onMounted(() => {
   initTerminal()
+  // 恢复回来 / 从别的子标签切回来时挂载的是**后端还活着的终端**：后端会先回放历史再回
+  // READY，这段空窗期要显示「正在恢复」（与 reconnect 同一判据）。新建的终端（tid 为空）
+  // 没有回放、永远等不到 READY，不能置位——否则提示条会一直挂着。
+  if (props.tab.tid) props.tab.restoring = true
   openSocket()
   regControls()
 })

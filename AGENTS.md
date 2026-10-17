@@ -155,6 +155,11 @@
   这不是「表单凭据入内存」；来源是当前会话正在用的那份（`sessions.go` 的 save switch）。
   同一请求带了新凭据时以新凭据为准；认证方式变了不 carry over；API 传空凭据不覆盖内存里
   能用的那份。
+  **旧密文解不开时（master.key 换过 / 密文损坏）不要把保存打成 500**：这次保存本来就要把
+  那份密文清掉，读不出一个马上要被丢弃的字段等于把用户锁死（开关关不掉，之后每次 open 都
+  在同一处解密失败）。记一条 `logx.Warnf`、跳过 carry over、照常保存——代价是新子终端报
+  `no_credential`，终端里有「重新打开会话以重新输入凭据」的指引。**不要**降级成拿空密码
+  去连（那会把数据损坏说成认证失败）。
 - 远程命令一律走 `remote_exec.go` 的 helper：`ssh.Session` 的 exec 通道 + `sh -c` +
   **所有插值路径用单引号引用**（`shellQuote`）+ 采集 stdout/stderr + 超时 + ctx 取消。
   绝不把用户给的路径裸拼进命令。
@@ -274,7 +279,11 @@
 - 应用回到前台 / 切回首页时 `home.restore(true)` 再对齐一次后端状态（`App.vue` 的
   `syncOpenSessions`，单飞、隐藏时跳过）：移动端 PWA 常驻时页面不重新加载，没有这一步别的设备
   新开的会话永远不会变成标签与卡片子终端列表。`terminals.ensure` 的 `restoring` 不要预置 true
-  ——视图可能还没挂载，预置会让状态点一直停在琥珀色。
+  ——视图可能还没挂载，预置会让状态点一直停在琥珀色；真正的置位在 `TerminalPane` 的
+  `onMounted` / `reconnect`，按 `tid` 判定（新建终端没有回放，置位会让提示条永远挂着）。
+  `home.load` 里那个 **`openGen` 代次守卫不能删**：`/api/sessions` 的 `open` 是请求发出时
+  的快照，本地在请求在飞期间开/关过会话时代次会变，响应里的 `open` 部分必须丢弃——否则
+  `restore()` 会把刚关掉的会话复活成幽灵标签（点进去只有 `gone`，而且再没人会摘掉它）。
 - 卡片上的**系统信息**（第十三轮，见 CONTRACT 23）：已连接的会话在子终端列表**之上**显示两行
   纯数字（CPU + 负载 / 内存 + 磁盘），5 秒刷新一次。**轮询一律走 `stores/sessionStats.ts`，
   由 `HomeView` 用 `sync(openIds, visible)` 驱动**——不要把定时器写进卡片组件（卡片会被反复

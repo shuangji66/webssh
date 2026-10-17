@@ -68,7 +68,8 @@ const stats = computed(() => (isOpen.value ? sessionStats.statsOf(props.session.
 
 <template>
   <article class="g-panel group flex flex-col p-4 transition-shadow hover:shadow-card">
-    <!-- 第一行：会话名（放不下就横向滚动）+ 右上角三个仅图标按钮。
+    <!-- 第一行：会话名（放不下就横向滚动）+ 右上角的仅图标按钮（进入 / 电源 / 编辑 / 删除；
+         未打开时没有「进入」，所以是三个或四个）。
          名字外面那层滚动容器必须有 min-w-0，否则 flex 子项不会收缩、滚动条永远不出现。 -->
     <div class="flex items-center gap-1.5">
       <div class="thin-scroll min-w-0 flex-1 overflow-x-auto">
@@ -103,7 +104,7 @@ const stats = computed(() => (isOpen.value ? sessionStats.statsOf(props.session.
         </svg>
       </button>
 
-      <!-- 打开/关闭共用这一格与同一个电源图标（第二十八轮用户要求）：
+      <!-- 打开/关闭共用这一格与同一个电源图标（第二十九轮用户要求）：
            未打开 = 绿色（启动会话），已打开 = 红色（中断连接）。
            颜色就是状态，不再靠两个不同图标区分；hover 底色也跟着状态走。 -->
       <button

@@ -223,10 +223,11 @@ onMounted(() => {
   // attach 终端，免得打开首页就顶掉别的设备。所以「进入」这一帧要把后端的终端补进本地
   // 标签，一个都没有时建「终端 1」——恢复的会话进入后仍然落在终端，而不是文件管理。
   const state = home.stateOf(props.sid)
-  if (state?.open) {
-    terminals.ensure(props.sid, state)
-    if (terminals.countOf(props.sid) === 0) terminals.add(props.sid)
-  }
+  if (state?.open) terminals.ensure(props.sid, state)
+  // 后端已经不再报告这个会话（另一台设备关掉了它、或本地快照过期）时也要给一个终端：
+  // 否则进入后主区域落到文件管理、子终端栏空空，用户连「重连」都没有入口。终端连上去
+  // 会立刻拿到 gone（或创建失败）的控制帧，标签保留并给出原因——比一片空白诚实。
+  if (terminals.countOf(props.sid) === 0) terminals.add(props.sid)
 
   const el = strip.value
   updateLabelState()

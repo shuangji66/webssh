@@ -74,10 +74,23 @@ export const useHomeStore = defineStore('home', () => {
     return s ? sessionLabel(s) : undefined
   }
 
-  /** 在飞的加载请求（并发调用共享它，见 load 的注释）。 */
-  let inflight: Promise<void> | null = null
+  /** 在飞的加载请求（并发调用共享它，见 load 的注释）；布尔值 = 这一次是否成功。 */
+  let inflight: Promise<boolean> | null = null
   /** 本次在飞请求失败时是否写整页错误：任一等待者要求显示错误就算（quiet 的差异）。 */
   let inflightShowsError = false
+
+  /**
+   * 本地对「已打开会话」的改动代（开 / 关 / 忘 / 删各 +1）。
+   *
+   * 用途只有一个：`/api/sessions` 响应里的 `open` 是**请求发出那一刻的快照**。请求在飞期间
+   * 用户关掉了会话（后端也关了、标签与卡片都收拾干净了），这份快照回来会把 `openStates`
+   * 写回去，`restore()` 随即把已关闭的会话重新投影成标签与「已打开」卡片——一个点进去只会
+   * 报「会话不存在」的幽灵标签，而且没有任何逻辑会再把它摘掉（restore 只加不删）。
+   *
+   * 判据放在这里而不是「关闭流程进行中就不许同步」：竞态的另一半是「同步请求在飞时用户关
+   * 会话」，那一侧（关闭流程）根本看不见请求在飞，只有比较代次才能判断这份响应是否已过期。
+   */
+  let openGen = 0
 
   /**
    * 拉一次会话配置 + 实时状态。
@@ -92,37 +105,54 @@ export const useHomeStore = defineStore('home', () => {
     // 后到，后者遍历的还是空 openStates：顶栏没有会话标签、卡片没有子终端列表，要等窗口
     // 获得焦点（或切回首页）再同步一次才补上。桌面端最容易撞上（窗口在后台时没有 focus），
     // 移动端启动即有 visibility/focus，所以「移动端没发现」。
+    //
+    // ⚠️ `force` 的调用者与上面那类「顺手同步」不同：它代表用户明确要求（点「重试」/手动
+    // 刷新）。若它等到的这一份**失败了**，直接返回只会把同一句失败原因再显示一遍，用户得
+    // 点第二次才真的重试——所以失败时要自己再发一次（见下面的 inflight !== joined 判断，
+    // 避免和同时到达的另一个等待者叠加成两个请求）。
     if (inflight) {
       if (!quiet) inflightShowsError = true
-      return inflight
+      const joined = inflight
+      const ok = await joined
+      if (ok || !force) return
+      if (inflight && inflight !== joined) return
     }
     if (loaded.value && !force) return
     loading.value = true
     inflightShowsError = !quiet
     if (!quiet) error.value = ''
-    inflight = (async () => {
+    // 这份快照对应的「本地改动代」：响应回来时若已经变了，说明用户在请求在飞期间开/关过
+    // 会话，`open` 部分已经过期，不能拿它覆盖本地状态（见 openGen 的说明）。
+    const gen = openGen
+    const request = (async (): Promise<boolean> => {
       try {
         const res = await api.sessions()
         sessions.value = res.sessions ?? []
-        const next: Record<string, SessionState> = {}
-        for (const state of res.open ?? []) next[state.id] = state
-        openStates.value = next
+        if (gen === openGen) {
+          const next: Record<string, SessionState> = {}
+          for (const state of res.open ?? []) next[state.id] = state
+          openStates.value = next
+        }
         loaded.value = true
         // 后台同步成功也要把上一次的错误清掉：否则「启动时失败 → 回到前台同步成功」会一直
         // 停在那块「加载失败 + 重试」上，尽管卡片数据已经是最新的。
         error.value = ''
+        return true
       } catch (e) {
         // 这里不抛：调用方是启动流程与首页，两者都要「显示错误但继续渲染」。
         // 等待者里有非 quiet 的（比如用户点了重试）就写错误，见 inflightShowsError。
         if (inflightShowsError) error.value = describeError(e)
+        return false
       } finally {
         loading.value = false
       }
     })()
+    inflight = request
     try {
-      await inflight
+      await request
     } finally {
-      inflight = null
+      // 只有自己发的那份能把自己清掉：并发路径里 inflight 可能已经被下一次请求接手
+      if (inflight === request) inflight = null
     }
   }
 
@@ -163,6 +193,7 @@ export const useHomeStore = defineStore('home', () => {
     await api.deleteSession(id)
     sessions.value = sessions.value.filter((item) => item.id !== id)
     delete openStates.value[id]
+    openGen++
     if (!target) return
     try {
       await api.forgetHostKey(target.host, target.port)
@@ -193,6 +224,7 @@ export const useHomeStore = defineStore('home', () => {
   async function openSession(id: string, credential?: SessionCredential): Promise<SessionState> {
     const res = await api.openSession({ id, ...credential })
     openStates.value[id] = res.state
+    openGen++
     // 后端会顺手更新 lastUsedAt；本地也跟一下，否则卡片上的「最近使用」要等下次刷新才变
     const s = sessions.value.find((item) => item.id === id)
     if (s) s.lastUsedAt = new Date().toISOString()
@@ -240,6 +272,7 @@ export const useHomeStore = defineStore('home', () => {
       if (!isGoneError(e)) throw e
     }
     delete openStates.value[id]
+    openGen++
   }
 
   /**
@@ -259,6 +292,7 @@ export const useHomeStore = defineStore('home', () => {
     useQuickAccessStore().forget(sid)
     useSessionUiStore().forget(sid)
     delete openStates.value[sid]
+    openGen++
   }
 
   /**

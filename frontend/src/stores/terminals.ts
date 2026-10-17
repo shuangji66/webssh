@@ -153,7 +153,8 @@ export const useTerminalsStore = defineStore('terminals', () => {
         status: info.exited ? 'exited' : 'open',
         // **不**在这里预置 restoring：ensure 只把后端的终端投影成标签，不代表已经发起了挂载。
         // 会话恢复后视图要等用户进入才挂载（见 App.vue），预置 true 会让卡片上的状态点一直
-        // 停在「恢复中」的琥珀色。真正的置位在 TerminalPane 发起挂载时（openSocket）。
+        // 停在「恢复中」的琥珀色。真正的置位在 `TerminalPane` 挂载 / 重连时，按 tid 判定
+        // （`onMounted` / `reconnect`：只有已有 tid 的终端才会回放并等 READY）。
         restoring: false,
         createdAt: info.createdAt || new Date().toISOString()
       })

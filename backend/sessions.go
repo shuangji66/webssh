@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"webssh/backend/internal/apierr"
+	"webssh/backend/internal/logx"
 	"webssh/backend/internal/secret"
 	"webssh/backend/internal/store"
 )
@@ -433,12 +434,25 @@ func (m *sessionManager) save(in store.SessionInput) (*store.SessionView, *apier
 		//
 		// 用户在同一请求里给了新凭据时走上面那个 case（新凭据优先）；认证方式变了则不
 		// carry over（类型不匹配的缓存会让下一次拨号报出与原因不符的 no_credential）。
+		// 旧密文解不开时不 carry over、但保存照常完成，见下面的分支。
 		if _, ok := m.memCreds[sc.ID]; !ok {
 			mc, credErr := m.storedCredential(cur)
 			if credErr != nil {
-				return nil, credErr
+				// 旧密文解不开（master.key 换过、密文损坏）：**照常完成这次保存**，只是不
+				// carry over ——本次保存的目的正是把那份密文清掉，因为「读不出一个马上就要
+				// 被丢弃的字段」而返回 500，等于把用户锁死在死角里：开关关不掉，这个会话之后
+				// 每次 open 也都会在同一处解密失败（前端只能拿到一句 internal），唯一的出路
+				// 是删掉会话重建。
+				//
+				// 代价说清楚：内存里没有可用的凭据，新建子终端会报 no_credential。这不是静默
+				// 失败——终端里那句提示明确要求「重新打开会话以重新输入凭据」，日志里也留了
+				// 一条可定位的记录。**不要**把它降级成「空密码去连」：那会把一个数据损坏变成
+				// 一个认证失败，原因彻底丢掉。
+				logx.Warnf("会话 %s 的旧凭据解密失败，跳过 carry over（本次保存会清掉落盘的那份）：%s",
+					sc.ID, credErr.Message)
+			} else {
+				m.setCachedCredentialLocked(sc.ID, mc)
 			}
-			m.setCachedCredentialLocked(sc.ID, mc)
 		}
 	case created || prevAuthType != sc.AuthType:
 		// 认证方式变了 → 缓存的凭据类型已经不匹配（旧的是密码、新的是私钥），留着只会

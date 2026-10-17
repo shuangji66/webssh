@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"webssh/backend/internal/secret"
 	"webssh/backend/internal/testssh"
 )
 
@@ -318,6 +319,49 @@ func TestCredentialSaveOffKeepsVerifiedMemoryCredential(t *testing.T) {
 	mc, ok = a.mux.sessions.cachedCredential(sid)
 	if !ok || mc.password != "verified-at-open" {
 		t.Fatalf("空密码不该覆盖内存里能用的凭据：%+v", mc)
+	}
+}
+
+// TestCredentialSaveOffWithUndecryptableStored 锁住「旧密文解不开时关掉保存凭据」的处置。
+//
+// 场景：master.key 换过 / 密文损坏。会话已经开着（现有连接不受影响），用户来关「保存凭据」。
+// 这次保存本来就要把那份密文清掉——如果因为「读不出一个马上要被丢弃的字段」返回 500，
+// 用户就被锁死在死角里：开关关不掉，之后每次 open 也都会在同一处解密失败（前端只能拿到一句
+// internal），唯一出路是删掉会话重建。
+//
+// 正确做法：记一条日志、跳过 carry over，保存照常完成；内存里没有可用凭据（新终端会报
+// no_credential，而不是拿空密码去连），落盘的那份密文被清掉。
+func TestCredentialSaveOffWithUndecryptableStored(t *testing.T) {
+	a := newCredApp(t)
+	saved := a.ok(t, "/api/sessions/save", map[string]any{
+		"host": a.ssh.Host(), "port": a.ssh.Port(), "user": a.sshUser,
+		"authType": "password", "password": secretPassword,
+	})
+	sid := strOf(saved["session"], "id")
+	a.ok(t, "/api/sessions/open", map[string]any{"id": sid})
+
+	// 换成一把解不开的密文（AAD 绑定 sid 与字段，换了主密钥就是这个效果）。
+	a.mux.sessions.mu.Lock()
+	a.mux.sessions.configs[sid].Password = &secret.Secret{V: 1, CT: "bm90LWEtcmVhbC1jaXBoZXJ0ZXh0"}
+	a.mux.sessions.mu.Unlock()
+
+	out := a.ok(t, "/api/sessions/save", map[string]any{
+		"id": sid, "host": a.ssh.Host(), "port": a.ssh.Port(), "user": a.sshUser,
+		"authType": "password", "saveCredential": false,
+	})
+	view, _ := out["session"].(map[string]any)
+	if view["credentialSaved"] != false || view["hasPassword"] != false {
+		t.Fatalf("关掉保存凭据后应当没有任何凭据：%v", view)
+	}
+	// 解不开的那份必须被这次保存清掉，不能留在配置里继续毒下一次 open。
+	raw := readLocal(t, filepath.Join(a.renv.DataDir, "sessions", sid+".json"))
+	if strings.Contains(raw, `"password": {`) {
+		t.Fatalf("解不开的旧密文应当被清掉：%s", raw)
+	}
+	assertNoCredentialOnDisk(t, a)
+	// 没有可 carry over 的来源：内存里也不该凭空多出（或留下一份空的）凭据。
+	if mc, ok := a.mux.sessions.cachedCredential(sid); ok {
+		t.Fatalf("解不开的凭据不 carry over，内存里不该有凭据：%+v", mc)
 	}
 }
 
