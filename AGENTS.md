@@ -256,8 +256,19 @@
   `.xterm-helper-textarea` 显式排除（它的字号由终端字号决定，内联样式设置）。
 - 首页卡片：**子终端列表是内联在卡片下的**（`SessionTerminalsDialog` 第六轮已删除），
   点一行是「快捷打开」（切应用标签 + `terminals.setActive` + `panes.get().focus()`），
-  关闭单个终端要先确认（会终止远端 shell）。卡片右上角是三个仅图标按钮，不标注认证方式，
-  也不显示状态灯/时间。终端状态点的配色只有一份：`terminals.termStatusDotClass()`。
+  关闭单个终端要先确认（会终止远端 shell）。卡片右上角是仅图标按钮（打开/关闭、编辑、删除；
+  已打开时另有「进入」，见下一段），不标注认证方式，也不显示状态灯/时间。终端状态点的配色只有
+  一份：`terminals.termStatusDotClass()`。
+- **启动恢复 = 建标签，不等于进入会话**（第二十五轮，CONTRACT 35）：`home.restore()` 把后端
+  `open` 列表投影成应用标签 + 终端子标签（卡片上因此有子终端列表），但用
+  `appTabs.openSession(sid, label, false)` **不激活**；启动后停在首页。`SessionView` 只在用户
+  第一次进入时挂载（`App.vue` 的 `enteredSessions`，进入过就保持挂载）。**不要**在启动循环里
+  `terminals.add()`（会给每个恢复的会话拨一条 SSH），**也不要**恢复时就挂载所有会话视图
+  （后台终端会 attach，顶掉别的设备）。进入时补终端在 `SessionView.onMounted`。
+- 应用回到前台 / 切回首页时 `home.restore(true)` 再对齐一次后端状态（`App.vue` 的
+  `syncOpenSessions`，单飞、隐藏时跳过）：移动端 PWA 常驻时页面不重新加载，没有这一步别的设备
+  新开的会话永远不会变成标签与卡片子终端列表。`terminals.ensure` 的 `restoring` 不要预置 true
+  ——视图可能还没挂载，预置会让状态点一直停在琥珀色。
 - 卡片上的**系统信息**（第十三轮，见 CONTRACT 23）：已连接的会话在子终端列表**之上**显示两行
   纯数字（CPU + 负载 / 内存 + 磁盘），5 秒刷新一次。**轮询一律走 `stores/sessionStats.ts`，
   由 `HomeView` 用 `sync(openIds, visible)` 驱动**——不要把定时器写进卡片组件（卡片会被反复

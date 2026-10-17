@@ -37,6 +37,7 @@ export const en: Record<string, string> = {
   home_empty_desc: 'Click “Add remote session”, fill in the address and login name, then open an SSH terminal directly.',
   home_load_failed: 'Failed to load sessions: {error}',
   home_open: 'Open',
+  home_enter: 'Enter session',
   home_close: 'Close',
   home_opened: 'Open',
   home_closed: 'Closed',

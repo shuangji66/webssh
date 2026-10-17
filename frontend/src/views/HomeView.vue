@@ -107,7 +107,7 @@ function needsCredential(e: unknown): boolean {
  * 抽出来是因为它要跑两次——第一次不带凭据，收到 credential_required 后带着用户填的凭据再跑
  * 一次。两次的顺序完全一样，复制一份必然有一份会先腐坏。
  */
-async function openWith(session: SessionView, credential?: SessionCredential) {
+async function openWith(session: SessionView, credential?: SessionCredential, announce = true) {
   const state = await home.openSession(session.id, credential)
   tabs.openSession(session.id, sessionLabel(session))
   // ensure 恢复后端已有的终端（并把激活项落到第一个），add 新建即激活 —— 两者都会写
@@ -116,14 +116,21 @@ async function openWith(session: SessionView, credential?: SessionCredential) {
   // 桌面与窄屏都要自动建一个终端（契约 11.7 / 第五轮用户要求：手机上新开会话也直接落在
   // 「终端 1」，而不是丢进文件管理子标签——新会话的第一件事就是敲命令）
   if (terminals.countOf(session.id) === 0) terminals.add(session.id)
-  toast.show(t('home_open_success', { name: sessionLabel(session) }), 'success')
+  // 进入一个本来就开着的会话不必再报一次「已打开」
+  if (announce) toast.show(t('home_open_success', { name: sessionLabel(session) }), 'success')
 }
 
-async function onOpen(session: SessionView) {
+/**
+ * 打开 / 进入会话的共同流程。
+ *
+ * `announce = false` 用于「进入已打开的会话」：后端 `/open` 幂等，这里只是把标签与终端
+ * 接到本机，报「已打开」会让人以为又新建了一次连接。
+ */
+async function runOpen(session: SessionView, announce: boolean) {
   if (busyId.value) return
   busyId.value = session.id
   try {
-    await openWith(session)
+    await openWith(session, undefined, announce)
   } catch (e) {
     if (needsCredential(e)) {
       // 不是失败，是「这个会话没存凭据」：别报错，弹输入框，填完带凭据重试
@@ -134,6 +141,15 @@ async function onOpen(session: SessionView) {
   } finally {
     busyId.value = ''
   }
+}
+
+function onOpen(session: SessionView) {
+  void runOpen(session, true)
+}
+
+/** 进入一个后端仍开着的会话（卡片上的「进入」按钮）：本机只是还没接到它上面。 */
+function onEnter(session: SessionView) {
+  void runOpen(session, false)
 }
 
 /**
@@ -368,6 +384,7 @@ async function onDelete(session: SessionView) {
           :tabs="terminals.tabsOf(session.id)"
           :busy="busyId === session.id"
           @open="onOpen(session)"
+          @enter="onEnter(session)"
           @close="pending = { kind: 'close', session }"
           @edit="onEdit(session)"
           @remove="pending = { kind: 'delete', session }"

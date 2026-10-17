@@ -151,8 +151,10 @@ export const useTerminalsStore = defineStore('terminals', () => {
         // 后端上报 exited 的终端其 PTY 已死：标成 exited（状态点变灰），
         // 而不是假装 open —— 后者会让用户以为「打字没反应」是前端卡住了。
         status: info.exited ? 'exited' : 'open',
-        // 恢复出来的标签一律要经历一次历史回放，提示条挂到 READY 为止
-        restoring: true,
+        // **不**在这里预置 restoring：ensure 只把后端的终端投影成标签，不代表已经发起了挂载。
+        // 会话恢复后视图要等用户进入才挂载（见 App.vue），预置 true 会让卡片上的状态点一直
+        // 停在「恢复中」的琥珀色。真正的置位在 TerminalPane 发起挂载时（openSocket）。
+        restoring: false,
         createdAt: info.createdAt || new Date().toISOString()
       })
     }

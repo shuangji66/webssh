@@ -40,13 +40,19 @@ export const useAppTabsStore = defineStore('appTabs', () => {
     activeId.value = HOME_TAB_ID
   }
 
-  /** 打开（或切回）一个会话标签。已存在时只激活，并按配置名更新标题。 */
-  function openSession(sid: string, title?: string) {
+  /**
+   * 打开（或切回）一个会话标签。已存在时更新标题。
+   *
+   * `activate = false` 只建立标签、不抢当前视图：启动恢复与后台同步走这条路（见
+   * `home.restore()`）——「打开前端」不等于「进入某个会话」，用户还在首页挑会话时不该被
+   * 拽进一个可能正被别的设备使用的终端。
+   */
+  function openSession(sid: string, title?: string, activate = true) {
     const wanted = title?.trim() || ''
     const existing = tabs.value.find((tab) => tab.id === sid)
     if (existing) {
       if (wanted) existing.title = wanted
-      activeId.value = sid
+      if (activate) activeId.value = sid
       return
     }
     tabs.value.push({
@@ -55,7 +61,7 @@ export const useAppTabsStore = defineStore('appTabs', () => {
       closable: true,
       title: wanted || sid
     })
-    activeId.value = sid
+    if (activate) activeId.value = sid
   }
 
   function activate(id: string) {

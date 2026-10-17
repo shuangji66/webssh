@@ -419,7 +419,7 @@ export const HOME_TAB_ID = 'home'
 useAppTabsStore(): {
   tabs: AppTab[]; activeId: string
   openHome(): void
-  openSession(sid: string, title?: string): void
+  openSession(sid: string, title?: string, activate?: boolean): void  // activate=false：只建标签不抢视图（恢复/同步）
   activate(id: string): void
   close(id: string): void                 // 首页不可关闭
   setTitle(sid: string, title: string): void
@@ -431,7 +431,7 @@ useHomeStore(): {
   sessions: SessionView[]; openStates: Record<string, SessionState>
   loading: boolean; loaded: boolean; error: string
   bootId: string
-  load(force?: boolean): Promise<void>
+  load(force?: boolean, quiet?: boolean): Promise<void>   // quiet：后台同步失败不写整页 error
   stateOf(id: string): SessionState | undefined
   isOpen(id: string): boolean
   save(input: SessionInput): Promise<SessionView>
@@ -446,7 +446,7 @@ useHomeStore(): {
   forgetSession(sid: string): void        // 摘掉前端状态（appTabs/terminals/sftp/fileEditor/quickAccess/sessionUi）
   handleTerminalGone(sid: string, uid: string): void   // 后端说这个终端没了（\x1b]gone\x07）
   watchBackendRestart(): void             // WS 掉线后探测后端是否换了进程
-  restore(): Promise<string[]>            // 启动时：把后端仍在运行的会话恢复成应用标签，返回 sid 列表
+  restore(force?: boolean): Promise<string[]>  // 恢复/同步：后端仍在运行的会话 → 标签 + 子终端（**不激活**）；force 重新拉 /api/sessions
 }
 
 // [B] stores/terminals.ts
@@ -634,6 +634,11 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   （内部依次 `appTabs.close` / `terminals.forget` / `sftp.forget` / `fileEditor.forget` /
   `sessionUi.forget`）。**带会话的标签关闭前必须确认**；编辑页里有未保存的内容时，确认文案
   会追加一句提醒（第十八轮）。
+- **启动恢复与进入会话**（第二十五轮，见第 35 节）：`home.restore()` 把后端 `open` 列表投影成
+  **应用标签 + 终端子标签**（因此首页卡片上能看到子终端列表），但**不激活**任何会话标签——
+  启动后停在首页。`SessionView` 只在用户第一次进入该会话时挂载（`App.vue` 的
+  `enteredSessions`），进入过之后保持挂载。应用回到前台 / 切回首页时 `home.restore(true)` 再
+  对齐一次后端状态，把别的设备新开的会话补成标签与卡片列表。
 - **打开会话**：`home.openSession(id)` → 无条件 `appTabs.openSession(id, label)` →
   `terminals.ensure(sid, state)` → 没有任何终端标签就自动建 1 个：`terminals.add(sid)`。
   **桌面与窄屏一致**（第五轮改的，见 15.3：手机上新开会话也直接落在「终端 1」）。
@@ -648,7 +653,8 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   - 面板**全部保持挂载**、`absolute inset-0` 叠放，非激活的加 `invisible`（`visibility:hidden`）。
     **不要**用 `v-if`（切标签会销毁 xterm 与 WS）也不用 `v-show`/`display:none`（尺寸为 0，
     FitAddon 量不到、WebGL 反复触发 0 尺寸重排）。例外只有左栏（没有 xterm，且必须真的让出
-    横向空间，见 `SessionView.vue` 的 `showLeft`）。
+    横向空间，见 `SessionView.vue` 的 `showLeft`）。这条规则从「会话视图第一次被进入」起生效：
+    此前整个 `SessionView` 根本不挂载（第 35 节），一旦进入就不再卸载。
 - **左栏**（宽屏且终端在前台且没被手动收起时）：`BreadcrumbBar` + `FileTree`。可见性是
   `wide && !filesActive && !leftHiddenOf(sid)` 的交集（13.1/14.3/16.1）；收起时子标签栏左侧出现
   「展开面包屑」。**没有**「完整文件管理」按钮（13.1/18.1 两次删除）。移动端不渲染左栏
@@ -665,7 +671,9 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
 - **首页卡片**：只平铺（网格，不提供列表/表格视图），卡片做大（`min-w-[22rem]`）。
   卡片显示：会话名 / `user@host:port` / 备注 / 「不保存凭据」提醒 / **内联的子终端列表**
   （点一行 = 快捷打开）。**不再有**认证方式徽标、打开状态灯、打开时间与最近使用时间
-  （15.2/16.2 删的，见 16.2）。操作：打开（或关闭）、编辑、删除。已打开时「关闭」按钮要显眼。
+  （15.2/16.2 删的，见 16.2）。操作：打开（或关闭）、**进入**（仅已打开时）、编辑、删除。
+  已打开时「关闭」按钮要显眼；「进入」是第二十五轮补的入口——后端开着但本机还没有标签
+  （另一台设备开的会话、或页面停在旧快照上）时，用户不必先关掉再打开。
 - **终端面板工具栏**（桌面端在子标签栏右侧，移动端第二行；**没有设置按钮**，设置只在首页工具条上）：
   搜索 / 粘贴 / 清屏 / 重连 /
   快捷指令 / 设置 + 折叠功能名按钮（沿用 terminal 的 `labelsOn` 行为）。
@@ -1226,8 +1234,9 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 
 - 第三轮的实现里，窄屏打开会话**不**自动建终端（当时的注释是「避免一进会话就占满屏幕」），
   于是手机上打开会话落在**文件管理**子标签上——用户明确要求改掉。
-- 现在 `HomeView.openWith` 与 `App.vue` 的恢复循环**都不再判 `isMobile`**：一个终端都没有就
-  `terminals.add(sid)`，桌面与窄屏一致（这与 11.7 的原口径一致）。
+- 现在 `HomeView.openWith` 与 `SessionView` 的 onMounted（用户第一次进入恢复的会话）**都不再判
+  `isMobile`**：一个终端都没有就 `terminals.add(sid)`，桌面与窄屏一致（这与 11.7 的原口径一致）。
+  第二十五轮起「恢复」不再等于「进入」：启动时只建标签，终端 1 在进入会话时补（见第 35 节）。
 
 ### 15.4 「返回终端」必须回到**你刚才用的那个终端**（真 bug）
 
@@ -3358,3 +3367,54 @@ location /app/ {
    在 `searchViewing` 时提前返回，因此自定义菜单与原生菜单都不出现——**这是刻意的**，
    别再当成「点了没反应」的缺陷。
 3. **单个大目录的 `ReadDir` 不改**（见 34.2 第 3 条的说明）。
+
+## 35. 第二十五轮：启动恢复停在首页 + 其他设备的会话标签 / 子终端同步
+
+### 35.1 用户报告
+
+1. **移动端进入前端应该先进会话首页**，而不是直接进入恢复的会话中；
+2. 当一个会话已经被（另一台设备）打开后，**其他设备打开前端只能看见已连接的会话卡片**，
+   没有会话标签和子终端列表，必须先把会话关掉才能重新进入。
+
+### 35.2 根因
+
+- `App.vue` 启动时调用 `home.restore()`，而 `restore()` 用 `openSession()` 逐个恢复标签，
+  `openSession` 会写 `activeId`——最后恢复的那个会话成了当前视图。手机上一打开就钻进终端，
+  且这个终端会立即 attach（单挂载点语义下会顶掉别的设备）。
+- 恢复只发生在 `onMounted` 一次。移动端把页面当 PWA 常驻（切回前台不重新加载）时，本地
+  `openStates` 停在旧快照上：卡片可能已经显示为「已打开」，但本机没有应用标签、`terminals`
+  里也没有子终端——卡片上唯一的动作是「关闭」，于是只能「关掉再打开」。
+- 即使恢复到标签，`v-for` 也会把所有 `SessionView` 立刻挂载，后台标签的终端会直接 attach。
+  仅仅打开前端就会抢占其他设备的终端。
+
+### 35.3 修复
+
+- `home.restore(force?)`：先 `load()`（`force` 时强制重拉 `/api/sessions`），把 `open` 列表
+  投影成**应用标签 + 终端子标签**，但用 `appTabs.openSession(sid, label, false)` **不激活**。
+  返回 sid 列表仍用于启动 toast。`terminals.ensure` 是幂等的，所以后台同步也能把别的设备
+  新开的终端补进卡片列表。
+- `App.vue`：启动后停在首页。新增 `enteredSessions`（reactive Set），`SessionView` 只渲染
+  「进入过的」会话（外加当前激活标签兜底）；进入过一次后保持挂载（v-show），面板规则不变。
+  新增 `syncOpenSessions()`：`visibilitychange`（可见时）/ `focus` / 切回首页时
+  `home.restore(true)`，单飞执行、页面隐藏时跳过。后台同步的加载是 `quiet` 的
+  （`load(force, true)`）：失败保留现有卡片，不把首页换成「加载失败 + 重试」。
+- `SessionView.onMounted`：进入时 `terminals.ensure`，仍无终端就 `terminals.add`——
+  「进入恢复的会话落在终端 1」这条 15.3 的体验保留，只是时点从「启动」挪到「进入」。
+- `terminals.ensure` 不再预置 `restoring: true`：恢复的视图可能不挂载，预置会让卡片状态点
+  永远停在「恢复中」的琥珀色；真正的置位在 `TerminalPane.openSocket`。
+- 卡片新增「进入」按钮（仅 `state.open === true`）：走 `home.openSession`（后端幂等）→
+  激活标签 → `ensure` / `add`。这是「本机没有标签/子终端」时的兜底入口，不必先关再开。
+- i18n：新增 `home_enter`（进入会话 / Enter session）。
+
+### 35.4 验证
+
+- `npm run type-check`、`npm run check:i18n` 通过。
+- Playwright（mock `/api/info`、`/api/sessions`，移动端 390×844 与桌面 1280×800）：
+  1. 启动后激活标签是「会话」，会话标签「测试」存在，卡片出现「终端 1」行；
+  2. 先加载「无已打开会话」的页面，再把后端快照改成 open 并触发 `focus`：会话标签与卡片
+     子终端列表补上，**当前视图仍是首页**；
+  3. 点会话标签 → 进入会话（子标签 `文件管理 / 终端 1`）；回首页后点「进入会话」按钮 →
+     切回该会话；
+  4. `open` 但 `terminals: []` 的会话：进入时才建「终端 1」，未进入时卡片没有子终端行。
+- 未在真机 / 真实 PTY 上重跑：本机沙箱打不开 `/dev/ptmx`（`open /dev/ptmx: permission denied`），
+  WebSocket 挂载路径沿用旧逻辑未改；构建后需按第 10.3 节手测一次「另一台设备顶号」。

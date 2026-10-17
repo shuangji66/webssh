@@ -1,14 +1,15 @@
 <script setup lang="ts">
 // SessionCard — 首页的会话卡片（点右上角的电源图标即连接）。
 //
-// 只做展示与抛事件：打开/关闭/编辑/删除的完整流程（确认框、toast、终端接线）在 HomeView，
-// 因为那里知道「其他卡片的状态」与「表单弹窗的显隐」，卡片自己不该管这些。
+// 只做展示与抛事件：打开/进入/关闭/编辑/删除的完整流程（确认框、toast、终端接线）在
+// HomeView，因为那里知道「其他卡片的状态」与「表单弹窗的显隐」，卡片自己不该管这些。
 //
 // 第五轮：卡片上的状态灯、「未打开/已打开」、打开时间、最近使用时间全部去掉——现在唯一的
 // 实时指示是终端列表本身。
 // 第六轮（当前这版）：
-//   - 关闭/编辑/删除移到**右上角**，仅图标、无边框，与会话名同一行且不换行；名字放不下就
+//   - 操作按钮移到**右上角**，仅图标、无边框，与会话名同一行且不换行；名字放不下就
 //     横向滚动（`overflow-x-auto whitespace-nowrap`），而不是把按钮挤下去或换行；
+//     已打开时多一个「进入」（后端开着但本机还没标签时不必先关再开）；
 //   - 不再标注认证方式（密码/密钥那两个徽标删掉）；
 //   - 打开的子终端**直接列在卡片下**（不再藏进弹窗），点一行就是「快捷打开」；
 //     每行右侧保留单个关闭按钮（它会终止远端的 shell，所以 HomeView 那边还有一次确认）。
@@ -38,6 +39,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'open'): void
+  /** 进入一个**已经打开**的会话（后端会话仍在，本机只是还没进入）。 */
+  (e: 'enter'): void
   (e: 'close'): void
   (e: 'edit'): void
   (e: 'remove'): void
@@ -73,6 +76,32 @@ const stats = computed(() => (isOpen.value ? sessionStats.statsOf(props.session.
           {{ label }}
         </h3>
       </div>
+
+      <!-- 「进入」：后端已经开着这个会话、但本机还没有标签/子终端时可点。
+           没有它时卡片上只有「关闭」一个动作，用户被逼着「先关掉再打开」才能进去
+           （第二十五轮用户上报：换台设备只看见已连接的卡片，没有标签和子终端列表）。 -->
+      <button
+        v-if="isOpen"
+        class="g-btn-ghost !h-8 !w-8 shrink-0 !px-0"
+        :disabled="busy"
+        :title="t('home_enter')"
+        :aria-label="t('home_enter')"
+        @click="emit('enter')"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          class="h-4 w-4"
+        >
+          <path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5" />
+          <polyline points="10 17 15 12 10 7" />
+          <line x1="15" y1="12" x2="3" y2="12" />
+        </svg>
+      </button>
 
       <!-- 关闭用红色（第七轮要求）：它是「中断连接」这类破坏性动作，和「打开」共用一格时
            靠颜色区分当前是哪一个；删除按钮本来就是红的，两者并排也不冲突。 -->

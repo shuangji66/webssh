@@ -74,13 +74,19 @@ export const useHomeStore = defineStore('home', () => {
     return s ? sessionLabel(s) : undefined
   }
 
-  /** 拉一次会话配置 + 实时状态。`force` 用于手动刷新与「本地状态可能落后」时的对齐。 */
-  async function load(force = false): Promise<void> {
+  /**
+   * 拉一次会话配置 + 实时状态。
+   *
+   * `force` 用于手动刷新与「本地状态可能落后」时的对齐；`quiet` 用于**后台同步**
+   * （应用回到前台 / 切回首页）：失败时保留现有列表、不把 `error` 写成整页错误——一次
+   * 网络抖动不该让用户正看着的会话卡片被「加载失败 + 重试」替换掉。
+   */
+  async function load(force = false, quiet = false): Promise<void> {
     // 并发去重：启动流程与首页挂载都会调，打两次没有意义（后到的请求结果还会互相覆盖）
     if (loading.value) return
     if (loaded.value && !force) return
     loading.value = true
-    error.value = ''
+    if (!quiet) error.value = ''
     try {
       const res = await api.sessions()
       sessions.value = res.sessions ?? []
@@ -88,9 +94,12 @@ export const useHomeStore = defineStore('home', () => {
       for (const state of res.open ?? []) next[state.id] = state
       openStates.value = next
       loaded.value = true
+      // 后台同步成功也要把上一次的错误清掉：否则「启动时失败 → 回到前台同步成功」会一直
+      // 停在那块「加载失败 + 重试」上，尽管卡片数据已经是最新的。
+      error.value = ''
     } catch (e) {
       // 这里不抛：调用方是启动流程与首页，两者都要「显示错误但继续渲染」
-      error.value = describeError(e)
+      if (!quiet) error.value = describeError(e)
     } finally {
       loading.value = false
     }
@@ -232,16 +241,35 @@ export const useHomeStore = defineStore('home', () => {
   }
 
   /**
-   * 启动恢复：把后端仍在运行的会话恢复成应用标签，返回 sid 列表（App 据此接线终端标签）。
+   * 启动恢复 / 后台同步：把后端仍在运行的会话恢复成「应用标签 + 终端子标签」，返回 sid 列表。
    *
    * 依据只有后端返回的 open 列表：标签在刷新前是否打开过是本地信息，不可靠也不该持久化
    * （本地记着但后端已经关了的情况必然出现，比如在另一台设备上关掉了）。
+   *
+   * **不激活任何会话标签**（`openSession(..., false)`）：打开前端只负责把「别处开着的会话」
+   * 投影成标签与卡片上的子终端列表，进入哪个会话由用户点。以前这里会激活最后一个恢复的
+   * 会话——在手机上等于一打开就钻进终端、在另一台设备上等于顺手把别人的终端顶掉。
+   *
+   * 这里**不**给「零终端」的会话补终端：SessionView 在用户真正进入会话时才挂载（见 App.vue），
+   * 后台补一个终端就等于为每个恢复的会话拨一条 SSH。进入会话时由 SessionView 补（见那里的
+   * onMounted）。
+   *
+   * `force = true` 用于应用回到前台 / 切回首页时重新对齐：别的设备新开的会话会补成标签，
+   * 卡片上的子终端列表也会跟着出现，不必刷新页面。
    */
-  async function restore(): Promise<string[]> {
-    if (!loaded.value) await load()
+  async function restore(force = false): Promise<string[]> {
+    // force 的加载是后台同步：失败时静默保留现有列表（见 load 的 quiet）
+    if (!loaded.value || force) await load(force, force)
     const tabs = useAppTabsStore()
-    const sids = Object.keys(openStates.value).filter((sid) => openStates.value[sid]?.open === true)
-    for (const sid of sids) tabs.openSession(sid, labelOf(sid))
+    const terminals = useTerminalsStore()
+    const sids: string[] = []
+    for (const [sid, state] of Object.entries(openStates.value)) {
+      if (state?.open !== true) continue
+      sids.push(sid)
+      tabs.openSession(sid, labelOf(sid), false)
+      // 幂等：已有同 tid 的标签不重复加。这样另一台设备新开的终端也能同步到卡片上。
+      terminals.ensure(sid, state)
+    }
     return sids
   }
 

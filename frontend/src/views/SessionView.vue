@@ -30,6 +30,7 @@ import { useAppTabsStore } from '@/stores/appTabs'
 import { FILES_TAB, useSessionUiStore } from '@/stores/sessionUi'
 import { usePaneControlsStore } from '@/stores/paneControls'
 import { useQuickAccessStore } from '@/stores/quickAccess'
+import { useHomeStore } from '@/stores/home'
 import { termStatusDotClass, useTerminalsStore, type TermTab } from '@/stores/terminals'
 import { revealActive, wheelToHorizontal } from '@/utils/scroll'
 import BreadcrumbBar from '@/components/files/BreadcrumbBar.vue'
@@ -50,6 +51,7 @@ const emit = defineEmits<{
 const sessionUi = useSessionUiStore()
 const terminals = useTerminalsStore()
 const paneControls = usePaneControlsStore()
+const home = useHomeStore()
 /**
  * 快捷访问（第二十轮）：弹窗显隐存在 store 里（两个入口在两个兄弟组件上：文件管理工具栏与
  * 左栏面包屑按钮条），弹窗本体挂在**这里**——它是两者的共同父级，且属于「一个会话一个」的
@@ -217,6 +219,15 @@ let stripRo: ResizeObserver | null = null
 // 挂在 onMounted 而不是 watch(模板 ref)：标签条永远存在（没有 v-if），挂载后元素就在，
 // 这里能确保观察者一定装上，不用赌模板 ref 的赋值时机。
 onMounted(() => {
+  // 会话视图**只在用户进入时挂载**（App.vue 的 enteredSessions）：恢复回来的标签不提前
+  // attach 终端，免得打开首页就顶掉别的设备。所以「进入」这一帧要把后端的终端补进本地
+  // 标签，一个都没有时建「终端 1」——恢复的会话进入后仍然落在终端，而不是文件管理。
+  const state = home.stateOf(props.sid)
+  if (state?.open) {
+    terminals.ensure(props.sid, state)
+    if (terminals.countOf(props.sid) === 0) terminals.add(props.sid)
+  }
+
   const el = strip.value
   updateLabelState()
   if (el && window.ResizeObserver) {

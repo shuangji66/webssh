@@ -38,6 +38,7 @@ export const zh: Record<string, string> = {
   home_empty_desc: '点击「添加会话」，填写地址与登录名，就能直接打开 SSH 终端。',
   home_load_failed: '加载会话列表失败：{error}',
   home_open: '打开',
+  home_enter: '进入会话',
   home_close: '关闭',
   home_opened: '已打开',
   home_closed: '未打开',
