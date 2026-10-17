@@ -12,12 +12,13 @@
 // 「不保存凭据」的会话会在这里收到 `credential_required`（契约 11.1.3）：那不是失败，
 // 而是「请先输入凭据」，所以转成 CredentialPromptDialog，填完带凭据重试一次。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { t } from '@/i18n'
+import { t, useI18n } from '@/i18n'
 import { ApiError, describeError, type SessionView } from '@/serverapi'
 import { HOME_TAB_ID, useAppTabsStore } from '@/stores/appTabs'
 import { useHomeStore, type SessionCredential } from '@/stores/home'
 import { usePaneControlsStore } from '@/stores/paneControls'
 import { useSessionStatsStore } from '@/stores/sessionStats'
+import { useSettingsStore } from '@/stores/settings'
 import { useTerminalsStore } from '@/stores/terminals'
 import { useToastStore } from '@/stores/toast'
 import { sessionLabel } from '@/utils/format'
@@ -31,7 +32,9 @@ const tabs = useAppTabsStore()
 const terminals = useTerminalsStore()
 const panes = usePaneControlsStore()
 const sessionStats = useSessionStatsStore()
+const settings = useSettingsStore()
 const toast = useToastStore()
+const { locale } = useI18n()
 
 /** 设置弹窗挂在壳层（App.vue），这里只抛事件——它是应用级设置（主题/语言/字体），不是首页的。 */
 const emit = defineEmits<{
@@ -45,16 +48,47 @@ const busyId = ref('')
 
 // ---------- 卡片列表 ----------
 
+/**
+ * 「最近使用」排序用的时间戳：`lastUsedAt` 为空时退到 `updatedAt`，再退到 `createdAt`。
+ *
+ * 与卡片上的展示时间无关——卡片本身不显示这几个时间（契约 16.2），它们只用于排序。
+ */
+function recentStamp(s: SessionView): string {
+  return s.lastUsedAt || s.updatedAt || s.createdAt
+}
+
+/**
+ * 名称排序的比较键：与卡片标题同一个口径（空名 = `user@host`）。
+ *
+ * 不按 `name` 字段裸排：没起名的会话 `name` 是空串，全排在一起就失去意义了。
+ */
+function nameKey(s: SessionView): string {
+  return sessionLabel(s)
+}
+
+const sortLabel = computed(() =>
+  settings.homeSort === 'name' ? t('home_sort_name') : t('home_sort_recent')
+)
+
 const list = computed(() => {
   const items = [...home.sessions]
-  // 最近用过的排前面：会话通常比一屏多，常用的应该在第一屏（lastUsedAt 为空时退到 updatedAt）
-  items.sort((a, b) => {
-    const at = a.lastUsedAt || a.updatedAt || a.createdAt
-    const bt = b.lastUsedAt || b.updatedAt || b.createdAt
-    return bt.localeCompare(at)
-  })
+  if (settings.homeSort === 'name') {
+    // 名称固定升序（没有第三态）：`numeric` 让 host2 排在 host10 前，`base` 让大小写/重音
+    // 不参与比较——两种写法视为同名，再按「最近使用」排，顺序才可预期。
+    const collator = new Intl.Collator(locale.value, { numeric: true, sensitivity: 'base' })
+    items.sort((a, b) => {
+      const byName = collator.compare(nameKey(a), nameKey(b))
+      return byName !== 0 ? byName : recentStamp(b).localeCompare(recentStamp(a))
+    })
+    return items
+  }
+  // 默认：最近用过的排前面：会话通常比一屏多，常用的应该在第一屏（lastUsedAt 为空时退到 updatedAt）
+  items.sort((a, b) => recentStamp(b).localeCompare(recentStamp(a)))
   return items
 })
+
+/** 只有一个会话时排序没有意义，按钮不显示（用户要求）；零会话与加载失败（不渲染卡片）时也不显示。 */
+const canSort = computed(() => !home.error && home.sessions.length >= 2)
 
 onMounted(() => {
   if (!home.loaded) void home.load()
@@ -324,6 +358,30 @@ async function onDelete(session: SessionView) {
         </button>
 
         <span class="flex-1"></span>
+
+        <!-- 排序切换：按钮文案 = 当前模式，点一下换另一种。会话少于两个时排序没有意义，
+             连按钮一起隐藏（用户要求：无会话或只有一个会话不显示）。 -->
+        <button
+          v-if="canSort"
+          class="g-btn-secondary !h-9 !px-3 text-sm"
+          @click="settings.toggleHomeSort()"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-4 w-4"
+          >
+            <path d="M8 20V4" />
+            <path d="M5 7l3-3 3 3" />
+            <path d="M16 4v16" />
+            <path d="M13 17l3 3 3-3" />
+          </svg>
+          <span class="whitespace-nowrap">{{ sortLabel }}</span>
+        </button>
 
         <button
           class="g-btn-secondary !h-9 !px-3 text-sm"

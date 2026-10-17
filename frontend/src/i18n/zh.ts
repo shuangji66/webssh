@@ -34,6 +34,8 @@ export const zh: Record<string, string> = {
 
   // ===== 首页：会话列表 =====
   home_new: '添加会话',
+  home_sort_recent: '排序：默认',
+  home_sort_name: '排序：名称',
   home_empty_title: '还没有远程会话',
   home_empty_desc: '点击「添加会话」，填写地址与登录名，就能直接打开 SSH 终端。',
   home_load_failed: '加载会话列表失败：{error}',

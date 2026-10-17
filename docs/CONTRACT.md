@@ -679,6 +679,14 @@ useSessionUiStore(): { setActiveSub(sid, id); activeSubOf(sid): string; isFilesA
   （15.2/16.2 删的，见 16.2）。操作：打开（或关闭）、**进入**（仅已打开时）、编辑、删除。
   已打开时「关闭」按钮要显眼；「进入」是第二十五轮补的入口——后端开着但本机还没有标签
   （另一台设备开的会话、或页面停在旧快照上）时，用户不必先关掉再打开。
+- **首页排序**（第二十七轮）：工具条「设置」左侧有一个排序切换按钮，**仅当会话数 ≥ 2**
+  时显示（0/1 个会话时排序没有意义）。文案 = 当前模式：`排序：默认` / `排序：名称`
+  （`home_sort_recent` / `home_sort_name`），点一下在两者间切换，偏好存本设备
+  localStorage（`webssh-home-sort`，脏值按 `recent` 处理，不动会话配置）。
+  `默认` 沿用原逻辑：`lastUsedAt || updatedAt || createdAt` 降序（最近使用优先）；
+  `名称` 固定**升序**、按**展示名**（`sessionLabel`，空名回退 `user@host`）比较，
+  `Intl.Collator(locale, { numeric: true, sensitivity: 'base' })`，同名再按默认逻辑排。
+  两种模式都只影响卡片展示顺序，与「已打开」无关（没有置顶）。
 - **终端面板工具栏**（桌面端在子标签栏右侧，移动端第二行；**没有设置按钮**，设置只在首页工具条上）：
   搜索 / 粘贴 / 清屏 / 重连 /
   快捷指令 / 设置 + 折叠功能名按钮（沿用 terminal 的 `labelsOn` 行为）。

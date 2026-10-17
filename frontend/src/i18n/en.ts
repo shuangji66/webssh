@@ -33,6 +33,8 @@ export const en: Record<string, string> = {
 
   // ===== home: session list =====
   home_new: 'Add session',
+  home_sort_recent: 'Sort: default',
+  home_sort_name: 'Sort: name',
   home_empty_title: 'No remote sessions yet',
   home_empty_desc: 'Click “Add remote session”, fill in the address and login name, then open an SSH terminal directly.',
   home_load_failed: 'Failed to load sessions: {error}',
