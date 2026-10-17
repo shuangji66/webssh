@@ -397,16 +397,48 @@ func (m *sessionManager) save(in store.SessionInput) (*store.SessionView, *apier
 		// 凭据已经（或改为）落盘：内存里那份多余，留着只会两份不一致。
 		m.dropCachedCredentialLocked(sc.ID)
 	case in.Password != nil || in.PrivateKey != nil:
-		if openNow {
+		mc := memoryCredential{
+			password:   derefRaw(in.Password),
+			privateKey: derefRaw(in.PrivateKey),
+			passphrase: derefRaw(in.Passphrase),
+		}
+		switch {
+		case !openNow:
+			m.dropCachedCredentialLocked(sc.ID)
+		case mc.hasAuthCredential(sc.AuthType):
 			// 会话正开着：它接下来还要开新终端 / 重连 SFTP，用的必须是用户刚给的这份
 			// （旧的那份可能已经过期或被改过）。
-			m.setCachedCredentialLocked(sc.ID, memoryCredential{
-				password:   derefRaw(in.Password),
-				privateKey: derefRaw(in.PrivateKey),
-				passphrase: derefRaw(in.Passphrase),
-			})
-		} else {
+			m.setCachedCredentialLocked(sc.ID, mc)
+		case prevAuthType != sc.AuthType:
+			// 认证方式变了、给的凭据又不匹配新方式：旧缓存类型同样不匹配，留着只会
+			// 让下一次拨号报出与原因不符的 no_credential。
 			m.dropCachedCredentialLocked(sc.ID)
+		default:
+			// 会话开着、认证方式没变、这次给的凭据是空的（API 调用方传了空串）：
+			// 不要用空值覆盖内存里那份能用的——否则用户只是保存了一次表单，新终端就
+			// 全部报 no_credential。前端表单不会发空串（留空 = 不修改）。
+		}
+	case !created && openNow && cur != nil && cur.CredentialsSaved() && prevAuthType == sc.AuthType:
+		// 会话**正开着**时把「保存凭据」从开切到关：sc 里的密文刚被清掉，但当前这条会话
+		// 还要用它开新终端 / 在 SFTP 断线后重新拨号。把凭据放进内存缓存（只活到 close，
+		// 与 11.1「不保存 = 只在内存里」一致）。
+		//
+		// 不这样做的话，用户只是关掉了一个持久化开关，回到会话里新建终端却全部报
+		// no_credential（前端还会把它显示成「终端不存在」）——「关掉保存」不等于
+		// 「中止当前会话」，这两个动作必须分开。
+		//
+		// 优先保留 memCreds 里已有的那份：它可能是这次 open 时用户**当场输入并验证成功**的
+		// （open 对带凭据的请求会写缓存，即使配置里也有旧密文），比旧配置里的更可信。
+		// 只有内存里没有时才解密旧配置。
+		//
+		// 用户在同一请求里给了新凭据时走上面那个 case（新凭据优先）；认证方式变了则不
+		// carry over（类型不匹配的缓存会让下一次拨号报出与原因不符的 no_credential）。
+		if _, ok := m.memCreds[sc.ID]; !ok {
+			mc, credErr := m.storedCredential(cur)
+			if credErr != nil {
+				return nil, credErr
+			}
+			m.setCachedCredentialLocked(sc.ID, mc)
 		}
 	case created || prevAuthType != sc.AuthType:
 		// 认证方式变了 → 缓存的凭据类型已经不匹配（旧的是密码、新的是私钥），留着只会

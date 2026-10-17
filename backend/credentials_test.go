@@ -260,8 +260,65 @@ func TestCredentialSaveSwitchEdits(t *testing.T) {
 	if strings.Contains(raw, "ct\":") {
 		t.Fatalf("关掉开关后配置里不该还有密文：%s", raw)
 	}
+	// 5b) 会话**正开着**：刚才清掉落盘的那份凭据必须被留在内存里。用户只是关掉了
+	//     「保存」这个持久化开关，不是要断开当前会话——新建子终端 / SFTP 断线重连
+	//     仍然要能用它拨号（原实现这里会回 no_credential，前端还会误报「终端不存在」）。
+	if _, ok := a.mux.sessions.cachedCredential(sid); !ok {
+		t.Fatal("会话开着时关掉保存开关，当前凭据应当留在内存里")
+	}
+	rt, apiErr := a.mux.sessions.runtimeFor(sid)
+	if apiErr != nil {
+		t.Fatalf("取运行时失败：%v", apiErr)
+	}
+	rt.sftpMu.Lock()
+	rt.dropSFTPLocked()
+	rt.sftpMu.Unlock()
+	a.ok(t, "/api/fs/list", map[string]any{"sid": sid, "path": ""})
+
+	// 5c) close 之后内存里的那份失效（与「不保存凭据」的整体语义一致）
 	a.ok(t, "/api/sessions/close", map[string]any{"id": sid})
+	if _, ok := a.mux.sessions.cachedCredential(sid); ok {
+		t.Error("关闭会话后不该还留着内存凭据")
+	}
 	a.fail(t, "/api/sessions/open", map[string]any{"id": sid}, "credential_required", http.StatusConflict)
+}
+
+// TestCredentialSaveOffKeepsVerifiedMemoryCredential 锁住 carry-over 的来源优先级与空值
+// 防覆盖。
+//
+// 场景：配置里存着旧密码，这次 open 时用户当场输入了新密码（open 成功后写进 memCreds）。
+// 此时把「保存凭据」关掉，**不能**拿磁盘上的旧密码覆盖内存里这份真正拨通了的凭据——否则
+// 新终端会用旧密码去连，报 auth_failed。没有内存凭据时才回落到解密旧配置。
+func TestCredentialSaveOffKeepsVerifiedMemoryCredential(t *testing.T) {
+	a := newCredApp(t)
+	saved := a.ok(t, "/api/sessions/save", map[string]any{
+		"host": a.ssh.Host(), "port": a.ssh.Port(), "user": a.sshUser,
+		"authType": "password", "password": secretPassword,
+	})
+	sid := strOf(saved["session"], "id")
+	a.ok(t, "/api/sessions/open", map[string]any{"id": sid})
+
+	// 模拟「这次 open 带了一份当场输入、验证成功的凭据」：它比磁盘上的旧密文更可信。
+	a.mux.sessions.setCachedCredential(sid, memoryCredential{password: "verified-at-open"})
+	a.ok(t, "/api/sessions/save", map[string]any{
+		"id": sid, "host": a.ssh.Host(), "port": a.ssh.Port(), "user": a.sshUser,
+		"authType": "password", "saveCredential": false,
+	})
+	mc, ok := a.mux.sessions.cachedCredential(sid)
+	if !ok || mc.password != "verified-at-open" {
+		t.Fatalf("carry over 不该用磁盘旧密码覆盖已验证的内存凭据：%+v", mc)
+	}
+
+	// API 调用方传空密码（前端表单不会发）也不能把内存里那份清成空：会话开着时那等于
+	// 让之后每个新终端都报 no_credential。
+	a.ok(t, "/api/sessions/save", map[string]any{
+		"id": sid, "host": a.ssh.Host(), "port": a.ssh.Port(), "user": a.sshUser,
+		"authType": "password", "password": "", "saveCredential": false,
+	})
+	mc, ok = a.mux.sessions.cachedCredential(sid)
+	if !ok || mc.password != "verified-at-open" {
+		t.Fatalf("空密码不该覆盖内存里能用的凭据：%+v", mc)
+	}
 }
 
 // TestCredentialCacheOnAuthTypeSwitch 钉住「改认证方式要清内存凭据、不改就不能清」。
@@ -400,11 +457,42 @@ func findView(t *testing.T, out map[string]any, sid string) map[string]any {
 	return nil
 }
 
+// TestTerminalCreateFailureIsNotGone 锁住「新建终端失败」与「终端不存在」的分流。
+//
+// 新建终端时没有可用凭据是在**拨号之前**就失败的，不分配 PTY，所以这条用例在无 PTY 的
+// 环境也会跑。它验证两件事：
+//  1. 真实原因留给人看（不能只发一个 gone 让前端说「终端不存在」）；
+//  2. 关闭码是 wsCloseCreateFailed 而不是 gone——前端据此保留标签并标红，用户修正凭据后
+//     可以点「重连」重试。
+func TestTerminalCreateFailureIsNotGone(t *testing.T) {
+	a := newCredApp(t)
+	sid, _ := saveUnsavedSession(t, a)
+	a.ok(t, "/api/sessions/open", map[string]any{"id": sid, "password": secretPassword})
+	// 抹掉内存凭据：之后新建终端只能从落盘或内存取，而两者都没有。
+	a.mux.sessions.dropCachedCredential(sid)
+
+	ws := a.dialWS(t, sid, "")
+	got, ok := ws.collectUntil("请重新打开会话", testTimeout)
+	if !ok {
+		t.Fatalf("没有内存凭据时新建终端应当给出明确提示，实际：%q", got)
+	}
+	if !strings.Contains(got, "没有可用的凭据") {
+		t.Errorf("错误文案没说清原因：%q", got)
+	}
+	if strings.Contains(got, oscGone) {
+		t.Fatalf("创建失败不能附带 gone 控制帧（前端会误判成终端不存在并删标签）：%q", got)
+	}
+	if code := ws.closeCode(testTimeout); code != wsCloseCreateFailed {
+		t.Errorf("创建失败的关闭码应当是 %d，实际 %d", wsCloseCreateFailed, code)
+	}
+}
+
 // TestCredentialNotSavedTerminalReuse 覆盖「内存凭据也供**新终端**复用」。
 //
 // 终端是另一条独立的 SSH 连接（见 sessions.go 的 newTerminal），拨号时同样只能从内存里
 // 拿到凭据——这条路径与 SFTP 重连（TestCredentialNotSaved 第 6 步）不同，值得单独锁住。
-// 需要真的分配 PTY，环境不支持时按仓库约定跳过。
+// 需要真的分配 PTY，环境不支持时按仓库约定跳过。失败路径（没有凭据）由
+// TestTerminalCreateFailureIsNotGone 覆盖。
 func TestCredentialNotSavedTerminalReuse(t *testing.T) {
 	requirePTY(t)
 	a := newCredApp(t)
@@ -412,19 +500,8 @@ func TestCredentialNotSavedTerminalReuse(t *testing.T) {
 
 	// 打开会话（凭据只进内存）
 	a.ok(t, "/api/sessions/open", map[string]any{"id": sid, "password": secretPassword})
-	// 先把内存凭据抹掉：这时新终端必须拨不出来（否则下面那次「复用成功」就说明不了任何事）。
-	// 终端新建失败走的是 WS 错误路径：一段人话 + `\x1b]gone\x07` 控制帧（不会分配 tid）。
-	a.mux.sessions.dropCachedCredential(sid)
-	ws := a.dialWS(t, sid, "")
-	got, ok := ws.collectUntil(oscGone, testTimeout)
-	if !ok {
-		t.Fatalf("没有内存凭据时新建终端应当收到 gone 控制帧，实际：%q", got)
-	}
-	if !strings.Contains(got, "没有可用的凭据") {
-		t.Errorf("错误文案没说清原因：%q", got)
-	}
 
-	// 再把凭据放回内存（等于用户重新输入一次），新终端就能连上：这条连接与打开会话时的
+	// 把凭据放回内存（相当于用户重新输入一次），新终端就能连上：这条连接与打开会话时的
 	// 那条完全无关，凭据只可能来自内存。
 	a.mux.sessions.setCachedCredential(sid, memoryCredential{password: secretPassword})
 	ws2 := a.dialWS(t, sid, "")

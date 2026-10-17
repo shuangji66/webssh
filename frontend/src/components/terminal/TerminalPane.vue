@@ -39,6 +39,7 @@ import {
   DETACHED_PAYLOAD,
   GONE_PAYLOAD,
   WS_CLOSE_DETACHED,
+  WS_CLOSE_CREATE_FAILED,
   api
 } from '@/serverapi'
 import KeypadBar from './KeypadBar.vue'
@@ -438,6 +439,17 @@ function openSocket() {
     // 所以这里按码兜底），统一走 detached 分支，不打印通用的「连接已关闭」。
     if (ev?.code === WS_CLOSE_DETACHED) {
       markDetached()
+      return
+    }
+    // 新建子终端失败（没有凭据 / 认证失败 / 远端拒绝 PTY……）：后端已经把真实原因写在
+    // 终端里了，这里只补一句「可以重连」并把状态点标红。**不要**走 onTerminalGone 的
+    // 「终端不存在」分支——那会把一个可以修好的凭据问题说成会话没了。
+    if (ev?.code === WS_CLOSE_CREATE_FAILED) {
+      terminals.setStatus(props.sid, props.tab.uid, 'error')
+      if (!disposed) {
+        term?.writeln('\r\n\x1b[31m' + t('term_create_failed') + '\x1b[0m')
+        scrollToBottom()
+      }
       return
     }
     if (!disposed) {

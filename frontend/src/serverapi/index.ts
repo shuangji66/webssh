@@ -477,6 +477,13 @@ export const DETACHED_PAYLOAD = '\x1b]detached\x07'
 export const GONE_PAYLOAD = '\x1b]gone\x07'
 /** 「已被其他设备接管」的 WebSocket 关闭码 */
 export const WS_CLOSE_DETACHED = 4001
+/**
+ * 「新建子终端失败」的 WebSocket 关闭码（没有可用凭据 / 认证失败 / 远端拒绝 PTY……）。
+ *
+ * 与 GONE_PAYLOAD 的语义必须分开：gone = 终端/会话在后端不存在（标签该消失），
+ * 创建失败 = 这次没建成（标签保留并标红，修正凭据后可以重连）。
+ */
+export const WS_CLOSE_CREATE_FAILED = 4002
 
 /** 终端 WebSocket 地址：tid 为空 = 新建一个终端（后端回 TID_PAYLOAD_RE 回填 id）。 */
 export function wsUrl(sid: string, tid?: string | null): string {

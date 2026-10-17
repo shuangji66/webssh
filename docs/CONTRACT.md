@@ -60,7 +60,7 @@
 | --- | --- |
 | `main.go` | 入口：环境解析 → 目录准备 → socket 绑定 → 信号等待 → 优雅退出；`appVersion`（`-ldflags` 注入）；`bootID` |
 | `config.go` | `RuntimeEnv`（全部来自环境变量）+ 默认值 |
-| `protocol.go` | 终端控制协议常量：OSC 控制帧、close 4001、历史/尺寸上限（与前端一对，见第 6 节） |
+| `protocol.go` | 终端控制协议常量：OSC 控制帧、close 4001/4002、历史/尺寸上限（与前端一对，见第 6 节） |
 | `hostkeys.go` | known_hosts 的 TOFU 记录（读写 + 指纹计算 + 匹配判断） |
 | `sshclient.go` | SSH 拨号：认证方式组装、主机密钥回调、超时、`ssh.Client` 生命周期 |
 | `sessions.go` | 会话配置的管理：字段校验、保存/删除、测试连接、信任主机密钥 |
@@ -317,6 +317,11 @@ RuntimeInfo  { version, bootId, dataDir, adminSock, adminBaseURL, hostname,
   → 进入实时流。
 - 终端不存在 → 一帧 `\r\n\x1b[31m…\x1b[0m\r\n` + `\x1b]gone\x07` 控制帧，然后关闭。
   ⚠️ 前端只认 `\x1b]gone\x07`，**不能**用人类可读文本判定（终端里 `echo` 出同样文本会误判）。
+- **新建终端失败**（没有可用凭据 / 认证失败 / 远端拒绝 PTY…）**不发 `gone`**：一帧原因文本
+  （`no_credential` 会追加「请重新打开会话以重新输入凭据」），然后以 close code **4002**
+  （`wsCloseCreateFailed`）关闭。前端据此保留标签、把状态点标红并提示可以重连；`gone` 只用
+  于「终端/会话在后端不存在」（前端会把标签当成失效）。两者混用会把一个可修复的凭据问题
+  说成「会话没了」——用户看到的是「新建一个失败一个」，永远猜不到原因。
 - 客户端 → 服务端：普通字节写入远程 PTY；`\x1b]resize;<cols>;<rows>\x07` → `Session.WindowChange`；
   `\x1b]ping\x07` → 心跳，不写 PTY。
 - **单挂载点**：一个终端同时只允许一个操作端。新挂载成功后给旧连接发 `\x1b]detached\x07`
@@ -815,6 +820,10 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
      `credential_required`（409）。带凭据时先用它拨号，成功后再把凭据留在内存（供该会话的
      后续终端与 SFTP 复用）。**会话关闭（或进程退出）后内存凭据即失效**，下次 open 会再次
      要求输入——这就是「不保存时每次连接都要输入」的落地方式。
+   - **会话开着时把「保存凭据」从开切到关**：当前会话的凭据不会因为这次保存而丢失——后端把
+     刚清掉落盘的那份解密后放进内存缓存（只活到 close），新建子终端 / SFTP 断线重连照常
+     可用。用户只是关掉了一个持久化开关，不等于要中止当前会话。用户在同一请求里给了新凭据
+     时以新凭据为准；认证方式变了则不 carry over（见 12.1.7）。
    - `POST /api/sessions/test` 一直都可以带明文凭据（表单里就是这样用的），无需改动。
    - 编辑一个 `credentialSaved == false` 的会话时，表单里**不显示**「留空 = 不修改」的提示
      （因为没有可保留的东西），打开开关就等于把凭据存下来。
@@ -978,6 +987,10 @@ detached 且不自动重连；「重连」夺回后可继续输入）→ 关闭�
 7. **内存凭据只由「一次成功的 open」写入**：表单里填的凭据不会进内存缓存，否则刚建好
    「不保存凭据」的会话点开就直接连上，与开关的承诺矛盾。`dialRequestForTest` 例外：表单没重填
    凭据时复用内存那份（否则已打开的会话在编辑弹窗里点「测试连接」会报「没有可用凭据」）。
+   **第二个例外**（第二十六轮）：会话开着时关掉「保存凭据」，把当前会话正在用的凭据
+   carry over 到内存（优先保留 `memCreds` 里那份——它可能是这次 open 当场输入并验证成功的；
+   没有才解密旧配置；见 11.1.3 与第 36 节）。这不是「表单凭据入内存」——来源是当前会话
+   正在用的那份，且只活到 close；不这么做，新建子终端会立刻报 no_credential。
 8. **失败善后用 `context.WithoutCancel` + 30s**：最常见的失败恰恰是「客户端断开」，
    用 `r.Context()` 会永远清不掉半成品文件。
 9. **部分更新语义统一**：更新已有会话时 `host`/`user`/`authType` 空串、`port==0`、字段缺省
@@ -3418,3 +3431,68 @@ location /app/ {
   4. `open` 但 `terminals: []` 的会话：进入时才建「终端 1」，未进入时卡片没有子终端行。
 - 未在真机 / 真实 PTY 上重跑：本机沙箱打不开 `/dev/ptmx`（`open /dev/ptmx: permission denied`），
   WebSocket 挂载路径沿用旧逻辑未改；构建后需按第 10.3 节手测一次「另一台设备顶号」。
+
+## 36. 第二十六轮：会话打开期间关闭「保存凭据」/ 修改凭据
+
+### 36.1 用户报告
+
+会话已经登录、正在用时，打开「编辑会话」把「保存凭据」关掉并保存，回到会话里新建的子终端
+全部登录失败（看起来像「终端不存在」）。用户建议：切换保存状态 / 修改密码密钥保存后提示
+「建议重新打开会话」，或者直接阻止新建子终端并提示。
+
+### 36.2 根因
+
+- `save` 在 `saveCredential=false` 时会把 `sc.Password` / `sc.PrivateKey` / `sc.Passphrase`
+  连同指纹一起清掉；但会话**仍然开着**，它的新终端与 SFTP 重连走 `dialCredential`：
+  此时 `CredentialsSaved()==false`、`memCreds` 里又没有那份凭据（它来自落盘，不是一次
+  「输入凭据的 open」），于是 `no_credential`。
+- 更糟的是 WS 新建终端把所有失败都当 `gone` 发：前端把标签标成「终端不存在」并弹
+  `term_not_found`，「会话没有可用的凭据」这句真正的原因反而被覆盖。用户每点一次「+」
+  就多一个失败标签，完全看不出该改什么。
+
+### 36.3 修复
+
+- **后端 carry over**（`sessions.go` 的 save）：`!saveCred && openNow && cur.CredentialsSaved()`
+  且认证方式未变、本次没带新凭据时，把当前会话正在用的凭据放进 `memCreds`（只活到 close）：
+  **优先保留已有内存凭据**（可能是这次 open 当场输入并验证成功的，比磁盘上的旧密文更可信），
+  没有才 `storedCredential(cur)` 解密旧配置。用户在同一请求里给了新凭据时以新凭据为准；
+  认证方式变了则不 carry over（类型不匹配的缓存会让下一次拨号报出与原因不符的
+  no_credential）。API 调用方传空密码不会覆盖内存里那份能用的（前端表单不会发空串）。
+  「保存凭据」关掉仍只影响持久化，不影响当前已打开会话的可用性。
+- **WS 错误分流**（`terminal.go` + `protocol.go` + `serverapi/index.ts`）：
+  - 新建终端失败且 `apiErr.Status == 404`（会话/运行时不存在）→ 仍发 `gone`；
+  - 其余失败（`no_credential` / `auth_failed` / `hostkey_*` / `shell_failed` / 拨号超时…）→
+    发原因文本 + close **4002**（`wsCloseCreateFailed`），**不带** `gone`。
+    `no_credential` 的文本追加「请重新打开会话以重新输入凭据，或在会话设置里重新开启
+    「保存凭据」并填写凭据」。
+  - `TerminalPane` 收到 4002：保留标签、状态置 `error`、补一句 `term_create_failed`
+    （修正凭据后可以点「重连」），不再走「终端不存在」的清理分支。
+- **表单提示**（`SessionFormDialog`）：会话开着且本次保存涉及凭据时，把普通的
+  「已保存」换成：
+  - 关闭保存：`form_cred_off_open`——当前会话关闭前仍可用，重新打开要重新输入；
+  - 修改密码/密钥（或切换认证方式）：`form_cred_changed_open`——已打开的终端仍是旧连接，
+    新终端用新凭据，需要全部生效请重新打开会话。
+  只改名/备注/端口时仍是「已保存」。
+- i18n 新增 `form_cred_off_open` / `form_cred_changed_open` / `term_create_failed`。
+
+### 36.4 取舍
+
+- **不阻止新建子终端**：会话开着时新建终端是正常操作；问题出在凭据被过早丢弃与错误文案，
+  修好这两处后没有阻止的必要。真正拿不到凭据时，终端里会有一句可执行的指引。
+- **不自动重连已有终端**：改密码/密钥后已有的 SSH 连接不会断（也不该偷偷断）；提示明确
+  说了「已打开的终端仍是旧连接」，需要全部生效时用户自己重新打开会话。
+- **不改 `saveCredential=false` 的持久化语义**：carry over 只到 close；关闭/进程退出后
+  仍然要求重新输入。
+
+### 36.5 验证
+
+- `TestCredentialSaveSwitchEdits`（扩展）：会话开着时关掉保存开关后，
+  `cachedCredential(sid)` 必须存在，丢掉 SFTP 通道后 `/api/fs/list` 仍能重连成功；
+  close 后缓存消失、open 回到 `credential_required`。
+- `TestCredentialSaveOffKeepsVerifiedMemoryCredential`（新增）：内存里有一份「本次 open
+  验证成功」的凭据时，关掉保存开关不能被磁盘上的旧密码覆盖；API 传空密码也不能把它清空。
+- `TestTerminalCreateFailureIsNotGone`（新增，不需要 PTY）：抹掉内存凭据后新建终端，
+  收到的文本要包含「没有可用的凭据」与「请重新打开会话」，**不能**包含 `\x1b]gone\x07`，
+  关闭码必须是 4002。
+- `make test`、`make check` 全绿；前端表单提示用 mock 数据在开发服务器上人工点过
+  （真实 PTY 受本机 `/dev/ptmx` 限制未跑）。

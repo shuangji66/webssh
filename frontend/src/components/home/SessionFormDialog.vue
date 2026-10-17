@@ -347,13 +347,38 @@ async function trustAndRetest() {
 
 // ---------- 保存 / 关闭 ----------
 
+/**
+ * 保存成功的提示文案。
+ *
+ * 会话**正开着**时改凭据，普通「已保存」会让用户以为新凭据已经在所有地方生效。实际语义是：
+ *   - 新开的终端 / SFTP 重连用新凭据；
+ *   - 已经开着的终端还是旧连接（不能也不该偷偷断掉它）；
+ *   - 关掉「保存凭据」只影响持久化，当前会话在关闭前仍然可用（后端把当前凭据留在内存里，
+ *     见 sessions.go 的 carry-over）。
+ * 所以这里换一句说清楚「什么时候需要重新打开会话」的话；没改凭据（只改名/备注/端口）时
+ * 保持原来的「已保存」。
+ */
+function savedToast(saved: SessionView): string {
+  const prev = props.session
+  const name = sessionLabel(saved)
+  if (!prev || !home.isOpen(saved.id)) return t('form_saved', { name })
+  if (prev.credentialSaved && !saved.credentialSaved) {
+    return t('form_cred_off_open', { name })
+  }
+  const credentialTouched =
+    (authType.value === 'password' ? !!password.value : !!privateKey.value) ||
+    prev.authType !== authType.value
+  if (credentialTouched) return t('form_cred_changed_open', { name })
+  return t('form_saved', { name })
+}
+
 async function submit() {
   const input = buildInput()
   if (!input) return
   saving.value = true
   try {
     const saved = await home.save(input)
-    toast.show(t('form_saved', { name: sessionLabel(saved) }), 'success')
+    toast.show(savedToast(saved), 'success')
     emit('saved', saved)
     close()
   } catch (e) {

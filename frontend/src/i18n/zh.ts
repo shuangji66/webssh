@@ -93,6 +93,10 @@ export const zh: Record<string, string> = {
   form_required_key: '请粘贴私钥内容',
   form_port_invalid: '端口需在 1–65535 之间',
   form_saved: '已保存「{name}」',
+  // 会话**正开着**时改凭据的两种提示（第二十六轮）：替换普通「已保存」，让用户知道
+  // 当前终端 / 新终端分别用的是哪份凭据、什么时候需要重新打开会话。
+  form_cred_off_open: '已保存「{name}」：已关闭保存凭据。当前会话在关闭前仍可继续使用；重新打开时需要重新输入凭据。',
+  form_cred_changed_open: '已保存「{name}」：凭据已更新。已打开的终端仍使用旧连接，新开终端会使用新凭据；需要全部生效请重新打开会话。',
   form_save_failed: '保存失败：{error}',
   form_trusted_key: '已信任的主机密钥',
   form_trusted_key_remove: '移除信任',
@@ -198,6 +202,7 @@ export const zh: Record<string, string> = {
   term_closed: '连接已关闭，重连或刷新后继续',
   term_ws_error: 'WebSocket 错误或被飞牛关闭',
   term_not_found: '终端不存在',
+  term_create_failed: '子终端创建失败（原因见上方）。修正凭据后点「重连」重试；如果会话已没有可用凭据，请重新打开会话。',
   term_detached: '终端已在其他设备打开',
   term_detached_hint: '该终端已在其他设备打开，点击「重连」可在此设备继续。',
   term_not_connected: '终端未连接',

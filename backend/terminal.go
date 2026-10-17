@@ -630,6 +630,24 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 	}
 
+	// createFailed 处理「新建子终端失败」，与 gone 严格区分。
+	//
+	// 这里曾经统一走 gone：认证失败 / 没有凭据 / 远端拒绝 PTY 时，前端把标签标成
+	// 「终端不存在」并弹「会话已不存在」，真实原因（比如「会话没有可用的凭据」）反而被
+	// 覆盖掉——用户只看到新建一个失败一个，不知道是凭据问题。创建失败要把原因留在终端
+	// 里、用 wsCloseCreateFailed 关闭，前端据此保留标签并标红；修正凭据后点「重连」即可。
+	createFailed := func(apiErr *apierr.Error) {
+		detail := "新建终端失败：" + apiErr.Message
+		if apiErr.Code == apierr.CodeNoCredential {
+			detail += "\r\n会话不保存凭据且本进程内已没有可用凭据：请重新打开会话以重新输入凭据，" +
+				"或在会话设置里重新开启「保存凭据」并填写凭据。"
+		}
+		frame := []byte("\r\n\x1b[31m" + detail + "\x1b[0m\r\n")
+		_ = ws.WriteFramed(conn, ws.Frame(termDataOp, frame))
+		_ = ws.WriteFramed(conn, ws.CloseFrame(wsCloseCreateFailed, "create_failed"))
+		_ = conn.Close()
+	}
+
 	rt, apiErr := h.mux.sessions.runtimeFor(sid)
 	if apiErr != nil {
 		gone(apiErr.Message)
@@ -640,7 +658,14 @@ func (h *terminalHandler) serve(w http.ResponseWriter, r *http.Request) {
 	if tid == "" {
 		t, apiErr := rt.newTerminal(r.Context(), defaultTermCols, defaultTermRows)
 		if apiErr != nil {
-			gone("新建终端失败：" + apiErr.Message)
+			// 404 = 会话/运行时已经不存在：仍走 gone（标签该消失）；
+			// 其余（无凭据、认证失败、PTY 失败、连接超时……）是「这次没建成」，
+			// 标签留着，用户修正后可以重连。
+			if apiErr.Status == http.StatusNotFound {
+				gone(apiErr.Message)
+			} else {
+				createFailed(apiErr)
+			}
 			return
 		}
 		if err := ws.WriteFramed(conn, ws.Frame(termDataOp, []byte("\x1b]tid;"+t.id+"\x07"))); err != nil {

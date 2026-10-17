@@ -27,6 +27,12 @@ const (
 	// 前端据此把标签置为 detached：提示用户、不自动重连（否则两台设备会互抢同一个终端）。
 	wsCloseDetached = 4001
 
+	// wsCloseCreateFailed 是「新建子终端失败」的关闭码（认证失败 / 没有可用凭据 /
+	// 远端拒绝 PTY 等）。**不要**把它和 oscGone 混用：gone 的语义是「终端/会话在后端
+	// 不存在」，前端收到会把标签标成不存在；创建失败必须保留标签、把真实原因留在终端里，
+	// 用户修正凭据后点「重连」就能重试。
+	wsCloseCreateFailed = 4002
+
 	// 以下是服务端 → 客户端的 OSC 控制帧（不写入远程 PTY，前端自己解析）。
 	oscReady    = "\x1b]ready\x07"    // 历史回放结束，进入实时流
 	oscExit     = "\x1b]exit\x07"     // 远程 shell 退出
